@@ -9,7 +9,7 @@ LDLIBS := -lrados /usr/lib/ceph/libceph-common.so.2 -pthread
 
 .PHONY: all clean check-config
 
-all: check-config $(BUILD_DIR)/libcls_nsvu_hnsw.so $(BUILD_DIR)/nsvu-update-coordinator $(BUILD_DIR)/nsvu-base-importer
+all: check-config $(BUILD_DIR)/libcls_hnsw_global.so $(BUILD_DIR)/nsvu-update-coordinator $(BUILD_DIR)/nsvu-base-importer
 
 check-config:
 	@test -n "$(CEPH_SRC)" || (echo "Set CEPH_SRC to the Ceph src directory."; exit 2)
@@ -18,7 +18,7 @@ check-config:
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/libcls_nsvu_hnsw.so: src/cls/hnsw_cls.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/libcls_hnsw_global.so: src/cls/hnsw_cls.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared -o $@ $<
 
 $(BUILD_DIR)/nsvu-update-coordinator: src/coordinator/update_coordinator.cc include/nsvu/protocol.hpp | $(BUILD_DIR)

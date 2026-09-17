@@ -56,8 +56,8 @@ struct Config {
   std::string input_format = "u8bin";
   std::string update_input_format = "u8bin";
   std::string keyring;
-  std::string meta_pool = "ghnsw_meta";
-  std::string owner_pool_prefix = "ghnsw_owner_";
+  std::string meta_pool = "nsvu_meta";
+  std::string owner_pool_prefix = "nsvu_owner_";
   std::string data_oid = "hnsw.owner.data";
   std::string meta_oid = "hnsw.global.meta";
   std::string metrics_out;

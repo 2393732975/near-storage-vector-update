@@ -40,7 +40,7 @@ make
 
 产物位于 `build/`：
 
-- `libcls_nsvu_hnsw.so`：部署到测试 OSD 的 CLS 模块；
+- `libcls_hnsw_global.so`：部署到测试 OSD 的 CLS 模块；
 - `nsvu-update-coordinator`：build/update Coordinator；
 - `nsvu-base-importer`：离线 base 导入器。
 
