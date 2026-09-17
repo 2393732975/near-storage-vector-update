@@ -1,0 +1,20 @@
+{
+  "gist1m": {
+    "input": "/data/gist1m/base.1M.fbin",
+    "update_input": "/data/gist1m/query.public.1K.fbin",
+    "input_format": "fbin",
+    "dimension": 960,
+    "vector_kind": "f32",
+    "metric": "l2",
+    "points_per_object": 16000
+  },
+  "sift100m": {
+    "input": "/data/sift100m/base.u8bin",
+    "update_input": "/data/sift100m/queries.u8bin",
+    "input_format": "u8bin",
+    "dimension": 128,
+    "vector_kind": "u8",
+    "metric": "l2",
+    "points_per_object": 250000
+  }
+}

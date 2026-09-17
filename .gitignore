@@ -1,0 +1,43 @@
+# Secrets and machine-local configuration
+*.keyring
+.env
+.env.*
+*.pem
+*.key
+credentials/
+
+# Build output
+build/
+bin/
+lib/
+*.o
+*.so
+*.a
+*.out
+*.d
+
+# Runtime and generated experiment output
+results/*
+!results/.gitkeep
+logs/
+*.log
+*.pid
+*.progress.json
+__pycache__/
+*.py[cod]
+
+# Data and large artifacts
+data/
+datasets/
+*.bin
+*.fbin
+*.u8bin
+*.ibin
+*.faiss
+*.parquet
+*.tar.gz
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
