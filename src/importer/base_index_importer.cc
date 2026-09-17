@@ -153,7 +153,21 @@ std::vector<std::string> LoadVectors(const Config& cfg) {
     if (cfg.num_vectors > n) {
       throw std::runtime_error("requested vectors exceed fbin count");
     }
-  } else if (cfg.input_format != "u8bin") {
+  } else if (cfg.input_format == "u8bin") {
+    uint32_t n = 0;
+    uint32_t file_dim = 0;
+    in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+    in.read(reinterpret_cast<char*>(&file_dim), sizeof(uint32_t));
+    if (!in) {
+      throw std::runtime_error("failed to read u8bin header: " + cfg.input);
+    }
+    if (file_dim != cfg.dim) {
+      throw std::runtime_error("u8bin dim mismatch");
+    }
+    if (cfg.num_vectors > n) {
+      throw std::runtime_error("requested vectors exceed u8bin count");
+    }
+  } else {
     throw std::runtime_error("unsupported input format: " + cfg.input_format);
   }
   std::vector<std::string> out;

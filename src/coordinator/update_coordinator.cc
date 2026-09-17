@@ -758,7 +758,22 @@ std::vector<std::string> LoadVectors(
 	    count = std::min<uint64_t>(count, static_cast<uint64_t>(n) - offset);
 	    in.seekg(static_cast<std::streamoff>(8 + offset * vec_bytes), std::ios::beg);
   } else if (format == "u8bin") {
-    in.seekg(static_cast<std::streamoff>(offset * vec_bytes), std::ios::beg);
+    uint32_t n = 0;
+    uint32_t file_dim = 0;
+    in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+    in.read(reinterpret_cast<char*>(&file_dim), sizeof(uint32_t));
+    if (!in) {
+      throw std::runtime_error("failed to read u8bin header: " + path);
+    }
+    if (file_dim != dim) {
+      throw std::runtime_error("u8bin dim mismatch: file=" + std::to_string(file_dim) +
+                               " expected=" + std::to_string(dim));
+    }
+    if (offset > n) {
+      throw std::runtime_error("u8bin read range exceeds file vector count");
+    }
+    count = std::min<uint64_t>(count, static_cast<uint64_t>(n) - offset);
+    in.seekg(static_cast<std::streamoff>(8 + offset * vec_bytes), std::ios::beg);
   } else {
     throw std::runtime_error("unsupported input format: " + format);
   }

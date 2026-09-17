@@ -42,7 +42,7 @@ run_dataset() {
   "$coordinator" --mode update --keyring "$CEPH_KEYRING" --input "$input" \
     --input-format "$format" --update-input "$update" --update-input-format "$format" \
     --dim "$dim" --vector-kind "$kind" --metric "$metric" --num-vectors "$count" \
-    --num-updates "$updates" --points-per-object "$ppo" --distance-mode "$mode" \
+    --num-updates "$updates" --update-offset 0 --target-start 0 --points-per-object "$ppo" --distance-mode "$mode" \
     --distance-split-probe --time-limit-seconds "$window_seconds" \
     --update-parallelism "$update_parallelism" --metrics-out "$output/update.json" \
     --progress-out "$output/update.progress.json"
