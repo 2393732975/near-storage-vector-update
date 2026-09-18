@@ -178,6 +178,28 @@ stage_profile.other_update_ms_per_update
 
 ## 运行方式
 
+### 汇总当前 JSON 打点
+
+`nsvu-update-coordinator` 已在 PPT 的三个观测点上记录原始耗时。对一轮输出运行：
+
+```bash
+python3 scripts/summarize-stage-costs.py \
+  results/ppt-baseline-<timestamp> \
+  --output results/ppt-baseline-<timestamp>/stage-costs.md
+```
+
+汇总器使用 `accounted_update_seconds` 作为主路径阶段占比的分母，适用于
+`UPDATE_PARALLELISM > 1`。不要直接采用 JSON 旧有的 `*_pct`：它们除以墙钟
+`graph_seconds`，而并发 worker 的累计阶段时间会重叠，因而可能大于 100%。
+
+输出包含与答辩 PPT 对应的三类指标：
+
+- 观测点 A：远端距离中的 RTT/排队、CLS OMAP 引用读取、payload 读取与纯算距；
+- 观测点 B：扣除距离调用后的邻接 patch 独占时间；
+- 观测点 C：`cas_global_meta` 全局元数据更新时间。
+
+当 `failed_updates` 非零时，报告仅用于定位瓶颈；修复失败后再作论文性能结论。
+
 ### 单数据集短时间窗
 
 如果当前 Ceph 中已经导入了对应数据集的 base 图，可以直接运行 update 时间窗：
