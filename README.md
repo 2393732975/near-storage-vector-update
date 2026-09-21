@@ -48,6 +48,22 @@ make
 
 数据集路径、Ceph 配置和 keyring 必须由运行者通过参数或本机环境提供，绝不可提交。`scripts/initialize-experiment-pools.sh` 会删除并重建实验池，必须显式传入 `--confirm-reset`。
 
+`scripts/run-ppt-baselines.sh` 默认运行 `osd compute` 两条路径和全部四个数据集。
+使用空格分隔的 `MODES` 与 `DATASETS` 可以只运行指定子集，例如：
+
+```bash
+# PPT 第 4–5 页：传统计算节点数据移动实验
+MODES=compute DATASETS="gist1m text2image10m deep100m sift100m" \
+  scripts/run-ppt-baselines.sh
+
+# PPT 第 11–12 页：OSD/CLS baseline 瓶颈实验
+MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
+  scripts/run-ppt-baselines.sh
+```
+
+运行前仍需设置 `CEPH_KEYRING` 与 `DATASET_ROOT`，并按需设置
+`WINDOW_SECONDS`、`UPDATE_PARALLELISM` 和 `RUN_ROOT`。
+
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。
 
 更多设计细节见 [研究路线](docs/research-roadmap.md)、[阶段剖析方法](docs/stage-profiling.md) 和 [计算侧对照实验](docs/compute-node-baseline.md)。

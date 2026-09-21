@@ -10,8 +10,25 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 window_seconds=${WINDOW_SECONDS:-300}
 run_root=${RUN_ROOT:-"$repo_root/results/ppt-baseline-$(date -u +%Y%m%dT%H%M%SZ)"}
 update_parallelism=${UPDATE_PARALLELISM:-1}
+read -r -a modes <<< "${MODES:-osd compute}"
+read -r -a datasets <<< "${DATASETS:-gist1m text2image10m deep100m sift100m}"
 importer="$repo_root/build/nsvu-base-importer"
 coordinator="$repo_root/build/nsvu-update-coordinator"
+
+(( ${#modes[@]} > 0 )) || { echo "MODES must not be empty." >&2; exit 2; }
+(( ${#datasets[@]} > 0 )) || { echo "DATASETS must not be empty." >&2; exit 2; }
+for mode in "${modes[@]}"; do
+  case "$mode" in
+    osd|compute) ;;
+    *) echo "Unknown mode in MODES: $mode" >&2; exit 2 ;;
+  esac
+done
+for dataset in "${datasets[@]}"; do
+  case "$dataset" in
+    gist1m|text2image10m|deep100m|sift100m) ;;
+    *) echo "Unknown dataset in DATASETS: $dataset" >&2; exit 2 ;;
+  esac
+done
 
 [[ -x "$importer" && -x "$coordinator" ]] || {
   echo "Build first with scripts/build.sh." >&2
@@ -48,8 +65,8 @@ run_dataset() {
     --progress-out "$output/update.progress.json"
 }
 
-for mode in osd compute; do
-  for dataset in gist1m text2image10m deep100m sift100m; do
+for mode in "${modes[@]}"; do
+  for dataset in "${datasets[@]}"; do
     run_dataset "$mode" "$dataset"
   done
 done
