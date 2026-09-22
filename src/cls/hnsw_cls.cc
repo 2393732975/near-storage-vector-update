@@ -21,6 +21,7 @@ using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
 using ghnsw::EdgePatchBatchRequest;
+using ghnsw::FinalizeInsertRequest;
 using ghnsw::GetAdjBatchReply;
 using ghnsw::GetGlobalMetaReply;
 using ghnsw::GetVectorBatchReply;
@@ -30,6 +31,8 @@ using ghnsw::LabelBatchRequest;
 using ghnsw::LabelUpdateBatchRequest;
 using ghnsw::LookupLabelBatchReply;
 using ghnsw::MarkNodeStaleRequest;
+using ghnsw::ReserveInsertReply;
+using ghnsw::ReserveInsertRequest;
 using ghnsw::SetAdjacencyBatchRequest;
 using ghnsw::StatusReply;
 using ghnsw::StoreVectorReply;
@@ -279,6 +282,26 @@ int cls_store_vector(cls_method_context_t hctx, ceph::bufferlist* in, ceph::buff
   if (r < 0) {
     return r;
   }
+
+  VectorRef existing;
+  r = read_vector_ref(hctx, req.global_id, &existing);
+  if (r == 0) {
+    const bool matches =
+        existing.global_id == req.global_id &&
+        existing.external_label == req.external_label &&
+        existing.bytes == req.vector_bytes.size() && existing.dim == req.dim &&
+        existing.vector_kind == req.vector_kind && existing.flags == req.flags &&
+        existing.level == req.level;
+    StatusReply reply;
+    reply.status = matches ? 0 : -EEXIST;
+    reply.count = matches ? 1 : 0;
+    encode_msg(reply, out);
+    return reply.status;
+  }
+  if (r != -ENOENT) {
+    return r;
+  }
+
   uint64_t size = 0;
   r = cls_cxx_stat2(hctx, &size, nullptr);
   if (r == -ENOENT) {
@@ -348,14 +371,23 @@ int cls_cas_label(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferl
   ceph::bufferlist current_bl;
   r = cls_cxx_map_get_val(hctx, ghnsw::LabelKey(req.external_label), &current_bl);
   bool matches = false;
-  if (req.expect_missing) {
-    matches = r == -ENOENT;
-  } else if (r == 0) {
-    uint64_t current = 0;
+  uint64_t current = 0;
+  if (r == 0) {
     r = decode_u64(current_bl, &current);
     if (r < 0) {
       return r;
     }
+    if (current == req.replacement_global_id) {
+      StatusReply reply;
+      reply.status = 0;
+      reply.count = 1;
+      encode_msg(reply, out);
+      return 0;
+    }
+  }
+  if (req.expect_missing) {
+    matches = r == -ENOENT;
+  } else if (r == 0) {
     matches = current == req.expected_global_id;
   } else if (r != -ENOENT) {
     return r;
@@ -536,6 +568,14 @@ int set_adjacency_common(
   }
   std::map<std::string, ceph::bufferlist> kv;
   for (const auto& entry : req.entries) {
+    ceph::bufferlist existing;
+    r = cls_cxx_map_get_val(hctx, ghnsw::NodeKey(entry.global_id), &existing);
+    if (r == 0) {
+      continue;
+    }
+    if (r != -ENOENT) {
+      return r;
+    }
     ceph::bufferlist bl;
     entry.encode(bl);
     kv.emplace(ghnsw::NodeKey(entry.global_id), std::move(bl));
@@ -557,6 +597,21 @@ int cls_apply_edge_patch_batch(
   }
   if (req.max_neighbors == 0) {
     return -EINVAL;
+  }
+  if (req.update_id == 0) {
+    return -EINVAL;
+  }
+  ceph::bufferlist marker;
+  r = cls_cxx_map_get_val(hctx, ghnsw::PatchKey(req.update_id), &marker);
+  if (r == 0) {
+    StatusReply reply;
+    reply.status = 0;
+    reply.count = static_cast<uint32_t>(req.entries.size());
+    encode_msg(reply, out);
+    return 0;
+  }
+  if (r != -ENOENT) {
+    return r;
   }
   std::map<std::string, ceph::bufferlist> kv;
   std::map<uint64_t, AdjacencyBlob> merged_patches;
@@ -610,6 +665,7 @@ int cls_apply_edge_patch_batch(
     merged.encode(bl);
     kv.emplace(ghnsw::NodeKey(merged.global_id), std::move(bl));
   }
+  kv.emplace(ghnsw::PatchKey(req.update_id), encode_u64(req.update_id));
   r = cls_cxx_map_set_vals(hctx, &kv);
   StatusReply reply;
   reply.status = r;
@@ -648,6 +704,107 @@ int cls_get_global_meta(cls_method_context_t hctx, ceph::bufferlist*, ceph::buff
   GetGlobalMetaReply reply;
   reply.status = r;
   reply.meta = meta;
+  encode_msg(reply, out);
+  return r;
+}
+
+int cls_reserve_insert_id(
+    cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  ReserveInsertRequest req;
+  int r = decode_msg(in, &req);
+  if (r < 0 || req.update_id == 0) {
+    return r < 0 ? r : -EINVAL;
+  }
+
+  ceph::bufferlist stored;
+  r = cls_cxx_map_get_val(hctx, ghnsw::ReservationKey(req.update_id), &stored);
+  if (r == 0) {
+    auto it = stored.cbegin();
+    ReserveInsertReply reply;
+    try {
+      reply.decode(it);
+    } catch (ceph::buffer::error&) {
+      return -EINVAL;
+    }
+    encode_msg(reply, out);
+    return reply.status;
+  }
+  if (r != -ENOENT) {
+    return r;
+  }
+
+  GlobalMeta meta;
+  r = read_global_meta(hctx, &meta);
+  if (r < 0) {
+    return r;
+  }
+  ReserveInsertReply reply;
+  reply.global_id = meta.next_global_id;
+  reply.search_meta = meta;
+  GlobalMeta next = meta;
+  next.next_global_id += 1;
+  next.version += 1;
+  r = write_global_meta(hctx, next);
+  if (r < 0) {
+    return r;
+  }
+  ceph::bufferlist reply_bl;
+  reply.encode(reply_bl);
+  std::map<std::string, ceph::bufferlist> values;
+  values.emplace(ghnsw::ReservationKey(req.update_id), std::move(reply_bl));
+  r = cls_cxx_map_set_vals(hctx, &values);
+  reply.status = r;
+  encode_msg(reply, out);
+  return r;
+}
+
+int cls_finalize_insert(
+    cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  FinalizeInsertRequest req;
+  int r = decode_msg(in, &req);
+  if (r < 0 || req.update_id == 0) {
+    return r < 0 ? r : -EINVAL;
+  }
+
+  ceph::bufferlist marker;
+  r = cls_cxx_map_get_val(hctx, ghnsw::FinalizedKey(req.update_id), &marker);
+  if (r == 0) {
+    uint64_t finalized_id = 0;
+    r = decode_u64(marker, &finalized_id);
+    StatusReply reply;
+    reply.status = r < 0 || finalized_id != req.global_id ? -EEXIST : 0;
+    reply.count = reply.status == 0 ? 1 : 0;
+    encode_msg(reply, out);
+    return reply.status;
+  }
+  if (r != -ENOENT) {
+    return r;
+  }
+
+  GlobalMeta meta;
+  r = read_global_meta(hctx, &meta);
+  if (r < 0) {
+    return r;
+  }
+  if (req.global_id >= meta.next_global_id) {
+    return -ERANGE;
+  }
+  if (meta.enterpoint == UINT64_MAX || req.level > meta.max_level) {
+    meta.max_level = req.level;
+    meta.enterpoint = req.global_id;
+  }
+  meta.cur_element_count += 1;
+  meta.version += 1;
+  r = write_global_meta(hctx, meta);
+  if (r < 0) {
+    return r;
+  }
+  std::map<std::string, ceph::bufferlist> values;
+  values.emplace(ghnsw::FinalizedKey(req.update_id), encode_u64(req.global_id));
+  r = cls_cxx_map_set_vals(hctx, &values);
+  StatusReply reply;
+  reply.status = r;
+  reply.count = r < 0 ? 0 : 1;
   encode_msg(reply, out);
   return r;
 }
@@ -694,6 +851,8 @@ CLS_INIT(hnsw_global) {
   cls_method_handle_t h_mark_node_stale;
   cls_method_handle_t h_get_global_meta;
   cls_method_handle_t h_cas_global_meta;
+  cls_method_handle_t h_reserve_insert_id;
+  cls_method_handle_t h_finalize_insert;
 
   cls_register("hnsw_global", &h_class);
   cls_register_cxx_method(
@@ -760,6 +919,18 @@ CLS_INIT(hnsw_global) {
       &h_mark_node_stale);
   cls_register_cxx_method(
       h_class, "get_global_meta", CLS_METHOD_RD, cls_get_global_meta, &h_get_global_meta);
+  cls_register_cxx_method(
+      h_class,
+      "reserve_insert_id",
+      CLS_METHOD_RD | CLS_METHOD_WR,
+      cls_reserve_insert_id,
+      &h_reserve_insert_id);
+  cls_register_cxx_method(
+      h_class,
+      "finalize_insert",
+      CLS_METHOD_RD | CLS_METHOD_WR,
+      cls_finalize_insert,
+      &h_finalize_insert);
   cls_register_cxx_method(
       h_class,
       "cas_global_meta",

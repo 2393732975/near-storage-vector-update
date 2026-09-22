@@ -16,6 +16,7 @@ void Require(bool condition, const char* message) {
 
 void TestEdgePatchBatch() {
   ghnsw::EdgePatchBatchRequest request;
+  request.update_id = 101;
   request.max_neighbors = 24;
   ghnsw::AdjacencyBlob patch;
   patch.global_id = 42;
@@ -29,11 +30,53 @@ void TestEdgePatchBatch() {
   ghnsw::EdgePatchBatchRequest decoded;
   decoded.decode(iterator);
 
+  Require(decoded.update_id == 101, "patch update_id did not round-trip");
   Require(decoded.max_neighbors == 24, "max_neighbors did not round-trip");
   Require(decoded.entries.size() == 1, "patch count did not round-trip");
   Require(decoded.entries[0].global_id == 42, "patch id did not round-trip");
   Require(decoded.entries[0].level_count == 2, "level count did not round-trip");
   Require(decoded.entries[0].neighbors == patch.neighbors, "neighbors did not round-trip");
+}
+
+void TestInsertLifecycle() {
+  ghnsw::ReserveInsertRequest reserve;
+  reserve.update_id = 202;
+  ceph::bufferlist reserve_encoded;
+  reserve.encode(reserve_encoded);
+  auto reserve_it = reserve_encoded.cbegin();
+  ghnsw::ReserveInsertRequest reserve_decoded;
+  reserve_decoded.decode(reserve_it);
+  Require(reserve_decoded.update_id == reserve.update_id,
+          "reservation update_id did not round-trip");
+
+  ghnsw::ReserveInsertReply reply;
+  reply.global_id = 303;
+  reply.search_meta.next_global_id = 303;
+  reply.search_meta.cur_element_count = 300;
+  ceph::bufferlist reply_encoded;
+  reply.encode(reply_encoded);
+  auto reply_it = reply_encoded.cbegin();
+  ghnsw::ReserveInsertReply reply_decoded;
+  reply_decoded.decode(reply_it);
+  Require(reply_decoded.global_id == reply.global_id,
+          "reserved global_id did not round-trip");
+  Require(reply_decoded.search_meta.next_global_id == 303 &&
+              reply_decoded.search_meta.cur_element_count == 300,
+          "reservation search meta did not round-trip");
+
+  ghnsw::FinalizeInsertRequest finalize;
+  finalize.update_id = 202;
+  finalize.global_id = 303;
+  finalize.level = 4;
+  ceph::bufferlist finalize_encoded;
+  finalize.encode(finalize_encoded);
+  auto finalize_it = finalize_encoded.cbegin();
+  ghnsw::FinalizeInsertRequest finalize_decoded;
+  finalize_decoded.decode(finalize_it);
+  Require(finalize_decoded.update_id == finalize.update_id &&
+              finalize_decoded.global_id == finalize.global_id &&
+              finalize_decoded.level == finalize.level,
+          "finalize request did not round-trip");
 }
 
 void TestVectorRef() {
@@ -92,6 +135,7 @@ void TestCasLabel() {
 int main() {
   try {
     TestEdgePatchBatch();
+    TestInsertLifecycle();
     TestVectorRef();
     TestCasLabel();
     std::cout << "protocol round-trip tests passed\n";

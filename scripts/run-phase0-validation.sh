@@ -14,6 +14,8 @@ rounds=${ROUNDS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
 parallelism=${UPDATE_PARALLELISM:-4}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
+osd_op_timeout_seconds=${OSD_OP_TIMEOUT_SECONDS:-45}
+osd_op_retry_limit=${OSD_OP_RETRY_LIMIT:-3}
 run_root=${RUN_ROOT:-"$repo_root/results/phase0-validation-$(date -u +%Y%m%dT%H%M%SZ)"}
 read -r -a datasets <<< "${DATASETS:-gist1m text2image10m deep100m sift100m}"
 
@@ -33,6 +35,14 @@ ceph_cli=(ceph --keyring "$CEPH_KEYRING")
 }
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || {
   echo "UPDATE_PARALLELISM must be positive." >&2
+  exit 2
+}
+[[ "$osd_op_timeout_seconds" =~ ^[1-9][0-9]*$ ]] || {
+  echo "OSD_OP_TIMEOUT_SECONDS must be positive." >&2
+  exit 2
+}
+[[ "$osd_op_retry_limit" =~ ^[0-9]+$ ]] || {
+  echo "OSD_OP_RETRY_LIMIT must be non-negative." >&2
   exit 2
 }
 
@@ -99,6 +109,8 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "window_seconds=$window_seconds"
   echo "update_parallelism=$parallelism"
   echo "checker_batch_size=$checker_batch_size"
+  echo "osd_op_timeout_seconds=$osd_op_timeout_seconds"
+  echo "osd_op_retry_limit=$osd_op_retry_limit"
   echo "datasets=${datasets[*]}"
 } >"$run_root/manifest.txt"
 
@@ -132,7 +144,10 @@ for dataset in "${datasets[@]}"; do
       --num-updates "$updates" --update-offset 0 --target-start 0 \
       --points-per-object "$ppo" --distance-mode osd --distance-split-probe \
       --distance-probe-interval-ms 1000 --time-limit-seconds "$window_seconds" \
-      --update-parallelism "$parallelism" --metrics-out "$round_dir/update.json" \
+      --update-parallelism "$parallelism" \
+      --osd-op-timeout-seconds "$osd_op_timeout_seconds" \
+      --osd-op-retry-limit "$osd_op_retry_limit" \
+      --metrics-out "$round_dir/update.json" \
       --progress-out "$round_dir/update.progress.json"
 
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] check $dataset round $round/$rounds"

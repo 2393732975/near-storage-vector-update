@@ -50,15 +50,18 @@ label 的归属、解码和 ACTIVE 目标。退出码 `0` 表示通过，`1` 表
 `--distance-probe-interval-ms` 调整。PG 数由 librados 当前 OSDMap 计算；owner 数
 是逻辑分片数，不等同于实际 OSD 数，正式实验仍须在 manifest 中记录 PG/OSD 映射。
 Coordinator 会先落盘 metrics，再在存在失败更新时以非零状态退出。
-修改型 RADOS 操作不设置客户端 OSD 超时，因为超时返回并不会取消 OSD 端可能仍会
-提交的写入；时间窗停止发起新 update 后，Coordinator 会等待已开始的同步操作完成。
+在线更新使用 64 位 `update_id`。ID 预留、元数据 finalize 和 edge patch 在其修改
+的对象内保存去重标记；向量/邻接创建、label CAS 和 stale 标记也支持安全重放。
+因此 RADOS 操作可以在有界超时后按同一请求重试，既不会永久等待，也不会把响应
+丢失误判成一个全新的写操作。正式 runner 会在 manifest 和 update metrics 中记录
+`OSD_OP_TIMEOUT_SECONDS`（默认 45）与 `OSD_OP_RETRY_LIMIT`（默认 3）。
 
 ## 验收门槛
 
 每个数据集连续运行三轮，要求 `failed_updates=0`、检查器 `status=pass`，并保存
 metrics、检查报告、Git commit、CLS 哈希和集群映射。当前协议还没有 intent/log；
-跨对象崩溃恢复与幂等 patch 属于阶段 2，阶段 0 通过检查器暴露此类残留，而不将其
-误判为成功。
+跨进程崩溃后的完整 saga 恢复仍属于阶段 2；阶段 0 的幂等标记只保证单次运行内的
+超时重试安全。检查器会继续暴露强制终止留下的未完成跨对象更新。
 
 正式四数据集验收可通过安全门控 runner 执行；它会为每个数据集重建实验池：
 

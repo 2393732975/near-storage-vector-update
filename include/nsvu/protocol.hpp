@@ -269,6 +269,54 @@ struct CasLabelRequest {
   }
 };
 
+struct ReserveInsertRequest {
+  uint64_t update_id = 0;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(update_id, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(update_id, it);
+  }
+};
+
+struct ReserveInsertReply {
+  int32_t status = 0;
+  uint64_t global_id = 0;
+  GlobalMeta search_meta;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(status, bl);
+    ceph::encode(global_id, bl);
+    search_meta.encode(bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(status, it);
+    ceph::decode(global_id, it);
+    search_meta.decode(it);
+  }
+};
+
+struct FinalizeInsertRequest {
+  uint64_t update_id = 0;
+  uint64_t global_id = 0;
+  uint32_t level = 0;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(update_id, bl);
+    ceph::encode(global_id, bl);
+    ceph::encode(level, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(update_id, it);
+    ceph::decode(global_id, it);
+    ceph::decode(level, it);
+  }
+};
+
 struct DistanceBatchRequest {
   std::string query_vector;
   uint32_t dim = 0;
@@ -370,10 +418,12 @@ struct SetAdjacencyBatchRequest {
 };
 
 struct EdgePatchBatchRequest {
+  uint64_t update_id = 0;
   uint32_t max_neighbors = 8;
   std::vector<AdjacencyBlob> entries;
 
   void encode(ceph::buffer::list& bl) const {
+    ceph::encode(update_id, bl);
     ceph::encode(max_neighbors, bl);
     ceph::encode(static_cast<uint32_t>(entries.size()), bl);
     for (const auto& entry : entries) {
@@ -382,6 +432,7 @@ struct EdgePatchBatchRequest {
   }
 
   void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(update_id, it);
     ceph::decode(max_neighbors, it);
     uint32_t count = 0;
     ceph::decode(count, it);
@@ -462,6 +513,18 @@ inline std::string NodeKey(uint64_t global_id) {
 
 inline std::string LabelKey(uint64_t external_label) {
   return "label/" + std::to_string(external_label);
+}
+
+inline std::string ReservationKey(uint64_t update_id) {
+  return "reservation/" + std::to_string(update_id);
+}
+
+inline std::string FinalizedKey(uint64_t update_id) {
+  return "finalized/" + std::to_string(update_id);
+}
+
+inline std::string PatchKey(uint64_t update_id) {
+  return "patch/" + std::to_string(update_id);
 }
 
 inline std::string OwnerMetaOid() {

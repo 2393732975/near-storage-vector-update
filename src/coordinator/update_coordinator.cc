@@ -38,6 +38,7 @@ using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
 using ghnsw::EdgePatchBatchRequest;
+using ghnsw::FinalizeInsertRequest;
 using ghnsw::GetAdjBatchReply;
 using ghnsw::GetGlobalMetaReply;
 using ghnsw::GetVectorBatchReply;
@@ -47,6 +48,8 @@ using ghnsw::LabelBatchRequest;
 using ghnsw::LabelUpdateBatchRequest;
 using ghnsw::LookupLabelBatchReply;
 using ghnsw::MarkNodeStaleRequest;
+using ghnsw::ReserveInsertReply;
+using ghnsw::ReserveInsertRequest;
 using ghnsw::SetAdjacencyBatchRequest;
 using ghnsw::StatusReply;
 using ghnsw::StoreVectorRequest;
@@ -82,6 +85,8 @@ struct Config {
   double distance_probe_interval_seconds = 1.0;
   uint64_t time_limit_seconds = 0;
   uint32_t update_parallelism = 1;
+  uint32_t osd_op_timeout_seconds = 45;
+  uint32_t osd_op_retry_limit = 3;
 };
 
 struct Metrics {
@@ -110,6 +115,7 @@ struct Metrics {
   uint64_t failed_update_protocol = 0;
   uint64_t failed_update_other = 0;
   uint64_t total_cls_exec_calls = 0;
+  uint64_t rados_exec_retries = 0;
   uint64_t global_meta_cas_calls = 0;
   uint64_t label_cas_calls = 0;
   uint64_t cls_request_bytes = 0;
@@ -268,6 +274,17 @@ double now_sec() {
   return std::chrono::duration_cast<std::chrono::duration<double>>(delta).count();
 }
 
+uint64_t make_update_id_seed() {
+  const uint64_t timestamp = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  std::random_device random;
+  const uint64_t entropy =
+      (static_cast<uint64_t>(random()) << 32) ^ static_cast<uint64_t>(random());
+  const uint64_t seed = timestamp ^ entropy;
+  return seed == 0 ? 1 : seed;
+}
+
 double percentile_ms(std::vector<double> values, double p) {
   if (values.empty()) {
     return 0.0;
@@ -359,6 +376,7 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->failed_update_protocol += src.failed_update_protocol;
   dst->failed_update_other += src.failed_update_other;
   dst->total_cls_exec_calls += src.total_cls_exec_calls;
+  dst->rados_exec_retries += src.rados_exec_retries;
   dst->global_meta_cas_calls += src.global_meta_cas_calls;
   dst->label_cas_calls += src.label_cas_calls;
   dst->cls_request_bytes += src.cls_request_bytes;
@@ -455,9 +473,11 @@ class CephFacade {
         (r = cluster_.conf_set("keyring", cfg_.keyring.c_str())) < 0) {
       throw std::runtime_error("conf_set keyring failed");
     }
-    // Do not set rados_osd_op_timeout for modifying operations: a client-side
-    // timeout does not cancel an operation that the OSD may later commit.
-    // The experiment window stops launching work and then drains in-flight ops.
+    // Every modifying CLS operation used by online updates is idempotent. A
+    // bounded timeout can therefore be retried without treating an ambiguous
+    // client response as a new mutation.
+    const std::string osd_timeout = std::to_string(cfg_.osd_op_timeout_seconds);
+    (void)cluster_.conf_set("rados_osd_op_timeout", osd_timeout.c_str());
     (void)cluster_.conf_set("rados_mon_op_timeout", "30");
     (void)cluster_.conf_set("client_mount_timeout", "30");
     if ((r = cluster_.connect()) < 0) {
@@ -485,6 +505,32 @@ class CephFacade {
     cluster_.shutdown();
   }
 
+  int Exec(
+      librados::IoCtx& ioctx,
+      const std::string& oid,
+      const char* method,
+      ceph::bufferlist& in,
+      ceph::bufferlist* out,
+      Metrics* metrics) {
+    int r = 0;
+    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+      out->clear();
+      r = ioctx.exec(oid, "hnsw_global", method, in, *out);
+      RecordExec(metrics, in, *out);
+      if (r != -ETIMEDOUT && r != -ETIME) {
+        return r;
+      }
+      if (attempt == cfg_.osd_op_retry_limit) {
+        break;
+      }
+      if (metrics) {
+        metrics->rados_exec_retries++;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    }
+    return r;
+  }
+
   void FetchVectorBatch(
       uint32_t owner,
       uint64_t chunk,
@@ -495,10 +541,10 @@ class CephFacade {
     req.global_ids = ids;
     ceph::bufferlist in = encode_msg(req), out;
     const double t0 = now_sec();
-    int r = owner_ioctxs_[owner].exec(
-        ghnsw::OwnerDataOid(chunk), "hnsw_global", "get_node_vector_batch", in, out);
+    int r = Exec(
+        owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
+        "get_node_vector_batch", in, &out, metrics);
     RecordDataTarget(metrics, owner, chunk);
-    RecordExec(metrics, in, out);
     const double elapsed = now_sec() - t0;
     if (metrics) {
       metrics->remote_vector_calls++;
@@ -538,10 +584,10 @@ class CephFacade {
     ceph::bufferlist in = encode_msg(req), out;
     const uint32_t owner = owner_for(global_id, cfg_);
     const uint64_t chunk = chunk_for(global_id, cfg_);
-    int r = owner_ioctxs_[owner_for(global_id, cfg_)].exec(
-        ghnsw::OwnerDataOid(chunk), "hnsw_global", "store_vector", in, out);
+    int r = Exec(
+        owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
+        "store_vector", in, &out, metrics);
     RecordDataTarget(metrics, owner, chunk);
-    RecordExec(metrics, in, out);
     if (r < 0) {
       throw CephOperationError("store_vector", r);
     }
@@ -564,9 +610,9 @@ class CephFacade {
       LabelUpdateBatchRequest req;
       req.entries = owner_labels;
       ceph::bufferlist in = encode_msg(req), out;
-      int r = owner_ioctxs_[owner].exec(
-          ghnsw::OwnerMetaOid(), "hnsw_global", "update_label_batch", in, out);
-      RecordExec(metrics, in, out);
+      int r = Exec(
+          owner_ioctxs_[owner], ghnsw::OwnerMetaOid(),
+          "update_label_batch", in, &out, metrics);
       if (r < 0) {
         throw CephOperationError("update_label_batch", r);
       }
@@ -589,9 +635,9 @@ class CephFacade {
     if (metrics) {
       metrics->label_cas_calls++;
     }
-    int r = owner_ioctxs_[owner].exec(
-        ghnsw::OwnerMetaOid(), "hnsw_global", "cas_label", in, out);
-    RecordExec(metrics, in, out);
+    int r = Exec(
+        owner_ioctxs_[owner], ghnsw::OwnerMetaOid(),
+        "cas_label", in, &out, metrics);
     if (r == -EAGAIN) {
       return false;
     }
@@ -622,9 +668,9 @@ class CephFacade {
       LabelBatchRequest req;
       req.external_labels = owner_labels;
       ceph::bufferlist in = encode_msg(req), out;
-      int r = owner_ioctxs_[owner].exec(
-          ghnsw::OwnerMetaOid(), "hnsw_global", "lookup_label_batch", in, out);
-      RecordExec(metrics, in, out);
+      int r = Exec(
+          owner_ioctxs_[owner], ghnsw::OwnerMetaOid(),
+          "lookup_label_batch", in, &out, metrics);
       if (r < 0) {
         throw CephOperationError("lookup_label_batch", r);
       }
@@ -646,10 +692,10 @@ class CephFacade {
       ceph::bufferlist in = encode_msg(req), out;
       metrics->remote_adj_calls++;
       metrics->remote_adj_nodes += owner_ids.size();
-      int r = owner_ioctxs_[owner_chunk.first].exec(
-          ghnsw::OwnerDataOid(owner_chunk.second), "hnsw_global", "get_node_adjacency_batch", in, out);
+      int r = Exec(
+          owner_ioctxs_[owner_chunk.first], ghnsw::OwnerDataOid(owner_chunk.second),
+          "get_node_adjacency_batch", in, &out, metrics);
       RecordDataTarget(metrics, owner_chunk.first, owner_chunk.second);
-      RecordExec(metrics, in, out);
       if (r < 0) {
         throw CephOperationError("get_node_adjacency_batch", r);
       }
@@ -720,10 +766,10 @@ class CephFacade {
         metrics->distance_osd_queue_est_seconds += noop_sample.queue_est_seconds;
       }
       const double t0 = now_sec();
-      int r = owner_ioctxs_[owner_chunk.first].exec(
-          ghnsw::OwnerDataOid(owner_chunk.second), "hnsw_global", "distance_to_local_batch", in, out);
+      int r = Exec(
+          owner_ioctxs_[owner_chunk.first], ghnsw::OwnerDataOid(owner_chunk.second),
+          "distance_to_local_batch", in, &out, metrics);
       RecordDataTarget(metrics, owner_chunk.first, owner_chunk.second);
-      RecordExec(metrics, in, out);
       metrics->remote_distance_seconds += now_sec() - t0;
       if (r < 0) {
         throw CephOperationError("distance_to_local_batch", r);
@@ -748,10 +794,10 @@ class CephFacade {
       SetAdjacencyBatchRequest req;
       req.entries = owner_entries;
       ceph::bufferlist in = encode_msg(req), out;
-      int r = owner_ioctxs_[owner_chunk.first].exec(
-          ghnsw::OwnerDataOid(owner_chunk.second), "hnsw_global", "set_adjacency_batch", in, out);
+      int r = Exec(
+          owner_ioctxs_[owner_chunk.first], ghnsw::OwnerDataOid(owner_chunk.second),
+          "set_adjacency_batch", in, &out, metrics);
       RecordDataTarget(metrics, owner_chunk.first, owner_chunk.second);
-      RecordExec(metrics, in, out);
       if (r < 0) {
         throw CephOperationError("set_adjacency_batch", r);
       }
@@ -761,20 +807,22 @@ class CephFacade {
     }
   }
 
-  void ApplyPatches(const std::vector<AdjacencyBlob>& entries, Metrics* metrics) {
+  void ApplyPatches(
+      const std::vector<AdjacencyBlob>& entries, uint64_t update_id, Metrics* metrics) {
     auto groups = GroupAdj(entries);
     for (const auto& [owner_chunk, owner_entries] : groups) {
       EdgePatchBatchRequest req;
+      req.update_id = update_id;
       req.max_neighbors = cfg_.M;
       req.entries = owner_entries;
       ceph::bufferlist in = encode_msg(req), out;
       metrics->remote_patch_calls++;
       metrics->total_patched_nodes += owner_entries.size();
       const double t0 = now_sec();
-      int r = owner_ioctxs_[owner_chunk.first].exec(
-          ghnsw::OwnerDataOid(owner_chunk.second), "hnsw_global", "apply_edge_patch_batch", in, out);
+      int r = Exec(
+          owner_ioctxs_[owner_chunk.first], ghnsw::OwnerDataOid(owner_chunk.second),
+          "apply_edge_patch_batch", in, &out, metrics);
       RecordDataTarget(metrics, owner_chunk.first, owner_chunk.second);
-      RecordExec(metrics, in, out);
       metrics->adjacency_patch_seconds += now_sec() - t0;
       if (r < 0) {
         throw CephOperationError("apply_edge_patch_batch", r);
@@ -787,10 +835,12 @@ class CephFacade {
     MarkNodeStaleRequest req;
     req.global_id = global_id;
     ceph::bufferlist in = encode_msg(req), out;
-    int r = owner_ioctxs_[owner_for(global_id, cfg_)].exec(
-        ghnsw::OwnerDataOid(chunk_for(global_id, cfg_)), "hnsw_global", "mark_node_stale", in, out);
+    const uint32_t owner = owner_for(global_id, cfg_);
+    const uint64_t chunk = chunk_for(global_id, cfg_);
+    int r = Exec(
+        owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
+        "mark_node_stale", in, &out, metrics);
     RecordDataTarget(metrics, owner_for(global_id, cfg_), chunk_for(global_id, cfg_));
-    RecordExec(metrics, in, out);
     if (r < 0) {
       throw CephOperationError("mark_node_stale", r);
     }
@@ -803,8 +853,7 @@ class CephFacade {
     const double t0 = now_sec();
     ceph::bufferlist out;
     ceph::bufferlist empty;
-    int r = meta_ioctx_.exec(cfg_.meta_oid, "hnsw_global", "get_global_meta", empty, out);
-    RecordExec(metrics, empty, out);
+    int r = Exec(meta_ioctx_, cfg_.meta_oid, "get_global_meta", empty, &out, metrics);
     if (r < 0) {
       throw CephOperationError("get_global_meta", r);
     }
@@ -816,6 +865,46 @@ class CephFacade {
     return reply.meta;
   }
 
+  ReserveInsertReply ReserveInsert(uint64_t update_id, Metrics* metrics) {
+    ReserveInsertRequest req;
+    req.update_id = update_id;
+    ceph::bufferlist in = encode_msg(req), out;
+    const double t0 = now_sec();
+    if (metrics) {
+      metrics->global_meta_cas_calls++;
+    }
+    int r = Exec(meta_ioctx_, cfg_.meta_oid, "reserve_insert_id", in, &out, metrics);
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - t0;
+    }
+    if (r < 0) {
+      throw CephOperationError("reserve_insert_id", r);
+    }
+    ReserveInsertReply reply;
+    decode_or_die(out, &reply, "ReserveInsertReply");
+    return reply;
+  }
+
+  void FinalizeInsert(
+      uint64_t update_id, uint64_t global_id, uint32_t level, Metrics* metrics) {
+    FinalizeInsertRequest req;
+    req.update_id = update_id;
+    req.global_id = global_id;
+    req.level = level;
+    ceph::bufferlist in = encode_msg(req), out;
+    const double t0 = now_sec();
+    if (metrics) {
+      metrics->global_meta_cas_calls++;
+    }
+    int r = Exec(meta_ioctx_, cfg_.meta_oid, "finalize_insert", in, &out, metrics);
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - t0;
+    }
+    if (r < 0) {
+      throw CephOperationError("finalize_insert", r);
+    }
+  }
+
   bool CasMeta(uint64_t expected_version, const GlobalMeta& meta, Metrics* metrics = nullptr) {
     CasGlobalMetaRequest req;
     req.expected_version = expected_version;
@@ -825,8 +914,7 @@ class CephFacade {
     if (metrics) {
       metrics->global_meta_cas_calls++;
     }
-    int r = meta_ioctx_.exec(cfg_.meta_oid, "hnsw_global", "cas_global_meta", in, out);
-    RecordExec(metrics, in, out);
+    int r = Exec(meta_ioctx_, cfg_.meta_oid, "cas_global_meta", in, &out, metrics);
     if (metrics) {
       metrics->global_meta_update_seconds += now_sec() - t0;
     }
@@ -923,10 +1011,10 @@ class CephFacade {
   TimedNoopSample TimedNoop(uint32_t owner, uint64_t chunk, Metrics* metrics) {
     ceph::bufferlist in, out;
     const double t0 = now_sec();
-    int r = owner_ioctxs_[owner].exec(
-        ghnsw::OwnerDataOid(chunk), "hnsw_global", "timed_noop", in, out);
+    int r = Exec(
+        owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
+        "timed_noop", in, &out, metrics);
     RecordDataTarget(metrics, owner, chunk);
-    RecordExec(metrics, in, out);
     const double roundtrip_seconds = now_sec() - t0;
     if (r < 0) {
       throw CephOperationError("timed_noop", r);
@@ -1126,7 +1214,8 @@ class ScopedStripedSharedLocks {
 
 class Coordinator {
  public:
-  explicit Coordinator(const Config& cfg) : cfg_(cfg), ceph_(cfg), rng_(cfg.seed) {}
+  explicit Coordinator(const Config& cfg)
+      : cfg_(cfg), ceph_(cfg), rng_(cfg.seed), next_update_id_(make_update_id_seed()) {}
 
   void Run() {
     ceph_.Connect();
@@ -1202,84 +1291,12 @@ class Coordinator {
         cfg_.dim,
         cfg_.vector_kind);
     metrics_.load_seconds = now_sec() - t0;
-    auto g0 = now_sec();
     if (vectors.empty()) {
       throw std::runtime_error("no update vectors loaded");
     }
-    if (cfg_.update_parallelism > 1) {
-      RunUpdateParallel(vectors);
-      return;
-    }
-    const double deadline =
-        cfg_.time_limit_seconds > 0 ? (g0 + static_cast<double>(cfg_.time_limit_seconds)) : 0.0;
-    const uint64_t label_span = std::max<uint64_t>(1, cfg_.num_updates);
-    uint64_t i = 0;
-    while (true) {
-      if (cfg_.time_limit_seconds > 0 && now_sec() >= deadline) {
-        metrics_.stopped_by_time_limit = true;
-        break;
-      }
-      if (cfg_.time_limit_seconds == 0 && i >= cfg_.num_updates) {
-        break;
-      }
-      const uint64_t vec_idx = i % vectors.size();
-      const uint64_t label = cfg_.target_start + (i % label_span);
-      begin_update_observation(&metrics_);
-      const double update_t0 = now_sec();
-      try {
-        const double lookup_t0 = now_sec();
-        auto labels = ceph_.LookupLabels({label}, &metrics_);
-        metrics_.lookup_old_seconds += now_sec() - lookup_t0;
-        auto it = labels.find(label);
-        const uint64_t new_id = InsertOne(vectors[vec_idx], label, false);
-        if (!ceph_.CasLabel(
-                label, it == labels.end(), it == labels.end() ? 0 : it->second,
-                new_id, &metrics_)) {
-          metrics_.label_cas_conflicts++;
-          ceph_.MarkStale(new_id, &metrics_);
-          metrics_.stale_marks++;
-          throw CephOperationError("label CAS", -EAGAIN);
-        }
-        if (it != labels.end()) {
-          ceph_.MarkStale(it->second, &metrics_);
-          metrics_.stale_marks++;
-        }
-        update_latencies_ms_.push_back((now_sec() - update_t0) * 1000.0);
-        metrics_.vectors_processed++;
-      } catch (const std::exception& error) {
-        record_update_failure(&metrics_, error);
-      } catch (...) {
-        metrics_.failed_updates++;
-        metrics_.failed_update_other++;
-        metrics_.failure_operations["unknown"]++;
-      }
-      finish_update_observation(&metrics_);
-      if ((i + 1) % 100 == 0) {
-        if (cfg_.time_limit_seconds > 0) {
-          std::cerr << "update attempts " << (i + 1) << " in "
-                    << (now_sec() - g0) << "s / " << cfg_.time_limit_seconds << "s" << std::endl;
-        } else {
-          std::cerr << "update inserted " << (i + 1) << "/" << cfg_.num_updates << std::endl;
-        }
-        WriteProgress(i + 1);
-      }
-      ++i;
-    }
-    metrics_.graph_seconds = now_sec() - g0;
-    if (metrics_.graph_seconds > 0.0) {
-      metrics_.throughput_updates_per_sec =
-          static_cast<double>(metrics_.vectors_processed) / metrics_.graph_seconds;
-    }
-    if (!update_latencies_ms_.empty()) {
-      double sum = 0.0;
-      for (double v : update_latencies_ms_) {
-        sum += v;
-      }
-      metrics_.avg_update_latency_ms = sum / static_cast<double>(update_latencies_ms_.size());
-      metrics_.p50_update_latency_ms = percentile_ms(update_latencies_ms_, 0.50);
-      metrics_.p95_update_latency_ms = percentile_ms(update_latencies_ms_, 0.95);
-      metrics_.p99_update_latency_ms = percentile_ms(update_latencies_ms_, 0.99);
-    }
+    // Use the same idempotent reservation/finalization path at every
+    // concurrency level. The legacy serial insertion path remains build-only.
+    RunUpdateParallel(vectors);
   }
 
 	  void RunUpdateParallel(const std::vector<std::string>& vectors) {
@@ -1348,7 +1365,9 @@ class Coordinator {
 	              auto labels = ctx.ceph.LookupLabels({label}, &ctx.metrics);
 	              ctx.metrics.lookup_old_seconds += now_sec() - lookup_t0;
 	              auto it = labels.find(label);
-              const uint64_t new_id = InsertOneParallel(ctx, vectors[vec_idx], label);
+              const uint64_t update_id = NextUpdateId();
+              const uint64_t new_id =
+                  InsertOneParallel(ctx, vectors[vec_idx], label, update_id);
               if (!ctx.ceph.CasLabel(
                       label, it == labels.end(), it == labels.end() ? 0 : it->second,
                       new_id, &ctx.metrics)) {
@@ -1436,42 +1455,22 @@ class Coordinator {
     }
   }
 
-  ReservedInsert ReserveInsertId(UpdateContext& ctx) {
-    uint64_t retries = 0;
-    while (true) {
-      GlobalMeta meta = ctx.ceph.GetMeta(&ctx.metrics);
-      GlobalMeta next = meta;
-      next.next_global_id += 1;
-      next.version += 1;
-      if (ctx.ceph.CasMeta(meta.version, next, &ctx.metrics)) {
-        return {meta.next_global_id, meta};
-      }
-      ctx.metrics.meta_cas_retries++;
-      ++retries;
-      const uint64_t backoff_us = std::min<uint64_t>(1000, 20 + retries * 10);
-      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+  uint64_t NextUpdateId() {
+    uint64_t id = next_update_id_.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) {
+      id = next_update_id_.fetch_add(1, std::memory_order_relaxed);
     }
+    return id;
   }
 
-  void FinalizeInsertMeta(UpdateContext& ctx, uint64_t global_id, uint32_t level) {
-    uint64_t retries = 0;
-    while (true) {
-      GlobalMeta meta = ctx.ceph.GetMeta(&ctx.metrics);
-      GlobalMeta next = meta;
-      if (next.enterpoint == UINT64_MAX || level > next.max_level) {
-        next.max_level = level;
-        next.enterpoint = global_id;
-      }
-      next.cur_element_count += 1;
-      next.version += 1;
-      if (ctx.ceph.CasMeta(meta.version, next, &ctx.metrics)) {
-        return;
-      }
-      ctx.metrics.meta_cas_retries++;
-      ++retries;
-      const uint64_t backoff_us = std::min<uint64_t>(1000, 20 + retries * 10);
-      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
-    }
+  ReservedInsert ReserveInsertId(UpdateContext& ctx, uint64_t update_id) {
+    ReserveInsertReply reply = ctx.ceph.ReserveInsert(update_id, &ctx.metrics);
+    return {reply.global_id, reply.search_meta};
+  }
+
+  void FinalizeInsertMeta(
+      UpdateContext& ctx, uint64_t update_id, uint64_t global_id, uint32_t level) {
+    ctx.ceph.FinalizeInsert(update_id, global_id, level, &ctx.metrics);
   }
 
   float DistanceToOne(UpdateContext& ctx, const std::string& query, uint64_t id) {
@@ -1641,8 +1640,11 @@ class Coordinator {
 	  }
 
   uint64_t InsertOneParallel(
-      UpdateContext& ctx, const std::string& vector, uint64_t external_label) {
-    ReservedInsert reserved = ReserveInsertId(ctx);
+      UpdateContext& ctx,
+      const std::string& vector,
+      uint64_t external_label,
+      uint64_t update_id) {
+    ReservedInsert reserved = ReserveInsertId(ctx, update_id);
     GlobalMeta meta = reserved.search_meta;
     const uint64_t global_id = reserved.global_id;
     const uint32_t level = SampleLevel(ctx.rng, cfg_.M);
@@ -1655,7 +1657,7 @@ class Coordinator {
 
     if (meta.cur_element_count == 0 || meta.enterpoint == UINT64_MAX) {
       ctx.ceph.SetAdjacency({new_adj}, &ctx.metrics);
-      FinalizeInsertMeta(ctx, global_id, level);
+      FinalizeInsertMeta(ctx, update_id, global_id, level);
       return global_id;
     }
 
@@ -1714,10 +1716,10 @@ class Coordinator {
 	    }
 	    ctx.metrics.patch_prepare_seconds += now_sec() - patch_t0;
 	    if (!ctx.pending_patches.empty()) {
-	      ctx.ceph.ApplyPatches(ctx.pending_patches, &ctx.metrics);
+	      ctx.ceph.ApplyPatches(ctx.pending_patches, update_id, &ctx.metrics);
 	    }
 	    ctx.pending_patches.clear();
-	    FinalizeInsertMeta(ctx, global_id, level);
+	    FinalizeInsertMeta(ctx, update_id, global_id, level);
 	    return global_id;
 	  }
 
@@ -1879,6 +1881,7 @@ class Coordinator {
 
   uint64_t InsertOne(
       const std::string& vector, uint64_t external_label, bool update_label = true) {
+    const uint64_t update_id = NextUpdateId();
     GlobalMeta meta = ceph_.GetMeta(&metrics_);
     const uint64_t global_id = meta.next_global_id;
     const uint32_t level = SampleLevel(rng_, cfg_.M);
@@ -1949,7 +1952,7 @@ class Coordinator {
 
     ceph_.SetAdjacency({new_adj}, &metrics_);
     if (!pending_patches_.empty()) {
-      ceph_.ApplyPatches(pending_patches_, &metrics_);
+      ceph_.ApplyPatches(pending_patches_, update_id, &metrics_);
     }
 
     if (level > meta.max_level) {
@@ -2040,6 +2043,9 @@ class Coordinator {
     out << "  \"meta_cas_retries\": " << metrics_.meta_cas_retries << ",\n";
     out << "  \"label_cas_conflicts\": " << metrics_.label_cas_conflicts << ",\n";
     out << "  \"failed_updates\": " << metrics_.failed_updates << ",\n";
+    out << "  \"rados_exec_retries\": " << metrics_.rados_exec_retries << ",\n";
+    out << "  \"osd_op_timeout_seconds\": " << cfg_.osd_op_timeout_seconds << ",\n";
+    out << "  \"osd_op_retry_limit\": " << cfg_.osd_op_retry_limit << ",\n";
     out << "  \"failure_breakdown\": {\n";
     out << "    \"timeout\": " << metrics_.failed_update_timeouts << ",\n";
     out << "    \"conflict\": " << metrics_.failed_update_conflicts << ",\n";
@@ -2273,6 +2279,7 @@ class Coordinator {
   CephFacade ceph_;
 	  Metrics metrics_;
 	  std::mt19937_64 rng_;
+	  std::atomic<uint64_t> next_update_id_;
 	  StripedLocks node_locks_;
 	  StripedLocks label_locks_;
 	  std::vector<AdjacencyBlob> pending_patches_;
@@ -2365,6 +2372,15 @@ Config ParseArgs(int argc, const char** argv) {
       if (cfg.update_parallelism == 0) {
         throw std::runtime_error("--update-parallelism must be >= 1");
       }
+    } else if (arg == "--osd-op-timeout-seconds") {
+      cfg.osd_op_timeout_seconds =
+          static_cast<uint32_t>(std::stoul(next("--osd-op-timeout-seconds")));
+      if (cfg.osd_op_timeout_seconds == 0) {
+        throw std::runtime_error("--osd-op-timeout-seconds must be >= 1");
+      }
+    } else if (arg == "--osd-op-retry-limit") {
+      cfg.osd_op_retry_limit =
+          static_cast<uint32_t>(std::stoul(next("--osd-op-retry-limit")));
     }
   }
   return cfg;
