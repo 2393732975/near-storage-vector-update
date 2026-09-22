@@ -548,6 +548,8 @@ int main(int argc, const char** argv) {
     meta_kv.emplace("meta/M", EncodeU32(meta.M));
     meta_kv.emplace("meta/ef", EncodeU32(meta.ef));
     meta_kv.emplace("meta/dim", EncodeU32(meta.dim));
+    meta_kv.emplace("meta/vector_kind", EncodeU32(meta.vector_kind));
+    meta_kv.emplace("meta/metric", EncodeU32(meta.metric));
     Ensure(meta_ioctx.omap_set(cfg.meta_oid, meta_kv), "omap_set meta");
     metrics.meta_persist_seconds = NowSec() - t_meta0;
     WriteProgress(cfg, "write_global_meta_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);

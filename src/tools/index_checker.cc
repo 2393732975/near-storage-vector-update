@@ -441,7 +441,9 @@ void WriteReport(const Config& cfg, const GlobalMeta& meta, const Report& report
   out << "    \"version\": " << meta.version << ",\n";
   out << "    \"M\": " << meta.M << ",\n";
   out << "    \"ef\": " << meta.ef << ",\n";
-  out << "    \"dim\": " << meta.dim << "\n";
+  out << "    \"dim\": " << meta.dim << ",\n";
+  out << "    \"vector_kind\": " << meta.vector_kind << ",\n";
+  out << "    \"metric\": " << meta.metric << "\n";
   out << "  },\n";
   out << "  \"nodes_expected\": " << report.nodes_expected << ",\n";
   out << "  \"nodes_checked\": " << report.nodes_checked << ",\n";
