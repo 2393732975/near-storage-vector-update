@@ -42,7 +42,14 @@ make
 
 - `libcls_hnsw_global.so`：部署到测试 OSD 的 CLS 模块；
 - `nsvu-update-coordinator`：build/update Coordinator；
-- `nsvu-base-importer`：离线 base 导入器。
+- `nsvu-base-importer`：离线 base 导入器；
+- `nsvu-index-checker`：不依赖 CLS 的离线索引一致性检查器。
+
+运行本地协议往返测试：
+
+```bash
+make check
+```
 
 ## 实验与安全
 
@@ -75,4 +82,4 @@ MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
 
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。
 
-更多设计细节见 [研究路线](docs/research-roadmap.md)、[阶段剖析方法](docs/stage-profiling.md) 和 [计算侧对照实验](docs/compute-node-baseline.md)。
+更多设计细节见 [研究路线](docs/research-roadmap.md)、[阶段 0 正确性与观测基线](docs/correctness-observability-baseline.md)、[阶段剖析方法](docs/stage-profiling.md) 和 [计算侧对照实验](docs/compute-node-baseline.md)。

@@ -17,8 +17,10 @@ namespace {
 
 using ghnsw::AdjacencyBlob;
 using ghnsw::CasGlobalMetaRequest;
+using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
+using ghnsw::EdgePatchBatchRequest;
 using ghnsw::GetAdjBatchReply;
 using ghnsw::GetGlobalMetaReply;
 using ghnsw::GetVectorBatchReply;
@@ -336,6 +338,45 @@ int cls_update_label_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph
   return r;
 }
 
+int cls_cas_label(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  CasLabelRequest req;
+  int r = decode_msg(in, &req);
+  if (r < 0) {
+    return r;
+  }
+
+  ceph::bufferlist current_bl;
+  r = cls_cxx_map_get_val(hctx, ghnsw::LabelKey(req.external_label), &current_bl);
+  bool matches = false;
+  if (req.expect_missing) {
+    matches = r == -ENOENT;
+  } else if (r == 0) {
+    uint64_t current = 0;
+    r = decode_u64(current_bl, &current);
+    if (r < 0) {
+      return r;
+    }
+    matches = current == req.expected_global_id;
+  } else if (r != -ENOENT) {
+    return r;
+  }
+
+  StatusReply reply;
+  if (!matches) {
+    reply.status = -EAGAIN;
+    encode_msg(reply, out);
+    return -EAGAIN;
+  }
+  std::map<std::string, ceph::bufferlist> values;
+  values.emplace(
+      ghnsw::LabelKey(req.external_label), encode_u64(req.replacement_global_id));
+  r = cls_cxx_map_set_vals(hctx, &values);
+  reply.status = r;
+  reply.count = r < 0 ? 0 : 1;
+  encode_msg(reply, out);
+  return r;
+}
+
 int cls_get_node_vector_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   IdBatchRequest req;
   int r = decode_msg(in, &req);
@@ -509,12 +550,14 @@ int set_adjacency_common(
 
 int cls_apply_edge_patch_batch(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
-  SetAdjacencyBatchRequest req;
+  EdgePatchBatchRequest req;
   int r = decode_msg(in, &req);
   if (r < 0) {
     return r;
   }
-  constexpr size_t kBaselineM = 8;
+  if (req.max_neighbors == 0) {
+    return -EINVAL;
+  }
   std::map<std::string, ceph::bufferlist> kv;
   std::map<uint64_t, AdjacencyBlob> merged_patches;
   for (const auto& patch : req.entries) {
@@ -555,7 +598,8 @@ int cls_apply_edge_patch_batch(
             dst.push_back(id);
           }
         }
-        const size_t max_m = level == 0 ? kBaselineM * 2 : kBaselineM;
+        const size_t max_m =
+            level == 0 ? static_cast<size_t>(req.max_neighbors) * 2 : req.max_neighbors;
         if (dst.size() > max_m) {
           dst.erase(dst.begin(), dst.end() - static_cast<std::ptrdiff_t>(max_m));
         }
@@ -639,6 +683,7 @@ CLS_INIT(hnsw_global) {
   cls_handle_t h_class;
   cls_method_handle_t h_store_vector;
   cls_method_handle_t h_update_label_batch;
+  cls_method_handle_t h_cas_label;
   cls_method_handle_t h_get_node_vector_batch;
   cls_method_handle_t h_lookup_label_batch;
   cls_method_handle_t h_get_node_adjacency_batch;
@@ -659,6 +704,12 @@ CLS_INIT(hnsw_global) {
       CLS_METHOD_RD | CLS_METHOD_WR,
       cls_update_label_batch,
       &h_update_label_batch);
+  cls_register_cxx_method(
+      h_class,
+      "cas_label",
+      CLS_METHOD_RD | CLS_METHOD_WR,
+      cls_cas_label,
+      &h_cas_label);
   cls_register_cxx_method(
       h_class,
       "get_node_vector_batch",

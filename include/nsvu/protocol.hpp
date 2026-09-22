@@ -248,6 +248,27 @@ struct LabelUpdateBatchRequest {
   }
 };
 
+struct CasLabelRequest {
+  uint64_t external_label = 0;
+  uint64_t expected_global_id = 0;
+  uint64_t replacement_global_id = 0;
+  bool expect_missing = false;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(external_label, bl);
+    ceph::encode(expected_global_id, bl);
+    ceph::encode(replacement_global_id, bl);
+    ceph::encode(expect_missing, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(external_label, it);
+    ceph::decode(expected_global_id, it);
+    ceph::decode(replacement_global_id, it);
+    ceph::decode(expect_missing, it);
+  }
+};
+
 struct DistanceBatchRequest {
   std::string query_vector;
   uint32_t dim = 0;
@@ -336,6 +357,32 @@ struct SetAdjacencyBatchRequest {
   }
 
   void decode(ceph::buffer::list::const_iterator& it) {
+    uint32_t count = 0;
+    ceph::decode(count, it);
+    entries.clear();
+    entries.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      AdjacencyBlob entry;
+      entry.decode(it);
+      entries.push_back(std::move(entry));
+    }
+  }
+};
+
+struct EdgePatchBatchRequest {
+  uint32_t max_neighbors = 8;
+  std::vector<AdjacencyBlob> entries;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(max_neighbors, bl);
+    ceph::encode(static_cast<uint32_t>(entries.size()), bl);
+    for (const auto& entry : entries) {
+      entry.encode(bl);
+    }
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(max_neighbors, it);
     uint32_t count = 0;
     ceph::decode(count, it);
     entries.clear();
