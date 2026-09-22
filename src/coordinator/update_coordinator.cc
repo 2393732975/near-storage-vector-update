@@ -880,8 +880,31 @@ class CephFacade {
     if (r < 0) {
       throw CephOperationError("reserve_insert_id", r);
     }
+    std::set<std::string> keys{ghnsw::ReservationKey(update_id)};
+    std::map<std::string, ceph::bufferlist> values;
+    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+      values.clear();
+      r = meta_ioctx_.omap_get_vals_by_keys(cfg_.meta_oid, keys, &values);
+      if (r != -ETIMEDOUT && r != -ETIME) {
+        break;
+      }
+      if (attempt == cfg_.osd_op_retry_limit) {
+        break;
+      }
+      if (metrics) {
+        metrics->rados_exec_retries++;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    }
+    if (r < 0) {
+      throw CephOperationError("read_insert_reservation", r);
+    }
+    auto value = values.find(ghnsw::ReservationKey(update_id));
+    if (value == values.end()) {
+      throw CephOperationError("read_insert_reservation", -ENOENT);
+    }
     ReserveInsertReply reply;
-    decode_or_die(out, &reply, "ReserveInsertReply");
+    decode_or_die(value->second, &reply, "ReserveInsertReply");
     return reply;
   }
 
