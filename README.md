@@ -48,6 +48,15 @@ make
 
 数据集路径、Ceph 配置和 keyring 必须由运行者通过参数或本机环境提供，绝不可提交。`scripts/initialize-experiment-pools.sh` 会删除并重建实验池，必须显式传入 `--confirm-reset`。
 
+实验结束后先预览、再删除本项目创建的 `nsvu_*` 池：
+
+```bash
+CEPH_USE_SUDO=true EXPECTED_CEPH_FSID="$(sudo -n ceph fsid)" scripts/cleanup-experiment-pools.sh
+CEPH_USE_SUDO=true EXPECTED_CEPH_FSID="$(sudo -n ceph fsid)" scripts/cleanup-experiment-pools.sh --confirm-cleanup
+```
+
+一次性清理旧实验遗留的 `ghnsw_*` 池时，额外添加 `--include-legacy-ghnsw`。脚本只删除精确白名单中的实验池，且仅在全部 OSD 为 `up/in`、全部 PG 为 `active+clean` 时执行；清理后会再次等待并检查集群。BlueStore 空间回收是异步的，已有 slow-op 告警可能在统计窗口结束前继续显示，其他健康告警也不会被脚本静默或屏蔽。清理成功但整体健康状态仍非 `HEALTH_OK` 时，脚本返回状态码 3 并打印剩余告警。
+
 `scripts/run-ppt-baselines.sh` 默认运行 `osd compute` 两条路径和全部四个数据集。
 使用空格分隔的 `MODES` 与 `DATASETS` 可以只运行指定子集，例如：
 
