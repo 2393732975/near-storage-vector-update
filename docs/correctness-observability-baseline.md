@@ -57,3 +57,10 @@ Coordinator 会先落盘 metrics，再在存在失败更新时以非零状态退
 metrics、检查报告、Git commit、CLS 哈希和集群映射。当前协议还没有 intent/log；
 跨对象崩溃恢复与幂等 patch 属于阶段 2，阶段 0 通过检查器暴露此类残留，而不将其
 误判为成功。
+
+正式四数据集验收可通过安全门控 runner 执行；它会为每个数据集重建实验池：
+
+```bash
+CEPH_KEYRING=/path/to/keyring DATASET_ROOT=/path/to/datasets \
+  scripts/run-phase0-validation.sh --confirm-reset
+```
