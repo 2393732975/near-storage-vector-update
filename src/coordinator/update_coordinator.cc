@@ -124,6 +124,7 @@ struct Metrics {
   uint64_t max_unique_data_pgs = 0;
   uint64_t max_unique_owner_shards = 0;
   uint64_t cross_owner_neighbor_links = 0;
+  std::map<std::string, uint64_t> failure_operations;
   std::set<std::string> current_data_objects;
   std::set<std::string> current_data_pgs;
   std::set<uint32_t> current_owner_shards;
@@ -177,11 +178,15 @@ class ProtocolError : public std::runtime_error {
 class CephOperationError : public std::runtime_error {
  public:
   CephOperationError(const std::string& what, int code)
-      : std::runtime_error(what + " failed: " + std::to_string(code)), code_(code) {}
+      : std::runtime_error(what + " failed: " + std::to_string(code)),
+        operation_(what),
+        code_(code) {}
 
   int code() const { return code_; }
+  const std::string& operation() const { return operation_; }
 
  private:
+  std::string operation_;
   int code_;
 };
 
@@ -211,13 +216,16 @@ void record_update_failure(Metrics* metrics, const std::exception& error) {
   metrics->failed_updates++;
   if (dynamic_cast<const ProtocolError*>(&error) != nullptr) {
     metrics->failed_update_protocol++;
+    metrics->failure_operations["protocol_decode"]++;
     return;
   }
   const auto* ceph_error = dynamic_cast<const CephOperationError*>(&error);
   if (ceph_error == nullptr) {
     metrics->failed_update_other++;
+    metrics->failure_operations["other"]++;
     return;
   }
+  metrics->failure_operations[ceph_error->operation()]++;
   switch (ceph_error->code()) {
     case -ETIMEDOUT:
     case -ETIME:
@@ -369,6 +377,9 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->max_unique_owner_shards = std::max(
       dst->max_unique_owner_shards, src.max_unique_owner_shards);
   dst->cross_owner_neighbor_links += src.cross_owner_neighbor_links;
+  for (const auto& [operation, count] : src.failure_operations) {
+    dst->failure_operations[operation] += count;
+  }
   dst->lookup_old_seconds += src.lookup_old_seconds;
   dst->mark_stale_seconds += src.mark_stale_seconds;
   dst->store_vector_seconds += src.store_vector_seconds;
@@ -444,9 +455,9 @@ class CephFacade {
         (r = cluster_.conf_set("keyring", cfg_.keyring.c_str())) < 0) {
       throw std::runtime_error("conf_set keyring failed");
     }
-    // Baseline experiments should not hang forever on a single synchronous
-    // cls_exec. Timed-out updates are counted and the window is finalized.
-    (void)cluster_.conf_set("rados_osd_op_timeout", "45");
+    // Do not set rados_osd_op_timeout for modifying operations: a client-side
+    // timeout does not cancel an operation that the OSD may later commit.
+    // The experiment window stops launching work and then drains in-flight ops.
     (void)cluster_.conf_set("rados_mon_op_timeout", "30");
     (void)cluster_.conf_set("client_mount_timeout", "30");
     if ((r = cluster_.connect()) < 0) {
@@ -1240,6 +1251,7 @@ class Coordinator {
       } catch (...) {
         metrics_.failed_updates++;
         metrics_.failed_update_other++;
+        metrics_.failure_operations["unknown"]++;
       }
       finish_update_observation(&metrics_);
       if ((i + 1) % 100 == 0) {
@@ -1374,6 +1386,7 @@ class Coordinator {
           } catch (...) {
             ctx.metrics.failed_updates++;
             ctx.metrics.failed_update_other++;
+            ctx.metrics.failure_operations["unknown"]++;
             finish_update_observation(&ctx.metrics);
           }
         }
@@ -2034,6 +2047,17 @@ class Coordinator {
     out << "    \"protocol\": " << metrics_.failed_update_protocol << ",\n";
     out << "    \"other\": " << metrics_.failed_update_other << "\n";
     out << "  },\n";
+    out << "  \"failure_operations\": {";
+    bool first_failure_operation = true;
+    for (const auto& [operation, count] : metrics_.failure_operations) {
+      out << (first_failure_operation ? "\n" : ",\n");
+      out << "    \"" << operation << "\": " << count;
+      first_failure_operation = false;
+    }
+    if (!first_failure_operation) {
+      out << "\n  ";
+    }
+    out << "},\n";
     out << "  \"time_limit_seconds\": " << metrics_.time_limit_seconds << ",\n";
     out << "  \"update_parallelism\": " << metrics_.update_parallelism << ",\n";
     out << "  \"stopped_by_time_limit\": "

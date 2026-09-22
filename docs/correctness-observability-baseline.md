@@ -50,6 +50,8 @@ label 的归属、解码和 ACTIVE 目标。退出码 `0` 表示通过，`1` 表
 `--distance-probe-interval-ms` 调整。PG 数由 librados 当前 OSDMap 计算；owner 数
 是逻辑分片数，不等同于实际 OSD 数，正式实验仍须在 manifest 中记录 PG/OSD 映射。
 Coordinator 会先落盘 metrics，再在存在失败更新时以非零状态退出。
+修改型 RADOS 操作不设置客户端 OSD 超时，因为超时返回并不会取消 OSD 端可能仍会
+提交的写入；时间窗停止发起新 update 后，Coordinator 会等待已开始的同步操作完成。
 
 ## 验收门槛
 
