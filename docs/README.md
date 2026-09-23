@@ -5,6 +5,7 @@
 
 ## 当前文档
 
+- [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
 - [阶段 0 正确性与观测基线](correctness-observability-baseline.md)：更新协议、离线检查器和正式验收流程。
 - [阶段耗时与数据移动打点](stage-profiling.md)：compute/OSD 路径、指标边界、统计口径和运行入口。
