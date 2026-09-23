@@ -70,6 +70,16 @@ runner 的数据参数固定在脚本中。目录和文件名必须如下：
 上限前停止。`.fbin` 和 `.u8bin` 都以两个 little-endian `uint32` 开头，依次为
 向量数和维度，随后是连续向量元素。
 
+阶段 1 还要求以下 ground-truth 文件。它们以两个 little-endian `uint32` 开头，
+依次为 query 数和每条 query 的邻居数，随后是连续 `uint32` base ID：
+
+| 数据集 | ground truth | header |
+| --- | --- | ---: |
+| GIST1M | `gist1m/gt.public.1K.top1000.ibin` | 1,000 × 1,000 |
+| Text2Image10M | `text2image10m/text2image-10M.gt.bin` | 100,000 × 100 |
+| Deep100M | `deep100m/deep-100M.gt.bin` | 10,000 × 100 |
+| SIFT100M | `sift100m/gt_100.bin` | 10,000 × 100 |
+
 ### 3.1 Deep100M 与 Text2Image10M
 
 Deep1B 和 Text-to-Image1B 的文件地址来自
@@ -219,8 +229,8 @@ for name in names:
 PY
 ```
 
-当前更新实验不使用 ground truth；只有增加 Recall@K 评价时才需要下载相同规模、
-相同 query 的 ground-truth 文件。
+PPT baseline runner 不使用 ground truth；阶段 1 runner 要求相同规模、相同 query
+的 ground-truth 文件，并按更新提交前搜索结果计算静态 Recall@K。
 
 ## 4. 运行 PPT 背景 compute 实验
 
@@ -271,27 +281,48 @@ nohup env \
 printf '%s\n' "$!" >"$run_root/runner.pid"
 ```
 
-## 6. 运行同轮 compute/OSD 对照
+## 6. 运行阶段 1 严格 compute/OSD 对照
 
-严格对照至少重复三次，每次使用新的结果目录。单次运行命令为：
+正式对照使用 `run-phase1-ab.sh`。它会对每个数据集和模式重新建池、重新导入
+base，执行三次独立重复；奇数轮按 compute→OSD、偶数轮按 OSD→compute，减少
+固定顺序偏差。每次更新后运行一致性检查，并统计提交前 level-0 搜索相对原始
+base ground truth 的静态 Recall@10。
 
 ```bash
-run_root="$PWD/results/ab-$(date -u +%Y%m%dT%H%M%SZ)"
+run_root="$PWD/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"
 test ! -e "$run_root"
+mkdir -p "$run_root"
 
-CEPH_KEYRING="$CEPH_KEYRING" \
-DATASET_ROOT="$DATASET_ROOT" \
-MODES="compute osd" \
-DATASETS="gist1m text2image10m deep100m sift100m" \
-WINDOW_SECONDS=300 \
-UPDATE_PARALLELISM=4 \
-RUN_ROOT="$run_root" \
-scripts/run-ppt-baselines.sh
+nohup env \
+  CEPH_KEYRING="$CEPH_KEYRING" \
+  DATASET_ROOT="$DATASET_ROOT" \
+  DATASETS="gist1m text2image10m deep100m sift100m" \
+  REPETITIONS=3 \
+  WINDOW_SECONDS=300 \
+  UPDATE_PARALLELISM=4 \
+  CHECKER_BATCH_SIZE=8192 \
+  OSD_OP_TIMEOUT_SECONDS=45 \
+  OSD_OP_RETRY_LIMIT=3 \
+  RECALL_K=10 \
+  RUN_ROOT="$run_root" \
+  scripts/run-phase1-ab.sh --confirm-reset \
+  >"$run_root/runner.log" 2>&1 &
+
+printf '%s\n' "$!" >"$run_root/runner.pid"
+printf 'PID=%s RUN_ROOT=%s\n' "$!" "$run_root"
 ```
 
-runner 会为每个模式/数据集重新导入 base 并重建池，但顺序运行仍可能受缓存和时间
-漂移影响。正式论文实验应在多轮中轮换 `MODES="compute osd"` 与
-`MODES="osd compute"`。
+ground truth 必须位于第 3 节列出的数据集目录。该 Recall 是更新提交前的静态
+回归门槛，不是修改后语料库的精确 Recall；精确动态质量评估需要重新计算 ground
+truth。每轮虽然使用新池，但导入会预热缓存，因此结果应标记为
+`fresh-pool-after-import`，不能声称是受控冷缓存结果。
+
+正常结束后自动生成 `summary.md` 和 `summary.json`。若需要重新汇总：
+
+```bash
+python3 scripts/summarize-phase1-ab.py "$run_root" \
+  --output "$run_root/summary.md" --json-output "$run_root/summary.json"
+```
 
 ## 7. 运行阶段 0 正确性验收
 
@@ -320,17 +351,17 @@ scripts/run-phase0-validation.sh --confirm-reset
 
 ## 8. 参数说明
 
-| 参数 | baseline 默认值 | 阶段 0 默认值 | 建议 |
-| --- | ---: | ---: | --- |
-| `MODES` | `osd compute` | 固定 `osd` | 单项实验显式指定，A/B 轮换顺序 |
-| `DATASETS` | 四数据集 | 四数据集 | 调试可选子集，正式实验全部运行 |
-| `WINDOW_SECONDS` | 300 | 300 | 正式对照保持一致 |
-| `UPDATE_PARALLELISM` | 1 | 4 | 本项目正式基线显式设为 4 |
-| `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 始终显式设置新目录 |
-| `ROUNDS` | 不适用 | 3 | 正确性验收至少 3 |
-| `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 内存不足时降低 |
-| `OSD_OP_TIMEOUT_SECONDS` | 45 | 45 | 不为掩盖 slow-op 而任意增大 |
-| `OSD_OP_RETRY_LIMIT` | 3 | 3 | 阶段 0 会记录在 manifest |
+| 参数 | baseline | 阶段 0 | 阶段 1 | 建议 |
+| --- | ---: | ---: | ---: | --- |
+| `DATASETS` | 四数据集 | 四数据集 | 四数据集 | 调试可选子集，正式实验全部运行 |
+| `WINDOW_SECONDS` | 300 | 300 | 300 | 正式对照保持一致 |
+| `UPDATE_PARALLELISM` | 1 | 4 | 4 | 本项目正式基线显式设为 4 |
+| `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
+| `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
+| `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |
+| `RECALL_K` | 不适用 | 不适用 | 10 | 当前 ground truth 至少含 top-100 |
+| `OSD_OP_TIMEOUT_SECONDS` | 45 | 45 | 45 | 不为掩盖 slow-op 而任意增大 |
+| `OSD_OP_RETRY_LIMIT` | 3 | 3 | 3 | 记录在 manifest |
 
 缩短窗口、减少数据集或降低检查规模只能用于 smoke test，不能与正式结果混合。
 
@@ -339,7 +370,7 @@ scripts/run-phase0-validation.sh --confirm-reset
 启动前先确认没有重复 runner：
 
 ```bash
-pgrep -af 'run-ppt-baselines|run-phase0-validation|nsvu-base-importer|nsvu-update-coordinator'
+pgrep -af 'run-ppt-baselines|run-phase0-validation|run-phase1-ab|nsvu-base-importer|nsvu-update-coordinator'
 ```
 
 baseline 输出结构：
@@ -353,7 +384,9 @@ RUN_ROOT/<mode>/<dataset>/
 ```
 
 阶段 0 还包含 `manifest.txt`、`suite.log`、`placement.txt`，以及每轮的
-`round-N/index-check.json`。检查进度和完成标志：
+`round-N/index-check.json`。阶段 1 的单轮路径为
+`rep-N/<mode>/<dataset>/`，正常结束标志是日志中的
+`phase-1 strict A/B passed`。检查进度和完成标志：
 
 ```bash
 ps -p "$(cat "$run_root/runner.pid")" -o pid,stat,etime,cmd
