@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -68,6 +69,7 @@ struct Config {
   std::string meta_oid = "hnsw.global.meta";
   std::string metrics_out;
   std::string progress_out;
+  std::string ground_truth;
   uint64_t num_vectors = 100000;
   uint64_t num_updates = 100;
   uint64_t update_offset = 100000;
@@ -87,6 +89,7 @@ struct Config {
   uint32_t update_parallelism = 1;
   uint32_t osd_op_timeout_seconds = 45;
   uint32_t osd_op_retry_limit = 3;
+  uint32_t recall_k = 10;
 };
 
 struct Metrics {
@@ -130,6 +133,9 @@ struct Metrics {
   uint64_t max_unique_data_pgs = 0;
   uint64_t max_unique_owner_shards = 0;
   uint64_t cross_owner_neighbor_links = 0;
+  uint64_t recall_evaluated_updates = 0;
+  uint64_t recall_hits = 0;
+  uint64_t recall_denominator = 0;
   std::map<std::string, uint64_t> failure_operations;
   std::set<std::string> current_data_objects;
   std::set<std::string> current_data_pgs;
@@ -395,6 +401,9 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->max_unique_owner_shards = std::max(
       dst->max_unique_owner_shards, src.max_unique_owner_shards);
   dst->cross_owner_neighbor_links += src.cross_owner_neighbor_links;
+  dst->recall_evaluated_updates += src.recall_evaluated_updates;
+  dst->recall_hits += src.recall_hits;
+  dst->recall_denominator += src.recall_denominator;
   for (const auto& [operation, count] : src.failure_operations) {
     dst->failure_operations[operation] += count;
   }
@@ -1136,6 +1145,55 @@ std::vector<std::string> LoadVectors(
   return out;
 }
 
+std::vector<std::vector<uint32_t>> LoadGroundTruth(
+    const std::string& path,
+    uint64_t offset,
+    uint64_t count,
+    uint32_t recall_k) {
+  if (path.empty()) {
+    return {};
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("failed to open ground truth: " + path);
+  }
+  uint32_t query_count = 0;
+  uint32_t stored_k = 0;
+  in.read(reinterpret_cast<char*>(&query_count), sizeof(query_count));
+  in.read(reinterpret_cast<char*>(&stored_k), sizeof(stored_k));
+  if (!in || query_count == 0 || stored_k == 0) {
+    throw std::runtime_error("invalid ground-truth header: " + path);
+  }
+  if (recall_k == 0 || recall_k > stored_k) {
+    throw std::runtime_error(
+        "recall K exceeds ground-truth width: requested=" +
+        std::to_string(recall_k) + " stored=" + std::to_string(stored_k));
+  }
+  if (offset > query_count || count > static_cast<uint64_t>(query_count) - offset) {
+    throw std::runtime_error("ground-truth read range exceeds query count");
+  }
+
+  const uint64_t row_bytes = static_cast<uint64_t>(stored_k) * sizeof(uint32_t);
+  in.seekg(static_cast<std::streamoff>(8 + offset * row_bytes), std::ios::beg);
+  if (!in) {
+    throw std::runtime_error("failed to seek ground truth: " + path);
+  }
+
+  std::vector<std::vector<uint32_t>> rows;
+  rows.reserve(count);
+  std::vector<uint32_t> stored_row(stored_k);
+  for (uint64_t i = 0; i < count; ++i) {
+    in.read(
+        reinterpret_cast<char*>(stored_row.data()),
+        static_cast<std::streamsize>(row_bytes));
+    if (!in) {
+      throw std::runtime_error("ground-truth row read failed: " + path);
+    }
+    rows.emplace_back(stored_row.begin(), stored_row.begin() + recall_k);
+  }
+  return rows;
+}
+
 std::vector<float> ToFloatVector(const std::string& raw, uint32_t dim, uint32_t vector_kind) {
   std::vector<float> out(dim);
   if (vector_kind == ghnsw::kVectorKindU8) {
@@ -1313,6 +1371,11 @@ class Coordinator {
         cfg_.num_updates,
         cfg_.dim,
         cfg_.vector_kind);
+    ground_truth_ = LoadGroundTruth(
+        cfg_.ground_truth,
+        cfg_.update_offset,
+        vectors.size(),
+        cfg_.recall_k);
     metrics_.load_seconds = now_sec() - t0;
     if (vectors.empty()) {
       throw std::runtime_error("no update vectors loaded");
@@ -1389,8 +1452,13 @@ class Coordinator {
 	              ctx.metrics.lookup_old_seconds += now_sec() - lookup_t0;
 	              auto it = labels.find(label);
               const uint64_t update_id = NextUpdateId();
-              const uint64_t new_id =
-                  InsertOneParallel(ctx, vectors[vec_idx], label, update_id);
+              std::vector<uint64_t> recall_candidates;
+              const uint64_t new_id = InsertOneParallel(
+                  ctx,
+                  vectors[vec_idx],
+                  label,
+                  update_id,
+                  ground_truth_.empty() ? nullptr : &recall_candidates);
               if (!ctx.ceph.CasLabel(
                       label, it == labels.end(), it == labels.end() ? 0 : it->second,
                       new_id, &ctx.metrics)) {
@@ -1402,6 +1470,10 @@ class Coordinator {
               if (it != labels.end()) {
                 ctx.ceph.MarkStale(it->second, &ctx.metrics);
                 ctx.metrics.stale_marks++;
+              }
+              if (!ground_truth_.empty()) {
+                RecordRecall(
+                    &ctx.metrics, recall_candidates, ground_truth_.at(vec_idx));
               }
             }
             finish_update_observation(&ctx.metrics);
@@ -1666,7 +1738,8 @@ class Coordinator {
       UpdateContext& ctx,
       const std::string& vector,
       uint64_t external_label,
-      uint64_t update_id) {
+      uint64_t update_id,
+      std::vector<uint64_t>* recall_candidates) {
     ReservedInsert reserved = ReserveInsertId(ctx, update_id);
     GlobalMeta meta = reserved.search_meta;
     const uint64_t global_id = reserved.global_id;
@@ -1707,6 +1780,14 @@ class Coordinator {
       ctx.metrics.graph_search_seconds += now_sec() - search_t0;
       ctx.metrics.graph_search_distance_seconds +=
           ctx.metrics.remote_distance_seconds - search_dist_t0;
+	      if (l == 0 && recall_candidates != nullptr) {
+	        recall_candidates->clear();
+	        const size_t limit = std::min<size_t>(cfg_.recall_k, found.size());
+	        recall_candidates->reserve(limit);
+	        for (size_t i = 0; i < limit; ++i) {
+	          recall_candidates->push_back(found[i].id);
+	        }
+	      }
 	      auto selected = SelectNeighbors(found, l == 0 ? cfg_.M * 2 : cfg_.M);
 	      auto& level_neighbors = new_adj.neighbors[l];
 	      for (const auto& nbr : selected) {
@@ -1745,6 +1826,31 @@ class Coordinator {
 	    FinalizeInsertMeta(ctx, update_id, global_id, level);
 	    return global_id;
 	  }
+
+  void RecordRecall(
+      Metrics* metrics,
+      const std::vector<uint64_t>& candidates,
+      const std::vector<uint32_t>& ground_truth) const {
+    const size_t denominator = std::min<size_t>(cfg_.recall_k, ground_truth.size());
+    if (denominator == 0) {
+      return;
+    }
+    std::unordered_set<uint64_t> candidate_ids;
+    const size_t candidate_count = std::min(denominator, candidates.size());
+    candidate_ids.reserve(candidate_count);
+    for (size_t i = 0; i < candidate_count; ++i) {
+      candidate_ids.insert(candidates[i]);
+    }
+    uint64_t hits = 0;
+    for (size_t i = 0; i < denominator; ++i) {
+      if (candidate_ids.count(ground_truth[i]) != 0) {
+        ++hits;
+      }
+    }
+    metrics->recall_evaluated_updates++;
+    metrics->recall_hits += hits;
+    metrics->recall_denominator += denominator;
+  }
 
   float DistanceToOne(const std::string& query, uint64_t id) {
     auto distances = ceph_.Distances(query, {id}, &metrics_);
@@ -2096,6 +2202,23 @@ class Coordinator {
     out << "  \"p50_update_latency_ms\": " << metrics_.p50_update_latency_ms << ",\n";
     out << "  \"p95_update_latency_ms\": " << metrics_.p95_update_latency_ms << ",\n";
     out << "  \"p99_update_latency_ms\": " << metrics_.p99_update_latency_ms << ",\n";
+    out << "  \"quality\": {\n";
+    out << "    \"ground_truth_enabled\": "
+        << (cfg_.ground_truth.empty() ? "false" : "true") << ",\n";
+    out << "    \"recall_k\": " << cfg_.recall_k << ",\n";
+    out << "    \"evaluated_updates\": "
+        << metrics_.recall_evaluated_updates << ",\n";
+    out << "    \"hits\": " << metrics_.recall_hits << ",\n";
+    out << "    \"denominator\": " << metrics_.recall_denominator << ",\n";
+    out << "    \"precommit_static_recall_at_k\": "
+        << (metrics_.recall_denominator > 0
+                ? static_cast<double>(metrics_.recall_hits) /
+                      static_cast<double>(metrics_.recall_denominator)
+                : 0.0)
+        << ",\n";
+    out << "    \"semantics\": "
+        << "\"level-0 precommit search against original-base ground truth\"\n";
+    out << "  },\n";
     out << "  \"observability\": {\n";
     out << "    \"update_attempts\": " << metrics_.update_attempts_observed << ",\n";
     out << "    \"total_cls_exec_calls\": " << metrics_.total_cls_exec_calls << ",\n";
@@ -2294,6 +2417,10 @@ class Coordinator {
     out << "  \"remote_adj_nodes\": " << metrics_.remote_adj_nodes << ",\n";
     out << "  \"total_patched_nodes\": " << metrics_.total_patched_nodes << ",\n";
     out << "  \"total_neighbor_links\": " << metrics_.total_neighbor_links << ",\n";
+    out << "  \"recall_evaluated_updates\": "
+        << metrics_.recall_evaluated_updates << ",\n";
+    out << "  \"recall_hits\": " << metrics_.recall_hits << ",\n";
+    out << "  \"recall_denominator\": " << metrics_.recall_denominator << ",\n";
     out << "  \"elapsed_seconds\": " << now_sec() << "\n";
     out << "}\n";
   }
@@ -2307,6 +2434,7 @@ class Coordinator {
 	  StripedLocks label_locks_;
 	  std::vector<AdjacencyBlob> pending_patches_;
 	  std::vector<double> update_latencies_ms_;
+	  std::vector<std::vector<uint32_t>> ground_truth_;
 	};
 
 Config ParseArgs(int argc, const char** argv) {
@@ -2371,6 +2499,13 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.metrics_out = next("--metrics-out");
     } else if (arg == "--progress-out") {
       cfg.progress_out = next("--progress-out");
+    } else if (arg == "--ground-truth") {
+      cfg.ground_truth = next("--ground-truth");
+    } else if (arg == "--recall-k") {
+      cfg.recall_k = static_cast<uint32_t>(std::stoul(next("--recall-k")));
+      if (cfg.recall_k == 0) {
+        throw std::runtime_error("--recall-k must be >= 1");
+      }
     } else if (arg == "--vector-kind") {
       cfg.vector_kind = parse_vector_kind(next("--vector-kind"));
     } else if (arg == "--metric") {
