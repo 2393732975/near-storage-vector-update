@@ -9,8 +9,8 @@
 ## 构建与本地验证
 
 ```bash
-export CEPH_SRC=/home/hhf/ceph/src
-export HNSWLIB_INCLUDE=/home/hhf/motivation_test/hnsw_test/include
+export CEPH_SRC=/path/to/ceph/src
+export HNSWLIB_INCLUDE=/path/to/hnswlib/include
 make -j2
 make check
 ```

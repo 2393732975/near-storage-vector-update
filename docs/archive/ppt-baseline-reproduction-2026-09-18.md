@@ -1,5 +1,8 @@
 # PPT 基线复现实验报告（2026-09-18）
 
+> **历史报告：** 本轮包含失败更新，且已被阶段 0 的正确性修正取代。本文仅用于
+> 追溯早期复现过程，不能作为当前性能或论文结论。
+
 ## 结论
 
 已完成 4 个数据集、两种距离计算路径共 8 组基线实验。计算节点路径在 GIST1M、Text2Image10M 与 Deep100M 上吞吐更高；OSD CLS 路径不回传候选向量，消除了 118 MB–3.50 GB 的跨网络向量传输。SIFT100M 中 OSD 吞吐高 6.9%，但平均延迟仍高 25.4%。因此，本轮结果支持“算子卸载显著减少数据移动”，但尚不能以吞吐优势证明 OSD 基线优于计算节点基线。
@@ -9,7 +12,7 @@
 - 代码：`36a9a1e`（含 `.u8bin` 文件头解析与更新偏移修复）。
 - 运行器：`scripts/run-ppt-baselines.sh`；时间窗 300 s，`UPDATE_PARALLELISM=4`，每个模式/数据集使用新建的 `nsvu_*` 单副本池。
 - 原始 JSON（未纳入 Git）：`results/ppt-baseline-20260917T101500Z/`。
-- 对照来源：`docs/proposal-defense.pptx` 的计算节点/OSD CLS 基线页。
+- 对照来源：[开题答辩 PPT](../references/proposal-defense.pptx) 的计算节点/OSD CLS 基线页。
 
 ## 本次更新结果
 

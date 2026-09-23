@@ -24,7 +24,7 @@ src/coordinator/    全局 HNSW 构建与在线更新编排
 src/importer/       本地构建 base HNSW 并导入 Ceph
 scripts/            构建与安全门控的实验池初始化脚本
 config/             不含真实路径的数据集配置示例
-docs/               开题材料、实验设计和研究路线
+docs/               当前设计、实验方法、正式报告与历史材料索引
 results/            本地产生的指标；默认不纳入 Git
 ```
 
@@ -82,4 +82,8 @@ MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
 
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。
 
-更多设计细节见 [研究路线](docs/research-roadmap.md)、[阶段 0 正确性与观测基线](docs/correctness-observability-baseline.md)、[阶段剖析方法](docs/stage-profiling.md) 和 [计算侧对照实验](docs/compute-node-baseline.md)。
+文档入口见 [docs/README.md](docs/README.md)。核心内容包括
+[优化实施方案](docs/optimization-implementation-plan.md)、
+[阶段 0 正确性与观测基线](docs/correctness-observability-baseline.md)、
+[阶段耗时与数据移动打点](docs/stage-profiling.md)和
+[阶段 0 集群验收报告](docs/reports/phase0-validation-report-2026-09-22.md)。

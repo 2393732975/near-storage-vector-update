@@ -1,186 +1,99 @@
-# Update 阶段耗时分解实验设计
+# 更新阶段耗时与数据移动打点
 
-## 目标
+本文定义 `nsvu-update-coordinator` 当前输出的阶段计时口径，并说明如何比较
+compute-node 与 OSD/CLS 两条更新路径。正式结论必须同时满足零失败更新和离线
+一致性检查通过。
 
-本实验用于回答：一次全图在线 update 中，主要阶段分别占多少时间。当前关注的阶段为：
+## 两条基线路径
 
-- 查旧点
-- 标记 stale
-- 全图搜索
-- 远端距离计算
-- 邻接 patch
-- 全局 meta 更新
+- `--distance-mode compute`：从 Ceph 拉取候选向量，在 Coordinator 本地计算距离。
+- `--distance-mode osd`：把 query 和候选 ID 发给目标对象，由 CLS 读取本地向量并
+  计算距离。图搜索控制、邻接修改和元数据协议仍由 Coordinator 编排。
 
-实验基于现有 `ceph_global_hnsw_baseline` 真实 update 路径实现，不使用模拟路径。因此统计结果包含 `librados cls_exec`、OSD 内 `cls` 执行和 Ceph 对象/OMAP 访问开销。
+两者使用相同的 base 图、更新语义和持久化结构，区别仅在距离阶段是否搬运候选
+向量。compute 路径用 `remote_vector_bytes` 和 `remote_vector_calls` 量化数据移动。
 
-## 阶段定义
+## 完整更新主阶段
 
-### 查旧点
+所有 `*_seconds` 都是 worker 累计工作时间。完整更新按以下互斥阶段分析：
 
-对应 `lookup_label_batch`。
+| 阶段 | JSON 字段 | 边界 |
+| --- | --- | --- |
+| 查找旧点 | `lookup_old_seconds` | label 到旧 `global_id` 的查找 |
+| 写入新向量 | `store_vector_seconds` | payload 与 `VectorRef` 持久化 |
+| 图搜索控制 | `full_graph_search_exclusive_seconds` | 图搜索总时间扣除距离调用 |
+| 远端距离 | `remote_distance_seconds` | Coordinator 观测的距离阶段端到端时间 |
+| 写新邻接 | `set_new_adjacency_seconds` | 新节点邻接表写入 |
+| 修补旧邻接 | `adjacency_patch_exclusive_seconds` | prepare 与 apply，扣除重复统计的距离调用 |
+| 更新元数据 | `global_meta_update_seconds` | global meta 的条件更新 |
+| 标记旧向量 | `mark_stale_seconds` | 将旧节点状态改为 stale |
 
-输入外部 label，查找当前 label 对应的旧 `global_id`。
+每次成功更新的阶段耗时应计算为：
 
-统计字段：
-
-```json
-stage_profile.lookup_old_seconds
-stage_profile.lookup_old_pct
-stage_profile.lookup_old_ms_per_update
+```text
+stage_ms_per_update = sum(stage_seconds) * 1000 / sum(vectors_processed)
 ```
 
-### 标记 stale
+多轮汇总时，平均更新延迟按 `vectors_processed` 加权。其余未单独打点的成本为
+加权平均更新延迟减去上述阶段之和，主要包含 label CAS、调度和客户端逻辑。
 
-对应 `mark_node_stale`。
+不要直接把 JSON 中的 `*_pct` 当作完整更新占比：它们以墙钟
+`graph_seconds` 为分母，而并发 worker 的累计时间会重叠，合计可能超过 100%。
+`accounted_update_seconds` 及汇总脚本提供的是旧六阶段累计工作时间视图，不包含
+已独立观测的写新向量和写新邻接，适合对比路径，但不等同于完整延迟分解。
 
-找到旧点后，将旧点的 `VectorRef.flags` 标记为 stale。
+## 距离阶段内部拆分
 
-统计字段：
+OSD/CLS 路径满足：
 
-```json
-stage_profile.mark_stale_seconds
-stage_profile.mark_stale_pct
-stage_profile.mark_stale_ms_per_update
+```text
+remote_distance
+  = distance_roundtrip_queue
+  + distance_vector_ref
+  + distance_payload_read
+  + distance_compute
+  + distance_cls_unaccounted
 ```
 
-### 全图搜索
+- `distance_vector_ref_seconds`：CLS 内读取 OMAP `VectorRef`。
+- `distance_payload_read_seconds`：CLS 内读取对象 payload。
+- `distance_compute_seconds`：CLS 内真正执行 L2/IP 算距。
+- `distance_cls_unaccounted_seconds`：CLS 内编码、循环等未细分时间。
+- `distance_roundtrip_queue_seconds`：客户端端到端时间减去 CLS 总时间，包含网络、
+  librados、OSD 排队和线程调度，不能解释为纯网络时间。
 
-对应 HNSW 的 greedy search 和 search layer 控制逻辑，包含邻接表读取、候选队列维护和邻居选择，但为了避免与远端距离计算重复计数，报告中的 `full_graph_search` 是扣除了远端距离计算后的 exclusive 时间。
+开启 `--distance-split-probe` 后，低频 noop 探针还会给出
+`distance_network_roundtrip_est_seconds` 和 `distance_osd_queue_est_seconds`。探针是
+估算手段，正式性能实验必须记录是否开启及采样间隔。
 
-统计字段：
+compute-node 路径满足：
 
-```json
-stage_profile.full_graph_search_exclusive_seconds
-stage_profile.full_graph_search_pct
-stage_profile.full_graph_search_ms_per_update
+```text
+remote_distance
+  = distance_fetch_rpc
+  + distance_local_compute
+  + distance_compute_node_unaccounted
 ```
 
-原始 inclusive 字段：
+其中 `distance_fetch_rpc_seconds` 是候选向量 RPC，
+`distance_local_compute_seconds` 是本地算距。路径价值应同时用延迟、吞吐和
+`remote_vector_bytes / vectors_processed` 判断，不能只比较纯算距时间。
 
-```json
-stage_profile.graph_search_seconds_raw
-stage_profile.graph_search_distance_seconds
+## 运行和汇总
+
+运行四数据集基线；脚本会为每个模式/数据集重建实验池：
+
+```bash
+CEPH_KEYRING=/path/to/keyring \
+DATASET_ROOT=/path/to/datasets \
+MODES="compute osd" \
+DATASETS="gist1m text2image10m deep100m sift100m" \
+WINDOW_SECONDS=300 \
+UPDATE_PARALLELISM=4 \
+scripts/run-ppt-baselines.sh
 ```
 
-### 远端距离计算
-
-对应 `distance_to_local_batch`。
-
-Coordinator 将候选点按 owner/chunk 分组，调用目标 OSD 的 `cls` 在 OSD 内计算距离。
-
-统计字段：
-
-```json
-stage_profile.remote_distance_seconds
-stage_profile.remote_distance_pct
-stage_profile.remote_distance_ms_per_update
-```
-
-需要注意，`remote_distance_seconds` 是 Coordinator 侧观测到的 `cls_exec(distance_to_local_batch)` 端到端时间，不等于纯距离计算时间。它包含：
-
-- Coordinator 到 OSD 的 `cls_exec` 请求路径。
-- OSD 调度和执行 `cls` 的开销。
-- OMAP 中 `vec/<global_id> -> VectorRef` 的读取。
-- 根据 `VectorRef.offset/bytes` 读取 payload 中的向量字节。
-- 真正的 L2/IP 距离计算。
-- reply 编码、返回和客户端 decode。
-
-因此现在进一步在 `DistanceBatchReply` 中返回 CLS 内部细分：
-
-```json
-stage_profile.distance_vector_ref_seconds
-stage_profile.distance_payload_read_seconds
-stage_profile.distance_compute_seconds
-stage_profile.distance_unaccounted_seconds
-```
-
-含义如下：
-
-- `distance_vector_ref_seconds`：OSD 内读取 OMAP `VectorRef` 的累计时间。
-- `distance_payload_read_seconds`：OSD 内从对象 payload 读取向量字节的累计时间。
-- `distance_compute_seconds`：OSD 内真正执行 L2/IP 距离计算的累计时间。
-- `distance_unaccounted_seconds`：Coordinator 侧远端距离总耗时扣除上述三项后的剩余部分，主要包括 `cls_exec` 往返、OSD 调度、编码/解码以及未细分的函数开销。
-
-这些字段也会输出对应百分比和每次 update 平均耗时：
-
-```json
-stage_profile.distance_vector_ref_pct
-stage_profile.distance_payload_read_pct
-stage_profile.distance_compute_pct
-stage_profile.distance_unaccounted_pct
-stage_profile.distance_vector_ref_ms_per_update
-stage_profile.distance_payload_read_ms_per_update
-stage_profile.distance_compute_ms_per_update
-stage_profile.distance_unaccounted_ms_per_update
-```
-
-### 邻接 patch
-
-包含两部分：
-
-- patch prepare：读取旧点邻接表，尝试把新点加入旧点邻居列表，必要时裁剪邻居。
-- patch apply：调用 `apply_edge_patch_batch` 将修改后的旧点邻接表写回 owner OSD。
-
-为了避免与远端距离计算重复计数，报告中的 `adjacency_patch` 会扣除 patch prepare 期间发生的远端距离计算。
-
-统计字段：
-
-```json
-stage_profile.adjacency_patch_exclusive_seconds
-stage_profile.adjacency_patch_pct
-stage_profile.adjacency_patch_ms_per_update
-```
-
-原始字段：
-
-```json
-stage_profile.patch_prepare_seconds_raw
-stage_profile.patch_apply_seconds_raw
-stage_profile.patch_prepare_distance_seconds
-```
-
-### 全局 meta 更新
-
-对应 `cas_global_meta`。
-
-插入完成后更新：
-
-- `enterpoint`
-- `max_level`
-- `cur_element_count`
-- `next_global_id`
-- `version`
-
-统计字段：
-
-```json
-stage_profile.global_meta_update_seconds
-stage_profile.global_meta_update_pct
-stage_profile.global_meta_update_ms_per_update
-```
-
-### 其他
-
-`other_update_seconds` 是端到端 update 时间扣除上述阶段后的剩余部分，主要包括：
-
-- 新向量写入 `store_vector`
-- 新点邻接表写入 `set_adjacency_batch`
-- 读取全局 meta
-- 函数调度和少量本地逻辑
-
-统计字段：
-
-```json
-stage_profile.other_update_seconds
-stage_profile.other_update_pct
-stage_profile.other_update_ms_per_update
-```
-
-## 运行方式
-
-### 汇总当前 JSON 打点
-
-`nsvu-update-coordinator` 已在 PPT 的三个观测点上记录原始耗时。对一轮输出运行：
+汇总单次实验目录：
 
 ```bash
 python3 scripts/summarize-stage-costs.py \
@@ -188,91 +101,13 @@ python3 scripts/summarize-stage-costs.py \
   --output results/ppt-baseline-<timestamp>/stage-costs.md
 ```
 
-汇总器使用 `accounted_update_seconds` 作为主路径阶段占比的分母，适用于
-`UPDATE_PARALLELISM > 1`。不要直接采用 JSON 旧有的 `*_pct`：它们除以墙钟
-`graph_seconds`，而并发 worker 的累计阶段时间会重叠，因而可能大于 100%。
+每轮还必须保存 Git commit、CLS 哈希、Ceph 版本、池配置和实际 PG/OSD 落点。
+原始 JSON 与生成结果保存在 `results/`，不提交 Git。
 
-输出包含与答辩 PPT 对应的三类指标：
+## 结果判读规则
 
-- 观测点 A：远端距离中的 RTT/排队、CLS OMAP 引用读取、payload 读取与纯算距；
-- 观测点 B：扣除距离调用后的邻接 patch 独占时间；
-- 观测点 C：`cas_global_meta` 全局元数据更新时间。
-
-当 `failed_updates` 非零时，报告仅用于定位瓶颈；修复失败后再作论文性能结论。
-
-### 单数据集短时间窗
-
-如果当前 Ceph 中已经导入了对应数据集的 base 图，可以直接运行 update 时间窗：
-
-```bash
-TIME_LIMIT_SECONDS=300 ./run_dataset_experiment.sh sift100m window30m
-```
-
-输出：
-
-```text
-results/multids/sift100m/update.window_300s.json
-```
-
-### 四数据集完整阶段 profile
-
-如果需要重新导入每个数据集并分别运行固定时间窗：
-
-```bash
-./run_stage_profile_suite.sh 300
-```
-
-参数 `300` 表示每个数据集 update 窗口为 300 秒。该脚本会顺序执行：
-
-```text
-GIST1M -> Text-to-Image10M -> Deep100M -> SIFT100M
-```
-
-每个数据集都会先重新 import base，再运行 update profile。
-
-### 生成汇总表和图
-
-```bash
-./generate_stage_profile_summary.py 300
-```
-
-输出：
-
-```text
-results/stage_profile_300s/stage_profile_summary.csv
-results/stage_profile_300s/stage_profile_report.md
-results/stage_profile_300s/figures/stage_profile_percent.svg
-```
-
-## 已完成的 smoke test
-
-已对当前 `SIFT100M` base 状态做了一个 20 秒短窗验证：
-
-```text
-results/multids/sift100m/update.window_20s.json
-results/stage_profile_20s/stage_profile_report.md
-```
-
-结果显示，在该短窗样本中：
-
-- 远端距离计算约占 `77.76%`
-- 邻接 patch 约占 `13.91%`
-- 全图搜索控制逻辑约占 `4.82%`
-- 查旧点、stale 标记和全局 meta 更新占比较小
-
-该 20 秒结果只用于验证计时逻辑是否工作，不建议作为正式结论。正式实验建议使用 300 秒或 1800 秒窗口。
-
-随后又对细化后的 `distance_to_local_batch` 做了一个 `SIFT100M` 30 秒短窗验证：
-
-```text
-results/multids/sift100m/update.window_30s.json
-```
-
-该短窗中，`remote_distance` 约占 update 总时间 `76.49%`，进一步拆分为：
-
-- `distance_vector_ref`：约 `25.86%`
-- `distance_payload_read`：约 `17.50%`
-- `distance_compute`：约 `0.10%`
-- `distance_unaccounted`：约 `33.02%`
-
-这说明在当前实现中，`远端距离计算` 这个大项主要不是纯 L2/IP 算术开销，而是 OMAP 查引用、payload 读取和 `cls_exec` 往返/调度等系统路径开销。
+- `failed_updates` 必须为 0，检查器必须返回 `status=pass`。
+- A/B 必须使用同一代码提交、数据、池落点、并发度和探针配置。
+- 至少重复三轮，报告均值、标准差、P50/P95/P99 和每次更新的数据移动量。
+- 累积轮次受缓存与索引状态变化影响，不能当成独立冷启动样本。
+- `roundtrip/queue` 很高表示系统路径占主导，但不能据此单独归因于网络或 OSD。
