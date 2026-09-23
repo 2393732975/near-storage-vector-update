@@ -92,6 +92,13 @@ struct Config {
   uint32_t recall_k = 10;
 };
 
+struct OperationMetrics {
+  uint64_t calls = 0;
+  uint64_t request_bytes = 0;
+  uint64_t reply_bytes = 0;
+  double roundtrip_seconds = 0.0;
+};
+
 struct Metrics {
   std::string mode;
   uint64_t vectors_processed = 0;
@@ -123,6 +130,7 @@ struct Metrics {
   uint64_t label_cas_calls = 0;
   uint64_t cls_request_bytes = 0;
   uint64_t cls_reply_bytes = 0;
+  uint64_t logical_distance_query_bytes = 0;
   uint64_t distance_batches = 0;
   uint64_t max_candidates_per_distance_batch = 0;
   uint64_t update_attempts_observed = 0;
@@ -136,6 +144,7 @@ struct Metrics {
   uint64_t recall_evaluated_updates = 0;
   uint64_t recall_hits = 0;
   uint64_t recall_denominator = 0;
+  std::map<std::string, OperationMetrics> operation_metrics;
   std::map<std::string, uint64_t> failure_operations;
   std::set<std::string> current_data_objects;
   std::set<std::string> current_data_pgs;
@@ -387,6 +396,7 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->label_cas_calls += src.label_cas_calls;
   dst->cls_request_bytes += src.cls_request_bytes;
   dst->cls_reply_bytes += src.cls_reply_bytes;
+  dst->logical_distance_query_bytes += src.logical_distance_query_bytes;
   dst->distance_batches += src.distance_batches;
   dst->max_candidates_per_distance_batch = std::max(
       dst->max_candidates_per_distance_batch, src.max_candidates_per_distance_batch);
@@ -404,6 +414,13 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->recall_evaluated_updates += src.recall_evaluated_updates;
   dst->recall_hits += src.recall_hits;
   dst->recall_denominator += src.recall_denominator;
+  for (const auto& [operation, values] : src.operation_metrics) {
+    auto& aggregate = dst->operation_metrics[operation];
+    aggregate.calls += values.calls;
+    aggregate.request_bytes += values.request_bytes;
+    aggregate.reply_bytes += values.reply_bytes;
+    aggregate.roundtrip_seconds += values.roundtrip_seconds;
+  }
   for (const auto& [operation, count] : src.failure_operations) {
     dst->failure_operations[operation] += count;
   }
@@ -524,8 +541,9 @@ class CephFacade {
     int r = 0;
     for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
       out->clear();
+      const double t0 = now_sec();
       r = ioctx.exec(oid, "hnsw_global", method, in, *out);
-      RecordExec(metrics, in, *out);
+      RecordExec(metrics, method, in, *out, now_sec() - t0);
       if (r != -ETIMEDOUT && r != -ETIME) {
         return r;
       }
@@ -761,6 +779,7 @@ class CephFacade {
       metrics->remote_distance_calls++;
       metrics->remote_candidates_scored += owner_ids.size();
       metrics->distance_batches++;
+      metrics->logical_distance_query_bytes += query_vec.size();
       metrics->max_candidates_per_distance_batch = std::max<uint64_t>(
           metrics->max_candidates_per_distance_batch, owner_ids.size());
       if (cfg_.distance_split_probe && metrics &&
@@ -994,14 +1013,21 @@ class CephFacade {
 
   void RecordExec(
       Metrics* metrics,
+      const std::string& operation,
       const ceph::bufferlist& request,
-      const ceph::bufferlist& reply) const {
+      const ceph::bufferlist& reply,
+      double roundtrip_seconds) const {
     if (!metrics) {
       return;
     }
     metrics->total_cls_exec_calls++;
     metrics->cls_request_bytes += request.length();
     metrics->cls_reply_bytes += reply.length();
+    auto& values = metrics->operation_metrics[operation];
+    values.calls++;
+    values.request_bytes += request.length();
+    values.reply_bytes += reply.length();
+    values.roundtrip_seconds += roundtrip_seconds;
   }
 
   std::map<std::pair<uint32_t, uint64_t>, std::vector<uint64_t>> GroupIds(
@@ -2219,6 +2245,27 @@ class Coordinator {
     out << "    \"semantics\": "
         << "\"level-0 precommit search against original-base ground truth\"\n";
     out << "  },\n";
+    out << "  \"operation_profile\": {";
+    bool first_operation = true;
+    for (const auto& [operation, values] : metrics_.operation_metrics) {
+      out << (first_operation ? "\n" : ",\n");
+      out << "    \"" << operation << "\": {";
+      out << "\"calls\": " << values.calls << ", ";
+      out << "\"request_bytes\": " << values.request_bytes << ", ";
+      out << "\"reply_bytes\": " << values.reply_bytes << ", ";
+      out << "\"roundtrip_seconds\": " << values.roundtrip_seconds << ", ";
+      out << "\"avg_roundtrip_ms\": "
+          << (values.calls > 0
+                  ? values.roundtrip_seconds * 1000.0 /
+                        static_cast<double>(values.calls)
+                  : 0.0)
+          << "}";
+      first_operation = false;
+    }
+    if (!first_operation) {
+      out << "\n  ";
+    }
+    out << "},\n";
     out << "  \"observability\": {\n";
     out << "    \"update_attempts\": " << metrics_.update_attempts_observed << ",\n";
     out << "    \"total_cls_exec_calls\": " << metrics_.total_cls_exec_calls << ",\n";
@@ -2229,6 +2276,8 @@ class Coordinator {
         << per_attempt(metrics_.total_cls_exec_calls) << ",\n";
     out << "    \"cls_request_bytes\": " << metrics_.cls_request_bytes << ",\n";
     out << "    \"cls_reply_bytes\": " << metrics_.cls_reply_bytes << ",\n";
+    out << "    \"logical_distance_query_bytes\": "
+        << metrics_.logical_distance_query_bytes << ",\n";
     out << "    \"distance_batches\": " << metrics_.distance_batches << ",\n";
     out << "    \"candidates_per_distance_batch\": "
         << (metrics_.distance_batches > 0
