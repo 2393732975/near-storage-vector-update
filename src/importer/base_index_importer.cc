@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -52,6 +53,8 @@ struct Metrics {
   double load_seconds = 0.0;
   double convert_seconds = 0.0;
   double build_seconds = 0.0;
+  double id_mapping_seconds = 0.0;
+  uint64_t permuted_internal_ids = 0;
   double vector_persist_seconds = 0.0;
   double adjacency_persist_seconds = 0.0;
   double meta_persist_seconds = 0.0;
@@ -216,20 +219,21 @@ std::vector<float> MakeFloatVectorsFromKind(
 
 AdjacencyBlob BuildAdjacencyBlob(
     const hnswlib::HierarchicalNSW<float>& index,
+    hnswlib::tableint internal_id,
     uint64_t global_id) {
   AdjacencyBlob blob;
   blob.global_id = global_id;
-  blob.level_count = static_cast<uint32_t>(index.element_levels_[global_id] + 1);
+  blob.level_count = static_cast<uint32_t>(index.element_levels_[internal_id] + 1);
   blob.neighbors.resize(blob.level_count);
   for (uint32_t level = 0; level < blob.level_count; ++level) {
-    auto* ll = level == 0 ? index.get_linklist0(global_id)
-                          : index.get_linklist(global_id, static_cast<int>(level));
+    auto* ll = level == 0 ? index.get_linklist0(internal_id)
+                          : index.get_linklist(internal_id, static_cast<int>(level));
     const uint32_t neighbor_count = *ll;
     auto* neighbors = reinterpret_cast<hnswlib::tableint*>(ll + 1);
     auto& out = blob.neighbors[level];
     out.reserve(neighbor_count);
     for (uint32_t i = 0; i < neighbor_count; ++i) {
-      out.push_back(static_cast<uint64_t>(neighbors[i]));
+      out.push_back(static_cast<uint64_t>(index.getExternalLabel(neighbors[i])));
     }
   }
   return blob;
@@ -269,6 +273,8 @@ void WriteMetrics(const Config& cfg, const Metrics& metrics) {
   out << "  \"load_seconds\": " << metrics.load_seconds << ",\n";
   out << "  \"convert_seconds\": " << metrics.convert_seconds << ",\n";
   out << "  \"build_seconds\": " << metrics.build_seconds << ",\n";
+  out << "  \"id_mapping_seconds\": " << metrics.id_mapping_seconds << ",\n";
+  out << "  \"permuted_internal_ids\": " << metrics.permuted_internal_ids << ",\n";
   out << "  \"vector_persist_seconds\": " << metrics.vector_persist_seconds << ",\n";
   out << "  \"adjacency_persist_seconds\": " << metrics.adjacency_persist_seconds << ",\n";
   out << "  \"meta_persist_seconds\": " << metrics.meta_persist_seconds << ",\n";
@@ -379,6 +385,37 @@ int main(int argc, const char** argv) {
     metrics.build_seconds = NowSec() - t_build0;
     WriteProgress(cfg, "build_hnsw_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);
 
+    std::cerr << "stage=map_internal_ids" << std::endl;
+    const double t_mapping0 = NowSec();
+    const hnswlib::tableint invalid_internal_id =
+        std::numeric_limits<hnswlib::tableint>::max();
+    std::vector<hnswlib::tableint> external_to_internal(
+        cfg.num_vectors, invalid_internal_id);
+    for (uint64_t internal = 0; internal < cfg.num_vectors; ++internal) {
+      const uint64_t external = static_cast<uint64_t>(
+          index.getExternalLabel(static_cast<hnswlib::tableint>(internal)));
+      if (external >= cfg.num_vectors) {
+        throw std::runtime_error(
+            "HNSW external label is out of range: " + std::to_string(external));
+      }
+      if (external_to_internal[external] != invalid_internal_id) {
+        throw std::runtime_error(
+            "duplicate HNSW external label: " + std::to_string(external));
+      }
+      external_to_internal[external] = static_cast<hnswlib::tableint>(internal);
+      if (external != internal) {
+        metrics.permuted_internal_ids++;
+      }
+    }
+    for (uint64_t external = 0; external < cfg.num_vectors; ++external) {
+      if (external_to_internal[external] == invalid_internal_id) {
+        throw std::runtime_error(
+            "missing HNSW external label: " + std::to_string(external));
+      }
+    }
+    metrics.id_mapping_seconds = NowSec() - t_mapping0;
+    WriteProgress(cfg, "map_internal_ids_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);
+
     librados::Rados cluster;
     Ensure(cluster.init2("client.admin", "client", 0), "rados init");
     Ensure(cluster.conf_read_file("/etc/ceph/ceph.conf"), "read ceph.conf");
@@ -447,7 +484,7 @@ int main(int argc, const char** argv) {
       ref.dim = cfg.dim;
       ref.vector_kind = cfg.vector_kind;
       ref.flags = ghnsw::kVectorFlagActive;
-      ref.level = static_cast<uint32_t>(index.element_levels_[i]);
+      ref.level = static_cast<uint32_t>(index.element_levels_[external_to_internal[i]]);
       owner_payload_batches[owner].append(raw_vectors[i]);
       owner_chunk_bytes[owner] += raw_vectors[i].size();
       owner_data_meta_batches[owner].emplace(ghnsw::VecKey(i), EncodeMsg(ref));
@@ -501,7 +538,7 @@ int main(int argc, const char** argv) {
         }
         owner_adj_chunk[owner] = chunk;
       }
-      AdjacencyBlob adj = BuildAdjacencyBlob(index, i);
+      AdjacencyBlob adj = BuildAdjacencyBlob(index, external_to_internal[i], i);
       owner_adj_batches[owner].emplace(ghnsw::NodeKey(i), EncodeMsg(adj));
       if (owner_adj_batches[owner].size() >= cfg.omap_batch) {
         FlushOmapBatch(
@@ -529,7 +566,8 @@ int main(int argc, const char** argv) {
     librados::bufferlist empty;
     Ensure(meta_ioctx.write_full(cfg.meta_oid, empty), "write_full meta");
     GlobalMeta meta;
-    meta.enterpoint = static_cast<uint64_t>(index.enterpoint_node_);
+    meta.enterpoint = static_cast<uint64_t>(
+        index.getExternalLabel(index.enterpoint_node_));
     meta.max_level = static_cast<uint32_t>(std::max(0, index.maxlevel_));
     meta.cur_element_count = cfg.num_vectors;
     meta.next_global_id = cfg.num_vectors;
