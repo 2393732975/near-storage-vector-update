@@ -3,6 +3,7 @@
 #include "include/ceph_assert.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,10 +29,20 @@ struct Config {
   std::string owner_pool_prefix = "nsvu_owner_";
   std::string meta_oid = "hnsw.global.meta";
   std::string output;
+  std::string reference_input;
+  std::string reference_input_format;
   uint32_t owners = 5;
   uint64_t points_per_object = 250000;
+  uint64_t reference_count = 0;
   uint32_t batch_size = 2048;
   uint32_t max_reported_errors = 100;
+  uint32_t semantic_samples = 0;
+  double semantic_min_edge_win_rate = 0.60;
+};
+
+struct SemanticSample {
+  uint64_t global_id = 0;
+  std::vector<uint64_t> neighbors;
 };
 
 struct Report {
@@ -43,6 +55,11 @@ struct Report {
   uint64_t label_mappings = 0;
   uint64_t errors = 0;
   uint64_t warnings = 0;
+  uint64_t semantic_nodes_sampled = 0;
+  uint64_t semantic_edges_compared = 0;
+  uint64_t semantic_edge_wins = 0;
+  double semantic_edge_distance_sum = 0.0;
+  double semantic_control_distance_sum = 0.0;
   bool entrypoint_found = false;
   bool entrypoint_active = false;
   std::vector<std::string> error_samples;
@@ -88,6 +105,99 @@ uint32_t LabelOwnerFor(uint64_t external_label, const Config& cfg) {
 uint64_t ChunkFor(uint64_t global_id, const Config& cfg) {
   return (global_id / cfg.owners) / cfg.points_per_object;
 }
+
+float VectorDistance(
+    const std::string& left,
+    const std::string& right,
+    const GlobalMeta& meta) {
+  if (meta.vector_kind == ghnsw::kVectorKindU8) {
+    const auto* a = reinterpret_cast<const uint8_t*>(left.data());
+    const auto* b = reinterpret_cast<const uint8_t*>(right.data());
+    float distance = 0.0f;
+    for (uint32_t i = 0; i < meta.dim; ++i) {
+      const float delta = static_cast<float>(a[i]) - static_cast<float>(b[i]);
+      distance += delta * delta;
+    }
+    return distance;
+  }
+  const auto* a = reinterpret_cast<const float*>(left.data());
+  const auto* b = reinterpret_cast<const float*>(right.data());
+  if (meta.metric == ghnsw::kMetricIP) {
+    float dot = 0.0f;
+    for (uint32_t i = 0; i < meta.dim; ++i) {
+      dot += a[i] * b[i];
+    }
+    return 1.0f - dot;
+  }
+  float distance = 0.0f;
+  for (uint32_t i = 0; i < meta.dim; ++i) {
+    const float delta = a[i] - b[i];
+    distance += delta * delta;
+  }
+  return distance;
+}
+
+uint64_t Mix64(uint64_t value) {
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
+class ReferenceVectors {
+ public:
+  ReferenceVectors(const Config& cfg, const GlobalMeta& meta)
+      : input_(cfg.reference_input, std::ios::binary),
+        vector_bytes_(
+            static_cast<uint64_t>(meta.dim) *
+            (meta.vector_kind == ghnsw::kVectorKindF32 ? sizeof(float) : sizeof(uint8_t))),
+        count_(cfg.reference_count) {
+    if (!input_) {
+      throw std::runtime_error("failed to open semantic reference: " + cfg.reference_input);
+    }
+    if (cfg.reference_input_format != "fbin" && cfg.reference_input_format != "u8bin") {
+      throw std::runtime_error("semantic reference format must be fbin or u8bin");
+    }
+    if ((cfg.reference_input_format == "fbin") !=
+        (meta.vector_kind == ghnsw::kVectorKindF32)) {
+      throw std::runtime_error("semantic reference format does not match vector kind");
+    }
+    uint32_t file_count = 0;
+    uint32_t file_dim = 0;
+    input_.read(reinterpret_cast<char*>(&file_count), sizeof(file_count));
+    input_.read(reinterpret_cast<char*>(&file_dim), sizeof(file_dim));
+    if (!input_ || file_dim != meta.dim || count_ > file_count) {
+      throw std::runtime_error("semantic reference header does not match index");
+    }
+  }
+
+  const std::string& Get(uint64_t global_id) {
+    if (global_id >= count_) {
+      throw std::runtime_error("semantic reference id is out of range");
+    }
+    auto cached = cache_.find(global_id);
+    if (cached != cache_.end()) {
+      return cached->second;
+    }
+    input_.clear();
+    input_.seekg(
+        static_cast<std::streamoff>(8 + global_id * vector_bytes_),
+        std::ios::beg);
+    std::string vector(vector_bytes_, '\0');
+    input_.read(vector.data(), static_cast<std::streamsize>(vector_bytes_));
+    if (!input_) {
+      throw std::runtime_error(
+          "failed to read semantic reference vector " + std::to_string(global_id));
+    }
+    return cache_.emplace(global_id, std::move(vector)).first->second;
+  }
+
+ private:
+  std::ifstream input_;
+  uint64_t vector_bytes_ = 0;
+  uint64_t count_ = 0;
+  std::unordered_map<uint64_t, std::string> cache_;
+};
 
 void AddError(Report* report, const Config& cfg, const std::string& message) {
   report->errors++;
@@ -210,6 +320,7 @@ void VerifyBatch(
     librados::IoCtx& ioctx,
     std::vector<librados::IoCtx>* owner_ioctxs,
     std::vector<uint8_t>* node_states,
+    std::vector<SemanticSample>* semantic_samples,
     Report* report) {
   std::set<std::string> keys;
   for (uint64_t id : ids) {
@@ -282,6 +393,14 @@ void VerifyBatch(
     }
     if (adjacency.neighbors.size() != static_cast<size_t>(ref.level) + 1) {
       AddError(report, cfg, "adjacency level count mismatch for node " + std::to_string(id));
+    }
+    if (cfg.semantic_samples > 0 && id < cfg.reference_count &&
+        !adjacency.neighbors.empty()) {
+      const uint64_t stride = std::max<uint64_t>(
+          1, cfg.reference_count / cfg.semantic_samples);
+      if (id % stride == 0) {
+        semantic_samples->push_back({id, adjacency.neighbors[0]});
+      }
     }
     for (size_t level = 0; level < adjacency.neighbors.size(); ++level) {
       const size_t degree_limit = level == 0 ? static_cast<size_t>(meta.M) * 2 : meta.M;
@@ -366,6 +485,63 @@ void VerifyLabelTargets(
   }
 }
 
+void VerifySemanticLocality(
+    const Config& cfg,
+    const GlobalMeta& meta,
+    std::vector<SemanticSample>* samples,
+    Report* report) {
+  if (cfg.semantic_samples == 0) {
+    return;
+  }
+  std::sort(samples->begin(), samples->end(), [](const auto& left, const auto& right) {
+    return left.global_id < right.global_id;
+  });
+  if (samples->size() > cfg.semantic_samples) {
+    samples->resize(cfg.semantic_samples);
+  }
+  ReferenceVectors reference(cfg, meta);
+  for (const auto& sample : *samples) {
+    report->semantic_nodes_sampled++;
+    const std::string& source = reference.Get(sample.global_id);
+    for (uint64_t neighbor : sample.neighbors) {
+      if (neighbor >= cfg.reference_count) {
+        continue;
+      }
+      uint64_t control = Mix64(
+          sample.global_id ^ (neighbor + 0x9e3779b97f4a7c15ULL)) %
+          cfg.reference_count;
+      if (control == sample.global_id) {
+        control = (control + 1) % cfg.reference_count;
+      }
+      const float edge_distance = VectorDistance(source, reference.Get(neighbor), meta);
+      const float control_distance = VectorDistance(source, reference.Get(control), meta);
+      if (!std::isfinite(edge_distance) || !std::isfinite(control_distance)) {
+        AddError(report, cfg, "non-finite semantic distance for node " +
+            std::to_string(sample.global_id));
+        continue;
+      }
+      report->semantic_edges_compared++;
+      report->semantic_edge_distance_sum += edge_distance;
+      report->semantic_control_distance_sum += control_distance;
+      if (edge_distance < control_distance) {
+        report->semantic_edge_wins++;
+      }
+    }
+  }
+  if (report->semantic_nodes_sampled == 0 || report->semantic_edges_compared == 0) {
+    AddError(report, cfg, "semantic locality check produced no comparisons");
+    return;
+  }
+  const double win_rate =
+      static_cast<double>(report->semantic_edge_wins) /
+      static_cast<double>(report->semantic_edges_compared);
+  if (win_rate < cfg.semantic_min_edge_win_rate) {
+    AddError(report, cfg, "semantic edge locality is below threshold: win_rate=" +
+        std::to_string(win_rate) + " threshold=" +
+        std::to_string(cfg.semantic_min_edge_win_rate));
+  }
+}
+
 Config ParseArgs(int argc, const char** argv) {
   Config cfg;
   for (int i = 1; i < argc; ++i) {
@@ -393,6 +569,18 @@ Config ParseArgs(int argc, const char** argv) {
     } else if (arg == "--max-reported-errors") {
       cfg.max_reported_errors =
           static_cast<uint32_t>(std::stoul(next("--max-reported-errors")));
+    } else if (arg == "--reference-input") {
+      cfg.reference_input = next("--reference-input");
+    } else if (arg == "--reference-input-format") {
+      cfg.reference_input_format = next("--reference-input-format");
+    } else if (arg == "--reference-count") {
+      cfg.reference_count = std::stoull(next("--reference-count"));
+    } else if (arg == "--semantic-samples") {
+      cfg.semantic_samples =
+          static_cast<uint32_t>(std::stoul(next("--semantic-samples")));
+    } else if (arg == "--semantic-min-edge-win-rate") {
+      cfg.semantic_min_edge_win_rate =
+          std::stod(next("--semantic-min-edge-win-rate"));
     } else if (arg == "--output") {
       cfg.output = next("--output");
     } else {
@@ -401,6 +589,17 @@ Config ParseArgs(int argc, const char** argv) {
   }
   if (cfg.owners == 0 || cfg.points_per_object == 0 || cfg.batch_size == 0) {
     throw std::runtime_error("owners, points-per-object and batch-size must be positive");
+  }
+  if (!(cfg.semantic_min_edge_win_rate > 0.0 &&
+        cfg.semantic_min_edge_win_rate <= 1.0)) {
+    throw std::runtime_error("semantic-min-edge-win-rate must be in (0, 1]");
+  }
+  if (cfg.semantic_samples > 0 &&
+      (cfg.reference_input.empty() || cfg.reference_input_format.empty() ||
+       cfg.reference_count < 2)) {
+    throw std::runtime_error(
+        "semantic samples require reference-input, reference-input-format and "
+        "reference-count >= 2");
   }
   return cfg;
 }
@@ -460,6 +659,32 @@ void WriteReport(const Config& cfg, const GlobalMeta& meta, const Report& report
       << ",\n";
   out << "  \"entrypoint_found\": " << (report.entrypoint_found ? "true" : "false") << ",\n";
   out << "  \"entrypoint_active\": " << (report.entrypoint_active ? "true" : "false") << ",\n";
+  out << "  \"semantic_locality\": {\n";
+  out << "    \"enabled\": " << (cfg.semantic_samples > 0 ? "true" : "false") << ",\n";
+  out << "    \"requested_samples\": " << cfg.semantic_samples << ",\n";
+  out << "    \"nodes_sampled\": " << report.semantic_nodes_sampled << ",\n";
+  out << "    \"edges_compared\": " << report.semantic_edges_compared << ",\n";
+  out << "    \"edge_wins\": " << report.semantic_edge_wins << ",\n";
+  out << "    \"edge_win_rate\": "
+      << (report.semantic_edges_compared > 0
+              ? static_cast<double>(report.semantic_edge_wins) /
+                    static_cast<double>(report.semantic_edges_compared)
+              : 0.0)
+      << ",\n";
+  out << "    \"mean_edge_distance\": "
+      << (report.semantic_edges_compared > 0
+              ? report.semantic_edge_distance_sum /
+                    static_cast<double>(report.semantic_edges_compared)
+              : 0.0)
+      << ",\n";
+  out << "    \"mean_control_distance\": "
+      << (report.semantic_edges_compared > 0
+              ? report.semantic_control_distance_sum /
+                    static_cast<double>(report.semantic_edges_compared)
+              : 0.0)
+      << ",\n";
+  out << "    \"minimum_edge_win_rate\": " << cfg.semantic_min_edge_win_rate << "\n";
+  out << "  },\n";
   out << "  \"errors\": " << report.errors << ",\n";
   out << "  \"warnings\": " << report.warnings << ",\n";
   WriteStringArray(out, "error_samples", report.error_samples, true);
@@ -491,6 +716,7 @@ int Run(const Config& cfg) {
   Report report;
   report.nodes_expected = meta.next_global_id;
   std::vector<uint8_t> node_states(meta.next_global_id, 0);
+  std::vector<SemanticSample> semantic_samples;
   for (uint32_t owner = 0; owner < cfg.owners; ++owner) {
     const uint64_t local_count =
         meta.next_global_id > owner
@@ -527,6 +753,7 @@ int Run(const Config& cfg) {
             owner_ioctxs[owner],
             &owner_ioctxs,
             &node_states,
+            &semantic_samples,
             &report);
         if (report.nodes_checked > 0 && report.nodes_checked % 1000000 < cfg.batch_size) {
           std::cerr << "checked " << report.nodes_checked << "/" << meta.next_global_id
@@ -537,6 +764,7 @@ int Run(const Config& cfg) {
   }
 
   VerifyLabelTargets(cfg, &owner_ioctxs, node_states, &report);
+  VerifySemanticLocality(cfg, meta, &semantic_samples, &report);
 
   if (report.nodes_checked != meta.cur_element_count) {
     AddError(&report, cfg, "node count does not match cur_element_count: checked=" +
