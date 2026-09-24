@@ -104,14 +104,17 @@ Ceph/RADOS
 ### 4.2 补齐质量和协议指标
 
 - 使用数据集 ground truth 报告 Recall@10；没有 Recall 的性能结果只能用于诊断。
+- 导入器必须把 hnswlib internal ID 显式转换成 external label 后再持久化；每轮以
+  256 个节点的 level-0 图边对随机边胜率（至少 0.60）做独立语义门禁。
 - 分 opcode 记录 calls/update、request/reply bytes、query bytes、候选数、batch
   fill ratio、batch wait、client roundtrip 和 CLS service time。
 - 明确区分 VectorRef/payload I/O、OSD 排队、网络/librados 与 Coordinator 调度；
   `roundtrip - CLS internal` 只能称为 roundtrip/queue，不能直接称为网络时间。
 - 分别统计 adjacency read、distance、new adjacency、patch、meta 和状态切换调用。
 
-退出条件：复现实有结果量级；每轮零失败且一致性检查通过；Recall@10 可用；同一
-配置有至少三次独立样本，并报告均值、标准差和置信区间。
+退出条件：复现实有结果量级；每轮零失败，结构与语义一致性检查通过；Recall@10
+可用；同一配置有至少三次独立样本，并报告均值、标准差和置信区间。修复 ID 映射
+前产生的阶段 1 数据只能作为故障诊断样本，不进入性能或质量结论。
 
 ## 5. 阶段 2：协议版本化与位置路由抽象
 

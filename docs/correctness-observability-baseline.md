@@ -36,6 +36,11 @@ adjacency、节点 level、度数上限、重复/自环/越界边、节点计数
 label 的归属、解码和 ACTIVE 目标。退出码 `0` 表示通过，`1` 表示发现不变量错误，
 `2` 表示连接、读取或参数错误。对 100M 节点检查时，节点状态表约占 100 MiB。
 
+阶段 1 还必须传入 `--reference-input`、`--reference-input-format`、
+`--reference-count`、`--semantic-samples 256` 和
+`--semantic-min-edge-win-rate 0.60`。该检查从 level-0 邻接均匀抽样，比较真实图边
+与确定性随机边的原始向量距离，防止仅靠结构不变量漏掉 ID 映射错误。
+
 ## 新增观测字段
 
 更新指标 JSON 新增 `failure_breakdown` 和 `observability`。重点字段包括：

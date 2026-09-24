@@ -286,7 +286,9 @@ printf '%s\n' "$!" >"$run_root/runner.pid"
 正式对照使用 `run-phase1-ab.sh`。它会对每个数据集和模式重新建池、重新导入
 base，执行三次独立重复；奇数轮按 compute→OSD、偶数轮按 OSD→compute，减少
 固定顺序偏差。每次更新后运行一致性检查，并统计提交前 level-0 搜索相对原始
-base ground truth 的静态 Recall@10。
+base ground truth 的静态 Recall@10。检查器还会从原始 base 均匀抽样节点，将每条
+level-0 图边与确定性的随机对照边比较；图边距离优于对照的比例必须达到 0.60，
+用于拦截 internal ID 与 external label 错配这类“结构合法、语义错误”的索引。
 
 ```bash
 run_root="$PWD/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -301,6 +303,8 @@ nohup env \
   WINDOW_SECONDS=300 \
   UPDATE_PARALLELISM=4 \
   CHECKER_BATCH_SIZE=8192 \
+  SEMANTIC_SAMPLES=256 \
+  SEMANTIC_MIN_EDGE_WIN_RATE=0.60 \
   OSD_OP_TIMEOUT_SECONDS=45 \
   OSD_OP_RETRY_LIMIT=3 \
   RECALL_K=10 \
@@ -359,6 +363,8 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
 | `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
 | `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |
+| `SEMANTIC_SAMPLES` | 不适用 | 不适用 | 256 | 正式实验不得关闭语义抽样 |
+| `SEMANTIC_MIN_EDGE_WIN_RATE` | 不适用 | 不适用 | 0.60 | 图边优于随机对照的最低比例 |
 | `RECALL_K` | 不适用 | 不适用 | 10 | 当前 ground truth 至少含 top-100 |
 | `OSD_OP_TIMEOUT_SECONDS` | 45 | 45 | 45 | 不为掩盖 slow-op 而任意增大 |
 | `OSD_OP_RETRY_LIMIT` | 3 | 3 | 3 | 记录在 manifest |

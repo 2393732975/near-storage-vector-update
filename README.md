@@ -82,7 +82,7 @@ MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
 
 阶段 1 的正式 compute/OSD 对照使用 `scripts/run-phase1-ab.sh --confirm-reset`。
 该 runner 默认执行三次独立重复、交替模式顺序、每轮一致性检查和静态 Recall@10，
-并在结束后生成 `summary.md`；完整命令见
+同时以原始向量验证抽样图边的语义局部性，并在结束后生成 `summary.md`；完整命令见
 [实验复现手册](docs/experiment-runbook.md#6-运行阶段-1-严格-computeosd-对照)。
 
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。

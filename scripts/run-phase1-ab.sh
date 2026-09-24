@@ -15,6 +15,8 @@ repetitions=${REPETITIONS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
 parallelism=${UPDATE_PARALLELISM:-4}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
+semantic_samples=${SEMANTIC_SAMPLES:-256}
+semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
 osd_op_timeout_seconds=${OSD_OP_TIMEOUT_SECONDS:-45}
 osd_op_retry_limit=${OSD_OP_RETRY_LIMIT:-3}
 recall_k=${RECALL_K:-10}
@@ -33,6 +35,14 @@ ceph_cli=(ceph --keyring "$CEPH_KEYRING")
 [[ "$window_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATE_PARALLELISM must be positive." >&2; exit 2; }
 [[ "$checker_batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "CHECKER_BATCH_SIZE must be positive." >&2; exit 2; }
+[[ "$semantic_samples" =~ ^[1-9][0-9]*$ ]] || { echo "SEMANTIC_SAMPLES must be positive." >&2; exit 2; }
+python3 - "$semantic_min_edge_win_rate" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+if not 0.0 < value <= 1.0:
+    raise SystemExit("SEMANTIC_MIN_EDGE_WIN_RATE must be in (0, 1].")
+PY
 [[ "$osd_op_timeout_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "OSD_OP_TIMEOUT_SECONDS must be positive." >&2; exit 2; }
 [[ "$osd_op_retry_limit" =~ ^[0-9]+$ ]] || { echo "OSD_OP_RETRY_LIMIT must be non-negative." >&2; exit 2; }
 [[ "$recall_k" =~ ^[1-9][0-9]*$ ]] || { echo "RECALL_K must be positive." >&2; exit 2; }
@@ -119,6 +129,7 @@ summary = {
     "checker_status": check["status"],
     "checker_errors": check["errors"],
     "checker_warnings": check["warnings"],
+    "semantic_edge_win_rate": check["semantic_locality"]["edge_win_rate"],
 }
 print(summary)
 if update["failed_updates"] != 0 or check["status"] != "pass":
@@ -127,6 +138,10 @@ if not quality.get("ground_truth_enabled"):
     raise SystemExit("ground truth was not enabled")
 if quality.get("evaluated_updates") != update["vectors_processed"]:
     raise SystemExit("Recall evaluation count does not match successful updates")
+if not check["semantic_locality"].get("enabled"):
+    raise SystemExit("Semantic locality check was not enabled")
+if check["semantic_locality"].get("edges_compared", 0) == 0:
+    raise SystemExit("Semantic locality check made no comparisons")
 PY
 }
 
@@ -164,6 +179,8 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "window_seconds=$window_seconds"
   echo "update_parallelism=$parallelism"
   echo "checker_batch_size=$checker_batch_size"
+  echo "semantic_samples=$semantic_samples"
+  echo "semantic_min_edge_win_rate=$semantic_min_edge_win_rate"
   echo "osd_op_timeout_seconds=$osd_op_timeout_seconds"
   echo "osd_op_retry_limit=$osd_op_retry_limit"
   echo "recall_k=$recall_k"
@@ -214,7 +231,11 @@ for repetition in $(seq 1 "$repetitions"); do
 
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] check rep=$repetition mode=$mode dataset=$dataset"
       "$checker" --keyring "$CEPH_KEYRING" --owners 5 --points-per-object "$ppo" \
-        --batch-size "$checker_batch_size" --output "$output/index-check.json"
+        --batch-size "$checker_batch_size" --reference-input "$input" \
+        --reference-input-format "$format" --reference-count "$count" \
+        --semantic-samples "$semantic_samples" \
+        --semantic-min-edge-win-rate "$semantic_min_edge_win_rate" \
+        --output "$output/index-check.json"
       validate_run "$output/update.json" "$output/index-check.json"
       wait_for_clean_cluster
     done
