@@ -1432,7 +1432,13 @@ class CephFacade {
             &existing,
             metrics,
             "raw_get_vector_ref_for_store");
-        if (r < 0) {
+        // A base whose per-owner count is exactly divisible by
+        // points_per_object inserts its first update into a new chunk object.
+        // Native OMAP lookup reports that object as ENOENT; treat it as an
+        // empty key set so the compound payload/OMAP write can create it.
+        if (r == -ENOENT) {
+          existing.clear();
+        } else if (r < 0) {
           throw CephOperationError("raw_get_vector_ref_for_store", r);
         }
         auto found = existing.find(key);
