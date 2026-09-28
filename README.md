@@ -6,7 +6,9 @@
 
 项目包含两条可对照的 HNSW 更新路径：
 
-1. **Compute-node baseline**：Coordinator 从 Ceph 拉取候选向量，在计算节点计算距离并写回图更新。
+1. **Compute-node baseline**：Coordinator 只使用原生 librados 的对象读写与 OMAP
+   API 完成 label、向量、邻接、patch 和全局元数据访问，并在计算节点计算距离；
+   该路径不调用任何 CLS 方法。
 2. **OSD-side CLS baseline**：Coordinator 保留全局 HNSW 搜索控制；Ceph CLS 在 OSD 内执行局部向量读取、距离计算、label 查询和原子邻接 patch。
 
 一次更新采用“旧节点标记 stale + 新节点重新插入全局图”的语义，而不是原地覆写向量。该设计能够暴露真实的全图在线更新成本。
@@ -84,6 +86,9 @@ MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
 该 runner 默认执行三次独立重复、交替模式顺序、每轮一致性检查和静态 Recall@10，
 同时以原始向量验证抽样图边的语义局部性，并在结束后生成 `summary.md`；完整命令见
 [实验复现手册](docs/experiment-runbook.md#6-运行阶段-1-严格-computeosd-对照)。
+两个 runner 都会检查 `update.json`：compute 必须满足
+`storage_access_mode=raw_rados`、`total_cls_exec_calls=0` 且原生 RADOS 调用数大于
+0；OSD 模式必须实际产生 CLS 调用，否则当前轮次立即失败。
 
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。
 

@@ -16,6 +16,8 @@ class Phase1SummaryTest(unittest.TestCase):
         output = root / f"rep-{repetition}" / mode / "gist1m"
         output.mkdir(parents=True)
         update = {
+            "distance_mode": mode,
+            "storage_access_mode": "raw_rados" if mode == "compute" else "cls",
             "vectors_processed": 100,
             "failed_updates": 0,
             "throughput_updates_per_sec": throughput,
@@ -25,12 +27,15 @@ class Phase1SummaryTest(unittest.TestCase):
             "quality": {"precommit_static_recall_at_k": recall},
             "observability": {
                 "update_attempts": 100,
-                "total_cls_exec_calls": 1000,
+                "total_cls_exec_calls": 0 if mode == "compute" else 1000,
+                "total_raw_rados_calls": 1200 if mode == "compute" else 0,
                 "distance_batches": 600,
                 "candidates_per_distance_batch": 1.25,
                 "logical_distance_query_bytes": 102400,
-                "cls_request_bytes": 204800,
-                "cls_reply_bytes": 307200,
+                "cls_request_bytes": 0 if mode == "compute" else 204800,
+                "cls_reply_bytes": 0 if mode == "compute" else 307200,
+                "raw_rados_request_bytes": 102400 if mode == "compute" else 0,
+                "raw_rados_reply_bytes": 409600 if mode == "compute" else 0,
             },
         }
         check = {"status": "pass", "errors": 0, "warnings": 0}
@@ -55,12 +60,21 @@ class Phase1SummaryTest(unittest.TestCase):
             self.assertAlmostEqual(
                 aggregate["gist1m"]["osd"]["cls_kib_per_update"]["mean"], 5.0
             )
+            self.assertAlmostEqual(
+                aggregate["gist1m"]["compute"]["raw_rados_calls_per_update"]["mean"],
+                12.0,
+            )
+            self.assertAlmostEqual(
+                aggregate["gist1m"]["compute"]["raw_rados_kib_per_update"]["mean"],
+                5.0,
+            )
 
             report = root / "summary.md"
             MODULE.write_markdown(root, aggregate, report)
             text = report.read_text(encoding="utf-8")
             self.assertIn("阶段 1 Compute/OSD 严格 A/B 汇总", text)
             self.assertIn("fresh-pool-after-import", text)
+            self.assertIn("| gist1m | compute | raw_rados | 12.00 | 0.00", text)
 
 
 if __name__ == "__main__":

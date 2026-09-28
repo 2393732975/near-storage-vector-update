@@ -7,6 +7,10 @@
 [阶段 0 OSD 卸载验收报告](reports/phase0-validation-report-2026-09-22.md)和
 [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)。
 
+> 口径修订：2026-09-28 起，`compute` 定义为全更新链路仅使用原生 RADOS API，
+> 严格禁止 CLS。此前报告中的 compute 路径仍对非距离操作调用 CLS，只能作为历史
+> 混合路径数据；严格 compute/OSD A/B 必须重新运行。
+
 | 数据集 | Compute 平均延迟 | OSD 第 1 轮 | OSD 三轮加权平均 |
 | --- | ---: | ---: | ---: |
 | GIST1M | 265.227 ms | 274.986 ms | 204.016 ms |
@@ -100,6 +104,10 @@ Ceph/RADOS
 配置、PG 数、CRUSH 落点和并发度，并交错运行 `compute` 与 `osd`。每个配置至少
 三次**重新导入后的独立重复**；冷启动与预热结果分开报告，不把同一索引上连续
 三轮当独立样本。每次运行创建唯一 `RUN_ROOT`。
+
+compute 的验收条件为 `storage_access_mode=raw_rados`、
+`total_cls_exec_calls=0` 且 `total_raw_rados_calls>0`；OSD 路径必须实际产生 CLS
+调用。未通过访问路径门禁的轮次不得进入 A/B 汇总。
 
 ### 4.2 补齐质量和协议指标
 

@@ -234,8 +234,9 @@ PPT baseline runner 不使用 ground truth；阶段 1 runner 要求相同规模�
 
 ## 4. 运行 PPT 背景 compute 实验
 
-该实验把候选向量拉回 Coordinator，再在计算节点算距。务必创建从未使用过的
-`RUN_ROOT`：
+该实验的整个更新协议只使用原生 librados 对象读写和 OMAP API：label、向量、
+邻接、patch、stale 标记与 global meta 都由 Coordinator 读写；候选向量拉回后在
+计算节点算距，全程不调用 CLS。务必创建从未使用过的 `RUN_ROOT`：
 
 ```bash
 run_root="$PWD/results/ppt-background-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -257,6 +258,11 @@ runner_pid=$!
 printf '%s\n' "$runner_pid" >"$run_root/runner.pid"
 printf 'PID=%s RUN_ROOT=%s\n' "$runner_pid" "$run_root"
 ```
+
+runner 会在每个数据集结束后强制验证 `storage_access_mode=raw_rados`、
+`total_cls_exec_calls=0` 和 `total_raw_rados_calls>0`。任一条件不满足都会终止实验。
+compute baseline 只支持单个 Coordinator 进程；可以使用进程内
+`UPDATE_PARALLELISM`，但不得让多个 runner/Coordinator 同时写同一组实验池。
 
 ## 5. 运行 OSD/CLS baseline
 
@@ -289,6 +295,8 @@ base，执行三次独立重复；奇数轮按 compute→OSD、偶数轮按 OSD�
 base ground truth 的静态 Recall@10。检查器还会从原始 base 均匀抽样节点，将每条
 level-0 图边与确定性的随机对照边比较；图边距离优于对照的比例必须达到 0.60，
 用于拦截 internal ID 与 external label 错配这类“结构合法、语义错误”的索引。
+其中 compute 是全链路原生 RADOS baseline，不是“仅距离在计算侧、其余仍调用
+CLS”的混合路径；runner 将零 CLS 调用作为正式结果的硬门禁。
 
 ```bash
 run_root="$PWD/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"

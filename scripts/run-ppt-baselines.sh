@@ -35,6 +35,39 @@ done
   exit 2
 }
 
+validate_access_path() {
+  local mode=$1 metrics=$2
+  python3 - "$mode" "$metrics" <<'PY'
+import json
+import sys
+
+mode = sys.argv[1]
+with open(sys.argv[2], encoding="utf-8") as stream:
+    metrics = json.load(stream)
+observability = metrics.get("observability", {})
+summary = {
+    "distance_mode": metrics.get("distance_mode"),
+    "storage_access_mode": metrics.get("storage_access_mode"),
+    "total_cls_exec_calls": observability.get("total_cls_exec_calls"),
+    "total_raw_rados_calls": observability.get("total_raw_rados_calls"),
+}
+print(summary)
+if metrics.get("distance_mode") != mode:
+    raise SystemExit(f"distance mode mismatch: expected {mode!r}")
+if mode == "compute":
+    if metrics.get("storage_access_mode") != "raw_rados":
+        raise SystemExit("compute baseline did not report raw_rados access")
+    if observability.get("total_cls_exec_calls") != 0:
+        raise SystemExit("compute baseline invoked CLS")
+    if not observability.get("total_raw_rados_calls", 0):
+        raise SystemExit("compute baseline made no raw RADOS calls")
+elif metrics.get("storage_access_mode") != "cls" or not observability.get(
+    "total_cls_exec_calls", 0
+):
+    raise SystemExit("OSD mode did not execute through CLS")
+PY
+}
+
 run_dataset() {
   local mode=$1 dataset=$2 input update format dim kind metric count updates threads ppo
   case "$dataset" in
@@ -63,6 +96,7 @@ run_dataset() {
     --distance-split-probe --time-limit-seconds "$window_seconds" \
     --update-parallelism "$update_parallelism" --metrics-out "$output/update.json" \
     --progress-out "$output/update.progress.json"
+  validate_access_path "$mode" "$output/update.json"
 }
 
 for mode in "${modes[@]}"; do

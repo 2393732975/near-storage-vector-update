@@ -3,6 +3,7 @@
 #include "include/ceph_assert.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -55,6 +56,7 @@ using ghnsw::SetAdjacencyBatchRequest;
 using ghnsw::StatusReply;
 using ghnsw::StoreVectorRequest;
 using ghnsw::TimedNoopReply;
+using ghnsw::VectorRef;
 
 struct Config {
   std::string mode = "build";
@@ -125,11 +127,14 @@ struct Metrics {
   uint64_t failed_update_protocol = 0;
   uint64_t failed_update_other = 0;
   uint64_t total_cls_exec_calls = 0;
+  uint64_t total_raw_rados_calls = 0;
   uint64_t rados_exec_retries = 0;
   uint64_t global_meta_cas_calls = 0;
   uint64_t label_cas_calls = 0;
   uint64_t cls_request_bytes = 0;
   uint64_t cls_reply_bytes = 0;
+  uint64_t raw_rados_request_bytes = 0;
+  uint64_t raw_rados_reply_bytes = 0;
   uint64_t logical_distance_query_bytes = 0;
   uint64_t distance_batches = 0;
   uint64_t max_candidates_per_distance_batch = 0;
@@ -145,6 +150,7 @@ struct Metrics {
   uint64_t recall_hits = 0;
   uint64_t recall_denominator = 0;
   std::map<std::string, OperationMetrics> operation_metrics;
+  std::map<std::string, OperationMetrics> raw_operation_metrics;
   std::map<std::string, uint64_t> failure_operations;
   std::set<std::string> current_data_objects;
   std::set<std::string> current_data_pgs;
@@ -391,11 +397,14 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->failed_update_protocol += src.failed_update_protocol;
   dst->failed_update_other += src.failed_update_other;
   dst->total_cls_exec_calls += src.total_cls_exec_calls;
+  dst->total_raw_rados_calls += src.total_raw_rados_calls;
   dst->rados_exec_retries += src.rados_exec_retries;
   dst->global_meta_cas_calls += src.global_meta_cas_calls;
   dst->label_cas_calls += src.label_cas_calls;
   dst->cls_request_bytes += src.cls_request_bytes;
   dst->cls_reply_bytes += src.cls_reply_bytes;
+  dst->raw_rados_request_bytes += src.raw_rados_request_bytes;
+  dst->raw_rados_reply_bytes += src.raw_rados_reply_bytes;
   dst->logical_distance_query_bytes += src.logical_distance_query_bytes;
   dst->distance_batches += src.distance_batches;
   dst->max_candidates_per_distance_batch = std::max(
@@ -416,6 +425,13 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->recall_denominator += src.recall_denominator;
   for (const auto& [operation, values] : src.operation_metrics) {
     auto& aggregate = dst->operation_metrics[operation];
+    aggregate.calls += values.calls;
+    aggregate.request_bytes += values.request_bytes;
+    aggregate.reply_bytes += values.reply_bytes;
+    aggregate.roundtrip_seconds += values.roundtrip_seconds;
+  }
+  for (const auto& [operation, values] : src.raw_operation_metrics) {
+    auto& aggregate = dst->raw_operation_metrics[operation];
     aggregate.calls += values.calls;
     aggregate.request_bytes += values.request_bytes;
     aggregate.reply_bytes += values.reply_bytes;
@@ -483,6 +499,81 @@ struct TimedNoopSample {
   double queue_est_seconds = 0.0;
 };
 
+constexpr const char* kMetaEnterPoint = "meta/enterpoint";
+constexpr const char* kMetaMaxLevel = "meta/max_level";
+constexpr const char* kMetaCurCount = "meta/cur_element_count";
+constexpr const char* kMetaNextGlobal = "meta/next_global_id";
+constexpr const char* kMetaVersion = "meta/version";
+constexpr const char* kMetaM = "meta/M";
+constexpr const char* kMetaEf = "meta/ef";
+constexpr const char* kMetaDim = "meta/dim";
+constexpr const char* kMetaVectorKind = "meta/vector_kind";
+constexpr const char* kMetaMetric = "meta/metric";
+
+template <typename T>
+ceph::bufferlist encode_scalar(T value) {
+  ceph::bufferlist bl;
+  ceph::encode(value, bl);
+  return bl;
+}
+
+template <typename T>
+T decode_scalar_or_die(const ceph::bufferlist& bl, const std::string& what) {
+  T value{};
+  auto it = bl.cbegin();
+  try {
+    ceph::decode(value, it);
+  } catch (const ceph::buffer::error&) {
+    throw ProtocolError("decode failed: " + what);
+  }
+  return value;
+}
+
+std::map<std::string, ceph::bufferlist> encode_global_meta(const GlobalMeta& meta) {
+  return {
+      {kMetaEnterPoint, encode_scalar(meta.enterpoint)},
+      {kMetaMaxLevel, encode_scalar(meta.max_level)},
+      {kMetaCurCount, encode_scalar(meta.cur_element_count)},
+      {kMetaNextGlobal, encode_scalar(meta.next_global_id)},
+      {kMetaVersion, encode_scalar(meta.version)},
+      {kMetaM, encode_scalar(meta.M)},
+      {kMetaEf, encode_scalar(meta.ef)},
+      {kMetaDim, encode_scalar(meta.dim)},
+      {kMetaVectorKind, encode_scalar(meta.vector_kind)},
+      {kMetaMetric, encode_scalar(meta.metric)},
+  };
+}
+
+std::set<std::string> global_meta_keys() {
+  return {
+      kMetaEnterPoint,
+      kMetaMaxLevel,
+      kMetaCurCount,
+      kMetaNextGlobal,
+      kMetaVersion,
+      kMetaM,
+      kMetaEf,
+      kMetaDim,
+      kMetaVectorKind,
+      kMetaMetric,
+  };
+}
+
+// The experiment runner uses one Coordinator process with multiple worker
+// facades. These shared locks preserve read-modify-write semantics across its
+// librados clients without relying on server-side CLS code.
+std::mutex& raw_meta_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::mutex& raw_object_mutex(int64_t pool_id, const std::string& oid) {
+  static std::array<std::mutex, 4096> mutexes;
+  const size_t pool_hash = std::hash<int64_t>{}(pool_id);
+  const size_t object_hash = std::hash<std::string>{}(oid);
+  return mutexes[(pool_hash ^ (object_hash << 1)) % mutexes.size()];
+}
+
 class CephFacade {
  public:
   explicit CephFacade(const Config& cfg) : cfg_(cfg) {}
@@ -538,6 +629,10 @@ class CephFacade {
       ceph::bufferlist& in,
       ceph::bufferlist* out,
       Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      throw ProtocolError(
+          "raw-RADOS compute baseline attempted CLS method: " + std::string(method));
+    }
     int r = 0;
     for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
       out->clear();
@@ -564,6 +659,10 @@ class CephFacade {
       const std::vector<uint64_t>& ids,
       std::unordered_map<uint64_t, std::string>* result,
       Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      RawFetchVectorBatch(owner, chunk, ids, result, metrics);
+      return;
+    }
     IdBatchRequest req;
     req.global_ids = ids;
     ceph::bufferlist in = encode_msg(req), out;
@@ -599,6 +698,11 @@ class CephFacade {
       uint32_t level,
       Metrics* metrics,
       bool update_label = true) {
+    if (cfg_.distance_mode == "compute") {
+      RawStoreVector(
+          global_id, external_label, vec, level, metrics, update_label);
+      return;
+    }
     const double t0 = now_sec();
     StoreVectorRequest req;
     req.global_id = global_id;
@@ -629,6 +733,10 @@ class CephFacade {
   void UpdateLabels(
       const std::vector<std::pair<uint64_t, uint64_t>>& labels,
       Metrics* metrics = nullptr) {
+    if (cfg_.distance_mode == "compute") {
+      RawUpdateLabels(labels, metrics);
+      return;
+    }
     std::map<uint32_t, std::vector<std::pair<uint64_t, uint64_t>>> groups;
     for (const auto& entry : labels) {
       groups[label_owner_for(entry.first, cfg_)].push_back(entry);
@@ -652,6 +760,14 @@ class CephFacade {
       uint64_t expected_global_id,
       uint64_t replacement_global_id,
       Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      return RawCasLabel(
+          external_label,
+          expect_missing,
+          expected_global_id,
+          replacement_global_id,
+          metrics);
+    }
     const uint32_t owner = label_owner_for(external_label, cfg_);
     CasLabelRequest req;
     req.external_label = external_label;
@@ -686,6 +802,9 @@ class CephFacade {
   std::unordered_map<uint64_t, uint64_t> LookupLabels(
       const std::vector<uint64_t>& labels,
       Metrics* metrics = nullptr) {
+    if (cfg_.distance_mode == "compute") {
+      return RawLookupLabels(labels, metrics);
+    }
     std::unordered_map<uint64_t, uint64_t> result;
     std::map<uint32_t, std::vector<uint64_t>> groups;
     for (uint64_t label : labels) {
@@ -711,6 +830,9 @@ class CephFacade {
   }
 
   std::unordered_map<uint64_t, AdjacencyBlob> GetAdjacency(const std::vector<uint64_t>& ids, Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      return RawGetAdjacency(ids, metrics);
+    }
     std::unordered_map<uint64_t, AdjacencyBlob> result;
     auto groups = GroupIds(ids);
     for (const auto& [owner_chunk, owner_ids] : groups) {
@@ -816,6 +938,10 @@ class CephFacade {
   }
 
   void SetAdjacency(const std::vector<AdjacencyBlob>& entries, Metrics* metrics = nullptr) {
+    if (cfg_.distance_mode == "compute") {
+      RawSetAdjacency(entries, metrics);
+      return;
+    }
     const double t0 = now_sec();
     auto groups = GroupAdj(entries);
     for (const auto& [owner_chunk, owner_entries] : groups) {
@@ -837,6 +963,10 @@ class CephFacade {
 
   void ApplyPatches(
       const std::vector<AdjacencyBlob>& entries, uint64_t update_id, Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      RawApplyPatches(entries, update_id, metrics);
+      return;
+    }
     auto groups = GroupAdj(entries);
     for (const auto& [owner_chunk, owner_entries] : groups) {
       EdgePatchBatchRequest req;
@@ -859,6 +989,10 @@ class CephFacade {
   }
 
   void MarkStale(uint64_t global_id, Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      RawMarkStale(global_id, metrics);
+      return;
+    }
     const double t0 = now_sec();
     MarkNodeStaleRequest req;
     req.global_id = global_id;
@@ -878,6 +1012,14 @@ class CephFacade {
   }
 
   GlobalMeta GetMeta(Metrics* metrics = nullptr) {
+    if (cfg_.distance_mode == "compute") {
+      const double t0 = now_sec();
+      GlobalMeta meta = RawGetMeta(metrics);
+      if (metrics) {
+        metrics->meta_read_seconds += now_sec() - t0;
+      }
+      return meta;
+    }
     const double t0 = now_sec();
     ceph::bufferlist out;
     ceph::bufferlist empty;
@@ -894,6 +1036,9 @@ class CephFacade {
   }
 
   ReserveInsertReply ReserveInsert(uint64_t update_id, Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      return RawReserveInsert(update_id, metrics);
+    }
     ReserveInsertRequest req;
     req.update_id = update_id;
     ceph::bufferlist in = encode_msg(req), out;
@@ -938,6 +1083,10 @@ class CephFacade {
 
   void FinalizeInsert(
       uint64_t update_id, uint64_t global_id, uint32_t level, Metrics* metrics) {
+    if (cfg_.distance_mode == "compute") {
+      RawFinalizeInsert(update_id, global_id, level, metrics);
+      return;
+    }
     FinalizeInsertRequest req;
     req.update_id = update_id;
     req.global_id = global_id;
@@ -957,6 +1106,9 @@ class CephFacade {
   }
 
   bool CasMeta(uint64_t expected_version, const GlobalMeta& meta, Metrics* metrics = nullptr) {
+    if (cfg_.distance_mode == "compute") {
+      return RawCasMeta(expected_version, meta, metrics);
+    }
     CasGlobalMetaRequest req;
     req.expected_version = expected_version;
     req.meta = meta;
@@ -996,6 +1148,856 @@ class CephFacade {
   }
 
  private:
+  void RecordRaw(
+      Metrics* metrics,
+      const std::string& operation,
+      uint64_t request_bytes,
+      uint64_t reply_bytes,
+      double roundtrip_seconds) const {
+    if (!metrics) {
+      return;
+    }
+    metrics->total_raw_rados_calls++;
+    metrics->raw_rados_request_bytes += request_bytes;
+    metrics->raw_rados_reply_bytes += reply_bytes;
+    auto& values = metrics->raw_operation_metrics[operation];
+    values.calls++;
+    values.request_bytes += request_bytes;
+    values.reply_bytes += reply_bytes;
+    values.roundtrip_seconds += roundtrip_seconds;
+  }
+
+  int RawOmapGet(
+      librados::IoCtx& ioctx,
+      const std::string& oid,
+      const std::set<std::string>& keys,
+      std::map<std::string, ceph::bufferlist>* values,
+      Metrics* metrics,
+      const std::string& operation) {
+    uint64_t request_bytes = 0;
+    for (const auto& key : keys) {
+      request_bytes += key.size();
+    }
+    int r = 0;
+    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+      values->clear();
+      const double t0 = now_sec();
+      r = ioctx.omap_get_vals_by_keys(oid, keys, values);
+      uint64_t reply_bytes = 0;
+      for (const auto& [key, value] : *values) {
+        reply_bytes += key.size() + value.length();
+      }
+      RecordRaw(
+          metrics, operation, request_bytes, reply_bytes, now_sec() - t0);
+      if (r != -ETIMEDOUT && r != -ETIME) {
+        return r;
+      }
+      if (attempt == cfg_.osd_op_retry_limit) {
+        break;
+      }
+      if (metrics) {
+        metrics->rados_exec_retries++;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    }
+    return r;
+  }
+
+  int RawOmapSet(
+      librados::IoCtx& ioctx,
+      const std::string& oid,
+      const std::map<std::string, ceph::bufferlist>& values,
+      Metrics* metrics,
+      const std::string& operation) {
+    uint64_t request_bytes = 0;
+    for (const auto& [key, value] : values) {
+      request_bytes += key.size() + value.length();
+    }
+    int r = 0;
+    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+      const double t0 = now_sec();
+      r = ioctx.omap_set(oid, values);
+      RecordRaw(metrics, operation, request_bytes, 0, now_sec() - t0);
+      if (r != -ETIMEDOUT && r != -ETIME) {
+        return r;
+      }
+      if (attempt == cfg_.osd_op_retry_limit) {
+        break;
+      }
+      if (metrics) {
+        metrics->rados_exec_retries++;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    }
+    return r;
+  }
+
+  int RawStat(
+      librados::IoCtx& ioctx,
+      const std::string& oid,
+      uint64_t* size,
+      time_t* modified,
+      Metrics* metrics,
+      const std::string& operation) {
+    int r = 0;
+    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+      const double t0 = now_sec();
+      r = ioctx.stat(oid, size, modified);
+      RecordRaw(
+          metrics,
+          operation,
+          0,
+          r == 0 ? sizeof(*size) + sizeof(*modified) : 0,
+          now_sec() - t0);
+      if (r != -ETIMEDOUT && r != -ETIME) {
+        return r;
+      }
+      if (attempt == cfg_.osd_op_retry_limit) {
+        break;
+      }
+      if (metrics) {
+        metrics->rados_exec_retries++;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    }
+    return r;
+  }
+
+  GlobalMeta RawGetMeta(Metrics* metrics) {
+    std::map<std::string, ceph::bufferlist> values;
+    const int r = RawOmapGet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        global_meta_keys(),
+        &values,
+        metrics,
+        "raw_get_global_meta");
+    if (r < 0) {
+      throw CephOperationError("raw_get_global_meta", r);
+    }
+    if (values.find(kMetaVersion) == values.end()) {
+      return GlobalMeta{};
+    }
+    auto required = [&](const char* key) -> const ceph::bufferlist& {
+      auto it = values.find(key);
+      if (it == values.end()) {
+        throw ProtocolError(std::string("missing global meta key: ") + key);
+      }
+      return it->second;
+    };
+    GlobalMeta meta;
+    meta.enterpoint = decode_scalar_or_die<uint64_t>(required(kMetaEnterPoint), kMetaEnterPoint);
+    meta.max_level = decode_scalar_or_die<uint32_t>(required(kMetaMaxLevel), kMetaMaxLevel);
+    meta.cur_element_count =
+        decode_scalar_or_die<uint64_t>(required(kMetaCurCount), kMetaCurCount);
+    meta.next_global_id =
+        decode_scalar_or_die<uint64_t>(required(kMetaNextGlobal), kMetaNextGlobal);
+    meta.version = decode_scalar_or_die<uint64_t>(required(kMetaVersion), kMetaVersion);
+    meta.M = decode_scalar_or_die<uint32_t>(required(kMetaM), kMetaM);
+    meta.ef = decode_scalar_or_die<uint32_t>(required(kMetaEf), kMetaEf);
+    meta.dim = decode_scalar_or_die<uint32_t>(required(kMetaDim), kMetaDim);
+    auto vector_kind = values.find(kMetaVectorKind);
+    meta.vector_kind = vector_kind == values.end()
+                           ? ghnsw::kVectorKindU8
+                           : decode_scalar_or_die<uint32_t>(
+                                 vector_kind->second, kMetaVectorKind);
+    auto metric = values.find(kMetaMetric);
+    meta.metric = metric == values.end()
+                      ? ghnsw::kMetricL2
+                      : decode_scalar_or_die<uint32_t>(metric->second, kMetaMetric);
+    return meta;
+  }
+
+  void RawFetchVectorBatch(
+      uint32_t owner,
+      uint64_t chunk,
+      const std::vector<uint64_t>& ids,
+      std::unordered_map<uint64_t, std::string>* result,
+      Metrics* metrics) {
+    const double batch_t0 = now_sec();
+    const std::string oid = ghnsw::OwnerDataOid(chunk);
+    std::set<std::string> keys;
+    for (uint64_t id : ids) {
+      keys.insert(ghnsw::VecKey(id));
+    }
+    std::map<std::string, ceph::bufferlist> values;
+    int r = RawOmapGet(
+        owner_ioctxs_[owner],
+        oid,
+        keys,
+        &values,
+        metrics,
+        "raw_get_vector_refs");
+    if (r < 0) {
+      throw CephOperationError("raw_get_vector_refs", r);
+    }
+
+    std::vector<std::pair<uint64_t, VectorRef>> refs;
+    refs.reserve(ids.size());
+    for (uint64_t id : ids) {
+      auto value = values.find(ghnsw::VecKey(id));
+      if (value == values.end()) {
+        continue;
+      }
+      VectorRef ref;
+      decode_or_die(value->second, &ref, "VectorRef");
+      refs.emplace_back(id, ref);
+    }
+
+    std::vector<ceph::bufferlist> payloads;
+    std::vector<int> read_status;
+    uint64_t payload_bytes = 0;
+    if (!refs.empty()) {
+      for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+        payloads.assign(refs.size(), ceph::bufferlist{});
+        read_status.assign(refs.size(), 0);
+        librados::ObjectReadOperation op;
+        uint64_t request_bytes = 0;
+        for (size_t i = 0; i < refs.size(); ++i) {
+          op.read(
+              static_cast<size_t>(refs[i].second.offset),
+              refs[i].second.bytes,
+              &payloads[i],
+              &read_status[i]);
+          request_bytes += sizeof(uint64_t) * 2;
+        }
+        ceph::bufferlist aggregate;
+        const double t0 = now_sec();
+        r = owner_ioctxs_[owner].operate(oid, &op, &aggregate);
+        const double roundtrip_seconds = now_sec() - t0;
+        uint64_t reply_bytes = 0;
+        for (const auto& payload : payloads) {
+          reply_bytes += payload.length();
+        }
+        RecordRaw(
+            metrics,
+            "raw_read_vector_payloads",
+            request_bytes,
+            reply_bytes,
+            roundtrip_seconds);
+        if (r != -ETIMEDOUT && r != -ETIME) {
+          break;
+        }
+        if (attempt == cfg_.osd_op_retry_limit) {
+          break;
+        }
+        if (metrics) {
+          metrics->rados_exec_retries++;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+      }
+      if (r < 0) {
+        throw CephOperationError("raw_read_vector_payloads", r);
+      }
+      for (size_t i = 0; i < refs.size(); ++i) {
+        if (read_status[i] < 0) {
+          throw CephOperationError("raw_read_vector_payload", read_status[i]);
+        }
+        result->emplace(
+            refs[i].first,
+            std::string(payloads[i].c_str(), payloads[i].length()));
+        payload_bytes += payloads[i].length();
+      }
+    }
+    RecordDataTarget(metrics, owner, chunk);
+    if (metrics) {
+      metrics->remote_vector_calls++;
+      metrics->remote_vector_seconds += now_sec() - batch_t0;
+      metrics->remote_vector_bytes += payload_bytes;
+    }
+  }
+
+  void RawStoreVector(
+      uint64_t global_id,
+      uint64_t external_label,
+      const std::string& vec,
+      uint32_t level,
+      Metrics* metrics,
+      bool update_label) {
+    const double t0 = now_sec();
+    const uint32_t owner = owner_for(global_id, cfg_);
+    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const std::string oid = ghnsw::OwnerDataOid(chunk);
+    const std::string key = ghnsw::VecKey(global_id);
+    {
+      std::lock_guard<std::mutex> lock(
+          raw_object_mutex(owner_ioctxs_[owner].get_id(), oid));
+      bool stored = false;
+      for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
+        std::map<std::string, ceph::bufferlist> existing;
+        int r = RawOmapGet(
+            owner_ioctxs_[owner],
+            oid,
+            {key},
+            &existing,
+            metrics,
+            "raw_get_vector_ref_for_store");
+        if (r < 0) {
+          throw CephOperationError("raw_get_vector_ref_for_store", r);
+        }
+        auto found = existing.find(key);
+        if (found != existing.end()) {
+          VectorRef ref;
+          decode_or_die(found->second, &ref, "VectorRef");
+          const bool matches =
+              ref.global_id == global_id && ref.external_label == external_label &&
+              ref.bytes == vec.size() && ref.dim == cfg_.dim &&
+              ref.vector_kind == cfg_.vector_kind &&
+              ref.flags == ghnsw::kVectorFlagActive && ref.level == level;
+          if (!matches) {
+            throw CephOperationError("raw_store_vector", -EEXIST);
+          }
+          stored = true;
+          break;
+        }
+
+        uint64_t size = 0;
+        time_t modified = 0;
+        r = RawStat(
+            owner_ioctxs_[owner],
+            oid,
+            &size,
+            &modified,
+            metrics,
+            "raw_stat_vector_object");
+        if (r == -ENOENT) {
+          size = 0;
+        } else if (r < 0) {
+          throw CephOperationError("raw_stat_vector_object", r);
+        }
+
+        VectorRef ref;
+        ref.global_id = global_id;
+        ref.external_label = external_label;
+        ref.offset = size;
+        ref.bytes = static_cast<uint32_t>(vec.size());
+        ref.dim = cfg_.dim;
+        ref.vector_kind = cfg_.vector_kind;
+        ref.flags = ghnsw::kVectorFlagActive;
+        ref.level = level;
+        ceph::bufferlist payload;
+        payload.append(vec);
+        std::map<std::string, ceph::bufferlist> ref_value{{key, encode_msg(ref)}};
+        librados::ObjectWriteOperation op;
+        op.write(size, payload);
+        op.omap_set(ref_value);
+        const double write_t0 = now_sec();
+        r = owner_ioctxs_[owner].operate(oid, &op);
+        RecordRaw(
+            metrics,
+            "raw_store_vector",
+            payload.length() + key.size() + ref_value.begin()->second.length(),
+            0,
+            now_sec() - write_t0);
+        if (r == 0) {
+          stored = true;
+          break;
+        }
+        if (r != -ETIMEDOUT && r != -ETIME) {
+          throw CephOperationError("raw_store_vector", r);
+        }
+        if (attempt == cfg_.osd_op_retry_limit) {
+          throw CephOperationError("raw_store_vector", r);
+        }
+        if (metrics) {
+          metrics->rados_exec_retries++;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+      }
+      if (!stored) {
+        throw CephOperationError("raw_store_vector", -EIO);
+      }
+    }
+    RecordDataTarget(metrics, owner, chunk);
+    if (update_label) {
+      RawUpdateLabels({{external_label, global_id}}, metrics);
+    }
+    if (metrics) {
+      metrics->store_vector_seconds += now_sec() - t0;
+    }
+  }
+
+  void RawUpdateLabels(
+      const std::vector<std::pair<uint64_t, uint64_t>>& labels,
+      Metrics* metrics) {
+    std::map<uint32_t, std::map<std::string, ceph::bufferlist>> groups;
+    for (const auto& [label, global_id] : labels) {
+      groups[label_owner_for(label, cfg_)].emplace(
+          ghnsw::LabelKey(label), encode_scalar(global_id));
+    }
+    for (const auto& [owner, values] : groups) {
+      const int r = RawOmapSet(
+          owner_ioctxs_[owner],
+          ghnsw::OwnerMetaOid(),
+          values,
+          metrics,
+          "raw_update_labels");
+      if (r < 0) {
+        throw CephOperationError("raw_update_labels", r);
+      }
+    }
+  }
+
+  bool RawCasLabel(
+      uint64_t external_label,
+      bool expect_missing,
+      uint64_t expected_global_id,
+      uint64_t replacement_global_id,
+      Metrics* metrics) {
+    const uint32_t owner = label_owner_for(external_label, cfg_);
+    const std::string oid = ghnsw::OwnerMetaOid();
+    const std::string key = ghnsw::LabelKey(external_label);
+    std::lock_guard<std::mutex> lock(
+        raw_object_mutex(owner_ioctxs_[owner].get_id(), oid));
+    if (metrics) {
+      metrics->label_cas_calls++;
+    }
+    std::map<std::string, ceph::bufferlist> values;
+    int r = RawOmapGet(
+        owner_ioctxs_[owner],
+        oid,
+        {key},
+        &values,
+        metrics,
+        "raw_get_label_for_cas");
+    if (r < 0) {
+      throw CephOperationError("raw_get_label_for_cas", r);
+    }
+    auto current_value = values.find(key);
+    if (current_value != values.end()) {
+      const uint64_t current =
+          decode_scalar_or_die<uint64_t>(current_value->second, "label target");
+      if (current == replacement_global_id) {
+        return true;
+      }
+      if (expect_missing || current != expected_global_id) {
+        return false;
+      }
+    } else if (!expect_missing) {
+      return false;
+    }
+    r = RawOmapSet(
+        owner_ioctxs_[owner],
+        oid,
+        {{key, encode_scalar(replacement_global_id)}},
+        metrics,
+        "raw_cas_label");
+    if (r < 0) {
+      throw CephOperationError("raw_cas_label", r);
+    }
+    return true;
+  }
+
+  std::unordered_map<uint64_t, uint64_t> RawLookupLabels(
+      const std::vector<uint64_t>& labels,
+      Metrics* metrics) {
+    std::unordered_map<uint64_t, uint64_t> result;
+    std::map<uint32_t, std::vector<uint64_t>> groups;
+    for (uint64_t label : labels) {
+      groups[label_owner_for(label, cfg_)].push_back(label);
+    }
+    for (const auto& [owner, owner_labels] : groups) {
+      std::set<std::string> keys;
+      for (uint64_t label : owner_labels) {
+        keys.insert(ghnsw::LabelKey(label));
+      }
+      std::map<std::string, ceph::bufferlist> values;
+      const int r = RawOmapGet(
+          owner_ioctxs_[owner],
+          ghnsw::OwnerMetaOid(),
+          keys,
+          &values,
+          metrics,
+          "raw_lookup_labels");
+      if (r < 0) {
+        throw CephOperationError("raw_lookup_labels", r);
+      }
+      for (uint64_t label : owner_labels) {
+        auto value = values.find(ghnsw::LabelKey(label));
+        if (value != values.end()) {
+          result.emplace(
+              label,
+              decode_scalar_or_die<uint64_t>(value->second, "label target"));
+        }
+      }
+    }
+    return result;
+  }
+
+  std::unordered_map<uint64_t, AdjacencyBlob> RawGetAdjacency(
+      const std::vector<uint64_t>& ids,
+      Metrics* metrics) {
+    std::unordered_map<uint64_t, AdjacencyBlob> result;
+    auto groups = GroupIds(ids);
+    for (const auto& [owner_chunk, owner_ids] : groups) {
+      const uint32_t owner = owner_chunk.first;
+      const uint64_t chunk = owner_chunk.second;
+      std::set<std::string> keys;
+      for (uint64_t id : owner_ids) {
+        keys.insert(ghnsw::NodeKey(id));
+      }
+      std::map<std::string, ceph::bufferlist> values;
+      const int r = RawOmapGet(
+          owner_ioctxs_[owner],
+          ghnsw::OwnerDataOid(chunk),
+          keys,
+          &values,
+          metrics,
+          "raw_get_adjacency");
+      if (metrics) {
+        metrics->remote_adj_calls++;
+        metrics->remote_adj_nodes += owner_ids.size();
+      }
+      RecordDataTarget(metrics, owner, chunk);
+      if (r < 0) {
+        throw CephOperationError("raw_get_adjacency", r);
+      }
+      for (uint64_t id : owner_ids) {
+        auto value = values.find(ghnsw::NodeKey(id));
+        if (value == values.end()) {
+          continue;
+        }
+        AdjacencyBlob adjacency;
+        decode_or_die(value->second, &adjacency, "AdjacencyBlob");
+        result.emplace(id, std::move(adjacency));
+      }
+    }
+    return result;
+  }
+
+  void RawSetAdjacency(
+      const std::vector<AdjacencyBlob>& entries,
+      Metrics* metrics) {
+    const double t0 = now_sec();
+    auto groups = GroupAdj(entries);
+    for (const auto& [owner_chunk, owner_entries] : groups) {
+      const uint32_t owner = owner_chunk.first;
+      const uint64_t chunk = owner_chunk.second;
+      const std::string oid = ghnsw::OwnerDataOid(chunk);
+      std::lock_guard<std::mutex> lock(
+          raw_object_mutex(owner_ioctxs_[owner].get_id(), oid));
+      std::set<std::string> keys;
+      for (const auto& entry : owner_entries) {
+        keys.insert(ghnsw::NodeKey(entry.global_id));
+      }
+      std::map<std::string, ceph::bufferlist> existing;
+      int r = RawOmapGet(
+          owner_ioctxs_[owner],
+          oid,
+          keys,
+          &existing,
+          metrics,
+          "raw_get_adjacency_for_create");
+      if (r < 0) {
+        throw CephOperationError("raw_get_adjacency_for_create", r);
+      }
+      std::map<std::string, ceph::bufferlist> values;
+      for (const auto& entry : owner_entries) {
+        const std::string key = ghnsw::NodeKey(entry.global_id);
+        if (existing.find(key) == existing.end()) {
+          values.emplace(key, encode_msg(entry));
+        }
+      }
+      if (!values.empty()) {
+        r = RawOmapSet(
+            owner_ioctxs_[owner],
+            oid,
+            values,
+            metrics,
+            "raw_set_adjacency");
+        if (r < 0) {
+          throw CephOperationError("raw_set_adjacency", r);
+        }
+      }
+      RecordDataTarget(metrics, owner, chunk);
+    }
+    if (metrics) {
+      metrics->set_new_adjacency_seconds += now_sec() - t0;
+    }
+  }
+
+  void RawApplyPatches(
+      const std::vector<AdjacencyBlob>& entries,
+      uint64_t update_id,
+      Metrics* metrics) {
+    auto groups = GroupAdj(entries);
+    for (const auto& [owner_chunk, owner_entries] : groups) {
+      const uint32_t owner = owner_chunk.first;
+      const uint64_t chunk = owner_chunk.second;
+      const std::string oid = ghnsw::OwnerDataOid(chunk);
+      const double t0 = now_sec();
+      std::lock_guard<std::mutex> lock(
+          raw_object_mutex(owner_ioctxs_[owner].get_id(), oid));
+      std::map<uint64_t, AdjacencyBlob> patches;
+      for (const auto& patch : owner_entries) {
+        auto& merged = patches[patch.global_id];
+        merged.global_id = patch.global_id;
+        if (merged.neighbors.size() < patch.neighbors.size()) {
+          merged.neighbors.resize(patch.neighbors.size());
+        }
+        for (size_t level = 0; level < patch.neighbors.size(); ++level) {
+          for (uint64_t id : patch.neighbors[level]) {
+            auto& neighbors = merged.neighbors[level];
+            if (std::find(neighbors.begin(), neighbors.end(), id) == neighbors.end()) {
+              neighbors.push_back(id);
+            }
+          }
+        }
+        merged.level_count = static_cast<uint32_t>(merged.neighbors.size());
+      }
+      std::set<std::string> keys{ghnsw::PatchKey(update_id)};
+      for (const auto& [global_id, _] : patches) {
+        keys.insert(ghnsw::NodeKey(global_id));
+      }
+      std::map<std::string, ceph::bufferlist> existing;
+      int r = RawOmapGet(
+          owner_ioctxs_[owner],
+          oid,
+          keys,
+          &existing,
+          metrics,
+          "raw_get_adjacency_for_patch");
+      if (r < 0) {
+        throw CephOperationError("raw_get_adjacency_for_patch", r);
+      }
+      if (existing.find(ghnsw::PatchKey(update_id)) == existing.end()) {
+        std::map<std::string, ceph::bufferlist> values;
+        for (const auto& [global_id, patch] : patches) {
+          AdjacencyBlob merged = patch;
+          auto current_value = existing.find(ghnsw::NodeKey(global_id));
+          if (current_value != existing.end()) {
+            decode_or_die(current_value->second, &merged, "AdjacencyBlob");
+            if (merged.neighbors.size() < patch.neighbors.size()) {
+              merged.neighbors.resize(patch.neighbors.size());
+            }
+            for (size_t level = 0; level < patch.neighbors.size(); ++level) {
+              auto& neighbors = merged.neighbors[level];
+              for (uint64_t id : patch.neighbors[level]) {
+                if (std::find(neighbors.begin(), neighbors.end(), id) == neighbors.end()) {
+                  neighbors.push_back(id);
+                }
+              }
+              const size_t max_neighbors =
+                  level == 0 ? static_cast<size_t>(cfg_.M) * 2 : cfg_.M;
+              if (neighbors.size() > max_neighbors) {
+                neighbors.erase(
+                    neighbors.begin(),
+                    neighbors.end() - static_cast<std::ptrdiff_t>(max_neighbors));
+              }
+            }
+            merged.level_count = static_cast<uint32_t>(merged.neighbors.size());
+          }
+          values.emplace(ghnsw::NodeKey(global_id), encode_msg(merged));
+        }
+        values.emplace(ghnsw::PatchKey(update_id), encode_scalar(update_id));
+        r = RawOmapSet(
+            owner_ioctxs_[owner],
+            oid,
+            values,
+            metrics,
+            "raw_apply_edge_patch_batch");
+        if (r < 0) {
+          throw CephOperationError("raw_apply_edge_patch_batch", r);
+        }
+      }
+      if (metrics) {
+        metrics->remote_patch_calls++;
+        metrics->total_patched_nodes += owner_entries.size();
+        metrics->adjacency_patch_seconds += now_sec() - t0;
+      }
+      RecordDataTarget(metrics, owner, chunk);
+    }
+  }
+
+  void RawMarkStale(uint64_t global_id, Metrics* metrics) {
+    const double t0 = now_sec();
+    const uint32_t owner = owner_for(global_id, cfg_);
+    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const std::string oid = ghnsw::OwnerDataOid(chunk);
+    const std::string key = ghnsw::VecKey(global_id);
+    std::lock_guard<std::mutex> lock(
+        raw_object_mutex(owner_ioctxs_[owner].get_id(), oid));
+    std::map<std::string, ceph::bufferlist> values;
+    int r = RawOmapGet(
+        owner_ioctxs_[owner],
+        oid,
+        {key},
+        &values,
+        metrics,
+        "raw_get_vector_ref_for_stale");
+    if (r < 0) {
+      throw CephOperationError("raw_get_vector_ref_for_stale", r);
+    }
+    auto value = values.find(key);
+    if (value == values.end()) {
+      throw CephOperationError("raw_get_vector_ref_for_stale", -ENOENT);
+    }
+    VectorRef ref;
+    decode_or_die(value->second, &ref, "VectorRef");
+    ref.flags = ghnsw::kVectorFlagStale;
+    r = RawOmapSet(
+        owner_ioctxs_[owner],
+        oid,
+        {{key, encode_msg(ref)}},
+        metrics,
+        "raw_mark_node_stale");
+    if (r < 0) {
+      throw CephOperationError("raw_mark_node_stale", r);
+    }
+    RecordDataTarget(metrics, owner, chunk);
+    if (metrics) {
+      metrics->mark_stale_seconds += now_sec() - t0;
+    }
+  }
+
+  ReserveInsertReply RawReserveInsert(uint64_t update_id, Metrics* metrics) {
+    if (update_id == 0) {
+      throw CephOperationError("raw_reserve_insert_id", -EINVAL);
+    }
+    const double t0 = now_sec();
+    std::lock_guard<std::mutex> lock(raw_meta_mutex());
+    if (metrics) {
+      metrics->global_meta_cas_calls++;
+    }
+    const std::string key = ghnsw::ReservationKey(update_id);
+    std::map<std::string, ceph::bufferlist> stored;
+    int r = RawOmapGet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        {key},
+        &stored,
+        metrics,
+        "raw_get_insert_reservation");
+    if (r < 0) {
+      throw CephOperationError("raw_get_insert_reservation", r);
+    }
+    auto existing = stored.find(key);
+    if (existing != stored.end()) {
+      ReserveInsertReply reply;
+      decode_or_die(existing->second, &reply, "ReserveInsertReply");
+      if (metrics) {
+        metrics->global_meta_update_seconds += now_sec() - t0;
+      }
+      return reply;
+    }
+    GlobalMeta meta = RawGetMeta(metrics);
+    ReserveInsertReply reply;
+    reply.global_id = meta.next_global_id;
+    reply.search_meta = meta;
+    GlobalMeta next = meta;
+    next.next_global_id++;
+    next.version++;
+    auto values = encode_global_meta(next);
+    values.emplace(key, encode_msg(reply));
+    r = RawOmapSet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        values,
+        metrics,
+        "raw_reserve_insert_id");
+    if (r < 0) {
+      throw CephOperationError("raw_reserve_insert_id", r);
+    }
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - t0;
+    }
+    return reply;
+  }
+
+  void RawFinalizeInsert(
+      uint64_t update_id,
+      uint64_t global_id,
+      uint32_t level,
+      Metrics* metrics) {
+    if (update_id == 0) {
+      throw CephOperationError("raw_finalize_insert", -EINVAL);
+    }
+    const double t0 = now_sec();
+    std::lock_guard<std::mutex> lock(raw_meta_mutex());
+    if (metrics) {
+      metrics->global_meta_cas_calls++;
+    }
+    const std::string key = ghnsw::FinalizedKey(update_id);
+    std::map<std::string, ceph::bufferlist> stored;
+    int r = RawOmapGet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        {key},
+        &stored,
+        metrics,
+        "raw_get_finalize_marker");
+    if (r < 0) {
+      throw CephOperationError("raw_get_finalize_marker", r);
+    }
+    auto existing = stored.find(key);
+    if (existing != stored.end()) {
+      const uint64_t finalized_id =
+          decode_scalar_or_die<uint64_t>(existing->second, "finalized id");
+      if (finalized_id != global_id) {
+        throw CephOperationError("raw_finalize_insert", -EEXIST);
+      }
+      if (metrics) {
+        metrics->global_meta_update_seconds += now_sec() - t0;
+      }
+      return;
+    }
+    GlobalMeta meta = RawGetMeta(metrics);
+    if (global_id >= meta.next_global_id) {
+      throw CephOperationError("raw_finalize_insert", -ERANGE);
+    }
+    if (meta.enterpoint == UINT64_MAX || level > meta.max_level) {
+      meta.enterpoint = global_id;
+      meta.max_level = level;
+    }
+    meta.cur_element_count++;
+    meta.version++;
+    auto values = encode_global_meta(meta);
+    values.emplace(key, encode_scalar(global_id));
+    r = RawOmapSet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        values,
+        metrics,
+        "raw_finalize_insert");
+    if (r < 0) {
+      throw CephOperationError("raw_finalize_insert", r);
+    }
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - t0;
+    }
+  }
+
+  bool RawCasMeta(
+      uint64_t expected_version,
+      const GlobalMeta& meta,
+      Metrics* metrics) {
+    const double t0 = now_sec();
+    std::lock_guard<std::mutex> lock(raw_meta_mutex());
+    if (metrics) {
+      metrics->global_meta_cas_calls++;
+    }
+    const GlobalMeta current = RawGetMeta(metrics);
+    if (current.version != expected_version) {
+      if (metrics) {
+        metrics->global_meta_update_seconds += now_sec() - t0;
+      }
+      return false;
+    }
+    const int r = RawOmapSet(
+        meta_ioctx_,
+        cfg_.meta_oid,
+        encode_global_meta(meta),
+        metrics,
+        "raw_cas_global_meta");
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - t0;
+    }
+    if (r < 0) {
+      throw CephOperationError("raw_cas_global_meta", r);
+    }
+    return true;
+  }
+
   void RecordDataTarget(Metrics* metrics, uint32_t owner, uint64_t chunk) {
     if (!metrics) {
       return;
@@ -1418,7 +2420,7 @@ class Coordinator {
 	    double start_cutoff = deadline;
 	    if (cfg_.time_limit_seconds > 0) {
 	      // Do not launch a fresh update right at the window boundary. A single
-	      // HNSW update can have a long tail because it issues multiple CLS ops.
+		      // HNSW update can have a long tail because it issues many remote ops.
 	      const double grace =
 	          std::min(30.0, static_cast<double>(cfg_.time_limit_seconds) * 0.10);
 	      start_cutoff = std::max(g0, deadline - grace);
@@ -2176,6 +3178,8 @@ class Coordinator {
     out << "{\n";
     out << "  \"mode\": \"" << metrics_.mode << "\",\n";
     out << "  \"distance_mode\": \"" << cfg_.distance_mode << "\",\n";
+    out << "  \"storage_access_mode\": \""
+        << (cfg_.distance_mode == "compute" ? "raw_rados" : "cls") << "\",\n";
     out << "  \"distance_split_probe\": "
         << (cfg_.distance_split_probe ? "true" : "false") << ",\n";
     out << "  \"distance_probe_interval_seconds\": "
@@ -2266,9 +3270,32 @@ class Coordinator {
       out << "\n  ";
     }
     out << "},\n";
+    out << "  \"raw_operation_profile\": {";
+    bool first_raw_operation = true;
+    for (const auto& [operation, values] : metrics_.raw_operation_metrics) {
+      out << (first_raw_operation ? "\n" : ",\n");
+      out << "    \"" << operation << "\": {";
+      out << "\"calls\": " << values.calls << ", ";
+      out << "\"request_bytes\": " << values.request_bytes << ", ";
+      out << "\"reply_bytes\": " << values.reply_bytes << ", ";
+      out << "\"roundtrip_seconds\": " << values.roundtrip_seconds << ", ";
+      out << "\"avg_roundtrip_ms\": "
+          << (values.calls > 0
+                  ? values.roundtrip_seconds * 1000.0 /
+                        static_cast<double>(values.calls)
+                  : 0.0)
+          << "}";
+      first_raw_operation = false;
+    }
+    if (!first_raw_operation) {
+      out << "\n  ";
+    }
+    out << "},\n";
     out << "  \"observability\": {\n";
     out << "    \"update_attempts\": " << metrics_.update_attempts_observed << ",\n";
     out << "    \"total_cls_exec_calls\": " << metrics_.total_cls_exec_calls << ",\n";
+    out << "    \"total_raw_rados_calls\": "
+        << metrics_.total_raw_rados_calls << ",\n";
     out << "    \"global_meta_cas_calls\": "
         << metrics_.global_meta_cas_calls << ",\n";
     out << "    \"label_cas_calls\": " << metrics_.label_cas_calls << ",\n";
@@ -2276,6 +3303,12 @@ class Coordinator {
         << per_attempt(metrics_.total_cls_exec_calls) << ",\n";
     out << "    \"cls_request_bytes\": " << metrics_.cls_request_bytes << ",\n";
     out << "    \"cls_reply_bytes\": " << metrics_.cls_reply_bytes << ",\n";
+    out << "    \"raw_rados_calls_per_update_attempt\": "
+        << per_attempt(metrics_.total_raw_rados_calls) << ",\n";
+    out << "    \"raw_rados_request_bytes\": "
+        << metrics_.raw_rados_request_bytes << ",\n";
+    out << "    \"raw_rados_reply_bytes\": "
+        << metrics_.raw_rados_reply_bytes << ",\n";
     out << "    \"logical_distance_query_bytes\": "
         << metrics_.logical_distance_query_bytes << ",\n";
     out << "    \"distance_batches\": " << metrics_.distance_batches << ",\n";

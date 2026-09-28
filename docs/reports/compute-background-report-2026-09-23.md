@@ -1,5 +1,9 @@
 # Compute-node 背景数据移动实验报告（2026-09-23）
 
+> **历史口径警告（2026-09-28）：** 本轮仅将距离计算放在 Coordinator，其他更新
+> 操作仍调用 CLS，不是全链路原生 RADOS baseline。结果可继续说明候选向量搬运
+> 特征，但新版 compute 性能必须在 `total_cls_exec_calls=0` 的实现上重新测量。
+
 ## 结论
 
 本轮完成 GIST1M、Text2Image10M、Deep100M 和 SIFT100M 四组 compute-node

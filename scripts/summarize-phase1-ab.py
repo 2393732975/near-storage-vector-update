@@ -93,6 +93,7 @@ def load_runs(root):
                 "mode": mode,
                 "dataset": dataset,
                 "path": str(path),
+                "storage_access_mode": update.get("storage_access_mode", "unknown"),
                 "failed_updates": update.get("failed_updates", 0),
                 "checker_status": check.get("status", "missing"),
                 "checker_errors": check.get("errors", 0),
@@ -105,6 +106,10 @@ def load_runs(root):
                 ),
                 "cls_calls_per_update": ratio(
                     nested(update, "observability", "total_cls_exec_calls", default=0),
+                    attempts,
+                ),
+                "raw_rados_calls_per_update": ratio(
+                    nested(update, "observability", "total_raw_rados_calls", default=0),
                     attempts,
                 ),
                 "distance_batches_per_update": ratio(
@@ -134,6 +139,21 @@ def load_runs(root):
                     + nested(update, "observability", "cls_reply_bytes", default=0),
                     vectors * 1024,
                 ),
+                "raw_rados_kib_per_update": ratio(
+                    nested(
+                        update,
+                        "observability",
+                        "raw_rados_request_bytes",
+                        default=0,
+                    )
+                    + nested(
+                        update,
+                        "observability",
+                        "raw_rados_reply_bytes",
+                        default=0,
+                    ),
+                    vectors * 1024,
+                ),
             }
         )
     if not runs:
@@ -151,11 +171,13 @@ def aggregate(runs):
         "p99_latency_ms",
         "recall_at_k",
         "cls_calls_per_update",
+        "raw_rados_calls_per_update",
         "distance_batches_per_update",
         "candidates_per_distance_batch",
         "patch_calls_per_update",
         "logical_query_kib_per_update",
         "cls_kib_per_update",
+        "raw_rados_kib_per_update",
     )
     output = {}
     for (dataset, mode), items in sorted(groups.items()):
@@ -163,6 +185,9 @@ def aggregate(runs):
             metric: describe([float(item[metric]) for item in items])
             for metric in metric_names
         }
+        stats["storage_access_modes"] = sorted(
+            {item["storage_access_mode"] for item in items}
+        )
         stats["valid_runs"] = sum(
             item["failed_updates"] == 0
             and item["checker_status"] == "pass"
@@ -232,8 +257,8 @@ def write_markdown(root, aggregate_data, output):
             "",
             "## 调用形态与数据移动",
             "",
-            "| 数据集 | 模式 | CLS calls/update | distance batches/update | candidates/batch | query KiB/update | CLS KiB/update | patch calls/update |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| 数据集 | 模式 | 存储访问 | Raw RADOS calls/update | CLS calls/update | distance batches/update | candidates/batch | query KiB/update | Raw RADOS KiB/update | CLS KiB/update | patch calls/update |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for dataset, modes in aggregate_data.items():
@@ -242,10 +267,14 @@ def write_markdown(root, aggregate_data, output):
                 continue
             values = modes[mode]
             lines.append(
-                f'| {dataset} | {mode} | {values["cls_calls_per_update"]["mean"]:.2f} '
+                f'| {dataset} | {mode} '
+                f'| {"/".join(values["storage_access_modes"])} '
+                f'| {values["raw_rados_calls_per_update"]["mean"]:.2f} '
+                f'| {values["cls_calls_per_update"]["mean"]:.2f} '
                 f'| {values["distance_batches_per_update"]["mean"]:.2f} '
                 f'| {values["candidates_per_distance_batch"]["mean"]:.3f} '
                 f'| {values["logical_query_kib_per_update"]["mean"]:.2f} '
+                f'| {values["raw_rados_kib_per_update"]["mean"]:.2f} '
                 f'| {values["cls_kib_per_update"]["mean"]:.2f} '
                 f'| {values["patch_calls_per_update"]["mean"]:.2f} |'
             )
@@ -259,7 +288,8 @@ def write_markdown(root, aggregate_data, output):
             "不是更新后动态语料库的精确 Recall。",
             "- 每次测量都重新建池并导入 base，但导入本身会预热客户端和 OSD 缓存；"
             "本结果应标记为 `fresh-pool-after-import`，不能称为受控冷缓存实验。",
-            "- 非距离 CLS 尚未返回服务端内部耗时；同步 baseline 也不存在可记录的微批等待。",
+            "- OSD 路径的非距离 CLS 尚未返回服务端内部耗时；同步 baseline "
+            "也不存在可记录的微批等待。",
             "",
         ]
     )

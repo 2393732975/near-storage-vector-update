@@ -6,12 +6,25 @@ compute-node 与 OSD/CLS 两条更新路径。正式结论必须同时满足零�
 
 ## 两条基线路径
 
-- `--distance-mode compute`：从 Ceph 拉取候选向量，在 Coordinator 本地计算距离。
+- `--distance-mode compute`：全更新路径只使用原生 librados 对象读写和 OMAP API；
+  Coordinator 拉取候选向量并在本地算距，不调用 CLS。
 - `--distance-mode osd`：把 query 和候选 ID 发给目标对象，由 CLS 读取本地向量并
   计算距离。图搜索控制、邻接修改和元数据协议仍由 Coordinator 编排。
 
-两者使用相同的 base 图、更新语义和持久化结构，区别仅在距离阶段是否搬运候选
-向量。compute 路径用 `remote_vector_bytes` 和 `remote_vector_calls` 量化数据移动。
+两者使用相同的 base 图、更新语义和持久化结构。compute 在客户端实现完整存储
+协议，OSD 路径由 CLS 在对象内实现相同语义；距离阶段还分别对应“拉回候选向量”
+与“下发 query”。compute 路径用 `remote_vector_bytes` 和
+`remote_vector_calls` 量化候选向量搬运。
+
+输出中的 `storage_access_mode` 明确标识路径。compute 必须满足
+`observability.total_cls_exec_calls=0`；`total_raw_rados_calls`、
+`raw_rados_request_bytes`、`raw_rados_reply_bytes` 和 `raw_operation_profile` 用于
+统计原生调用。任何 compute 代码误用 `cls_exec` 都会由 Coordinator 的运行时保护
+立即终止。
+
+原生路径用进程内共享锁保护 read-modify-write，适用于 runner 的单 Coordinator、
+多 worker 模型；它不是多 Coordinator 分布式事务协议。多进程写同一实验池不属于
+该 baseline 的支持范围。
 
 ## 完整更新主阶段
 
@@ -107,6 +120,8 @@ python3 scripts/summarize-stage-costs.py \
 ## 结果判读规则
 
 - `failed_updates` 必须为 0，检查器必须返回 `status=pass`。
+- compute 必须为 `raw_rados` 且 CLS 调用数严格等于 0；OSD 模式必须产生 CLS
+  调用。runner 会自动执行该门禁。
 - A/B 必须使用同一代码提交、数据、池落点、并发度和探针配置。
 - 至少重复三轮，报告均值、标准差、P50/P95/P99 和每次更新的数据移动量。
 - 累积轮次受缓存与索引状态变化影响，不能当成独立冷启动样本。

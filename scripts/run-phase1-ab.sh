@@ -111,15 +111,19 @@ record_placement() {
 }
 
 validate_run() {
-  local update_json=$1 check_json=$2
-  python3 - "$update_json" "$check_json" <<'PY'
+  local mode=$1 update_json=$2 check_json=$3
+  python3 - "$mode" "$update_json" "$check_json" <<'PY'
 import json
 import sys
 
-update = json.load(open(sys.argv[1], encoding="utf-8"))
-check = json.load(open(sys.argv[2], encoding="utf-8"))
+mode = sys.argv[1]
+update = json.load(open(sys.argv[2], encoding="utf-8"))
+check = json.load(open(sys.argv[3], encoding="utf-8"))
 quality = update.get("quality", {})
+observability = update.get("observability", {})
 summary = {
+    "distance_mode": update.get("distance_mode"),
+    "storage_access_mode": update.get("storage_access_mode"),
     "vectors_processed": update["vectors_processed"],
     "failed_updates": update["failed_updates"],
     "throughput_updates_per_sec": update["throughput_updates_per_sec"],
@@ -130,8 +134,24 @@ summary = {
     "checker_errors": check["errors"],
     "checker_warnings": check["warnings"],
     "semantic_edge_win_rate": check["semantic_locality"]["edge_win_rate"],
+    "total_cls_exec_calls": observability.get("total_cls_exec_calls"),
+    "total_raw_rados_calls": observability.get("total_raw_rados_calls"),
 }
 print(summary)
+if update.get("distance_mode") != mode:
+    raise SystemExit(f"distance mode mismatch: expected {mode!r}")
+if mode == "compute":
+    if update.get("storage_access_mode") != "raw_rados":
+        raise SystemExit("compute baseline did not report raw_rados access")
+    if observability.get("total_cls_exec_calls") != 0:
+        raise SystemExit("compute baseline invoked CLS")
+    if not observability.get("total_raw_rados_calls", 0):
+        raise SystemExit("compute baseline made no raw RADOS calls")
+elif mode == "osd":
+    if update.get("storage_access_mode") != "cls":
+        raise SystemExit("OSD mode did not report CLS access")
+    if not observability.get("total_cls_exec_calls", 0):
+        raise SystemExit("OSD mode made no CLS calls")
 if update["failed_updates"] != 0 or check["status"] != "pass":
     raise SystemExit(1)
 if not quality.get("ground_truth_enabled"):
@@ -236,7 +256,7 @@ for repetition in $(seq 1 "$repetitions"); do
         --semantic-samples "$semantic_samples" \
         --semantic-min-edge-win-rate "$semantic_min_edge_win_rate" \
         --output "$output/index-check.json"
-      validate_run "$output/update.json" "$output/index-check.json"
+      validate_run "$mode" "$output/update.json" "$output/index-check.json"
       wait_for_clean_cluster
     done
   done
