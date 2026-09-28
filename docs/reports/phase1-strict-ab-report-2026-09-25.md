@@ -82,3 +82,11 @@ payload 读取还分别达到 127.1/119.4 ms。图搜索的非距离部分为 24
 
 Recall 是更新提交前 level-0 搜索相对原始 base ground truth 的静态指标，不是更新
 后动态数据集的精确 Recall。导入会预热缓存，报告结果也不能解释为冷缓存性能。
+
+## 集群收尾
+
+报告和本地原始工件确认落盘后，已用带 FSID 保护的白名单脚本删除 `nsvu_meta` 和
+`nsvu_owner_0`–`nsvu_owner_4`。最终只保留 `.mgr`、`rbd` 两个既有池，5 个 OSD
+全部 `up/in`，33 个 PG 全部 `active+clean`。实验产生的 large-OMAP 告警已消失；
+集群仍报告 osd.0 BlueStore slow-op 和既有 `devicehealth` 磁盘 I/O 错误，未对这些
+告警执行屏蔽、强制压缩或 OSD 重启。BlueStore 物理空间将在后台异步回收。
