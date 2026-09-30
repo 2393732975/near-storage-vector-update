@@ -92,6 +92,24 @@ remote_distance
 `distance_local_compute_seconds` 是本地算距。路径价值应同时用延迟、吞吐和
 `remote_vector_bytes / vectors_processed` 判断，不能只比较纯算距时间。
 
+## 聚合效率指标
+
+阶段 2 起，`observability` 同时报告距离路径自己的对象扇出，不能再用整条更新的
+`avg_unique_data_objects_per_update_attempt` 代替：
+
+- `avg_unique_distance_objects_per_update_attempt` 与最大值：每次 update 的真实
+  距离对象扇出；
+- `candidates_per_unique_distance_object`：对象内可聚合候选密度；
+- `distance_batch_size_histogram`：当前每次对象请求携带的候选数分布；
+- `frontier_window_fill`：每个搜索窗口实际展开的 frontier 节点数；B0 串行搜索
+  应接近 1，阶段 3 才会提升；
+- `distance_candidates_before_dedupe`、`distance_candidates_after_dedupe` 与 retention
+  ratio：visited 去重的工作量变化。
+
+这些量必须满足：批大小直方图计数之和等于 `distance_batches`；候选总数除以唯一
+距离对象总数等于 `candidates_per_unique_distance_object`。正式结果仍需通过零失败、
+索引检查和配对 Recall 门禁。
+
 ## 运行和汇总
 
 运行四数据集基线；脚本会为每个模式/数据集重建实验池：

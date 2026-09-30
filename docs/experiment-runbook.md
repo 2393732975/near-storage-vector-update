@@ -297,6 +297,9 @@ level-0 图边与确定性的随机对照边比较；图边距离优于对照的
 用于拦截 internal ID 与 external label 错配这类“结构合法、语义错误”的索引。
 其中 compute 是全链路原生 RADOS baseline，不是“仅距离在计算侧、其余仍调用
 CLS”的混合路径；runner 将零 CLS 调用作为正式结果的硬门禁。
+当前 CLS 协议为 schema v1；请求和响应都带版本化信封。运行 OSD 路径前必须确认
+所有 OSD 已部署同一提交的 `libcls_hnsw_global.so`，否则 Coordinator 与旧 CLS
+协议不兼容，实验会失败。
 
 ```bash
 run_root="$PWD/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -316,6 +319,7 @@ nohup env \
   OSD_OP_TIMEOUT_SECONDS=45 \
   OSD_OP_RETRY_LIMIT=3 \
   RECALL_K=10 \
+  PAIRED_RECALL_MAX_REGRESSION=0.005 \
   RUN_ROOT="$run_root" \
   scripts/run-phase1-ab.sh --confirm-reset \
   >"$run_root/runner.log" 2>&1 &
@@ -328,6 +332,10 @@ ground truth 必须位于第 3 节列出的数据集目录。该 Recall 是更�
 回归门槛，不是修改后语料库的精确 Recall；精确动态质量评估需要重新计算 ground
 truth。每轮虽然使用新池，但导入会预热缓存，因此结果应标记为
 `fresh-pool-after-import`，不能声称是受控冷缓存结果。
+每个重复/数据集完成两种模式后，runner 会取从 query 0 开始的最长共同前缀，生成
+`rep-N/paired-quality/<dataset>.json`；OSD Recall@10 相对 compute 下降超过默认
+0.005（0.5 个百分点）时立即失败。该配对门禁解决固定时间窗完成更新数不同造成的
+不可比问题。
 
 正常结束后自动生成 `summary.md` 和 `summary.json`。若需要重新汇总：
 

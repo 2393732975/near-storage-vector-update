@@ -176,6 +176,23 @@ schema_version、opcode、request_id；写请求再携带 update_id、expected_v
 退出条件：modulo 模式的对象映射逐 ID 等价；失败注入仍可幂等重放；新指标在
 GIST1M smoke 中可闭合；重构后 B0 延迟和吞吐变化不超过 5%。
 
+### 5.1 实施状态（2026-09-30）
+
+阶段 2 的代码改造已经完成：importer、Coordinator 和 checker 共用保持原 modulo
+语义的 `PlacementResolver`；CLS schema v1 的请求与响应统一携带 magic、opcode、
+request ID 和 placement epoch，在线写请求进一步传递 update ID 或 expected
+version，未知 schema/opcode 会明确拒绝。严格 A/B runner 还会在两条路径的最长
+共同 query 前缀上执行 Recall@10 回归门禁。
+
+观测已补齐 distance-only 唯一对象数、候选/对象、每对象批大小直方图、frontier
+window fill，以及 visited 去重前后的候选数。modulo 边界单测、协议 round-trip、
+未知版本拒绝、Python 单测和全量编译均已通过。
+
+集群验收尚未执行：schema v1 必须先将同一提交构建的 CLS 部署到全部 OSD，再用
+GIST1M smoke 验证指标闭合、幂等重放和相对 B0 的性能变化不超过 5%。部署 CLS、
+重启 OSD 和重建实验池均按仓库安全规则另行取得明确授权；完成这些门禁前，M2
+状态为“实现完成、集群验收待完成”。
+
 ## 6. 阶段 3：最高优先级——单次更新的读路径聚合
 
 这是最新数据指向的首个性能改动。现有 `SearchLayer` 虽然调用
