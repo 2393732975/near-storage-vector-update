@@ -22,6 +22,7 @@ osd_op_retry_limit=${OSD_OP_RETRY_LIMIT:-3}
 recall_k=${RECALL_K:-10}
 paired_recall_max_regression=${PAIRED_RECALL_MAX_REGRESSION:-0.005}
 read -r -a datasets <<< "${DATASETS:-gist1m text2image10m deep100m sift100m}"
+read -r -a requested_modes <<< "${MODES:-compute osd}"
 
 importer="$repo_root/build/nsvu-base-importer"
 coordinator="$repo_root/build/nsvu-update-coordinator"
@@ -55,6 +56,22 @@ if not 0.0 <= value <= 1.0:
     raise SystemExit("PAIRED_RECALL_MAX_REGRESSION must be in [0, 1].")
 PY
 (( ${#datasets[@]} > 0 )) || { echo "DATASETS must not be empty." >&2; exit 2; }
+(( ${#requested_modes[@]} > 0 )) || { echo "MODES must not be empty." >&2; exit 2; }
+has_compute=false
+has_osd=false
+for mode in "${requested_modes[@]}"; do
+  case "$mode" in
+    compute)
+      [[ "$has_compute" == false ]] || { echo "MODES contains duplicate compute." >&2; exit 2; }
+      has_compute=true
+      ;;
+    osd)
+      [[ "$has_osd" == false ]] || { echo "MODES contains duplicate osd." >&2; exit 2; }
+      has_osd=true
+      ;;
+    *) echo "Unsupported mode in MODES: $mode" >&2; exit 2 ;;
+  esac
+done
 
 wait_for_clean_cluster() {
   local deadline=$((SECONDS + 300)) osd_stat pg_stat
@@ -214,6 +231,7 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "recall_k=$recall_k"
   echo "paired_recall_max_regression=$paired_recall_max_regression"
   echo "cache_condition=fresh-pool-after-import (not a controlled cold-cache run)"
+  echo "modes=${requested_modes[*]}"
   echo "datasets=${datasets[*]}"
   for dataset in "${datasets[@]}"; do
     load_dataset_config "$dataset"
@@ -222,10 +240,9 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
 } >"$run_root/manifest.txt"
 
 for repetition in $(seq 1 "$repetitions"); do
-  if (( repetition % 2 == 1 )); then
-    modes=(compute osd)
-  else
-    modes=(osd compute)
+  modes=("${requested_modes[@]}")
+  if (( ${#requested_modes[@]} == 2 && repetition % 2 == 0 )); then
+    modes=("${requested_modes[1]}" "${requested_modes[0]}")
   fi
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] repetition $repetition/$repetitions order=${modes[*]}"
   for dataset in "${datasets[@]}"; do
@@ -268,12 +285,14 @@ for repetition in $(seq 1 "$repetitions"); do
       validate_run "$mode" "$output/update.json" "$output/index-check.json"
       wait_for_clean_cluster
     done
-    paired_output="$run_root/rep-$repetition/paired-quality/$dataset.json"
-    python3 "$repo_root/scripts/compare-paired-recall.py" \
-      "$run_root/rep-$repetition/compute/$dataset/update.json" \
-      "$run_root/rep-$repetition/osd/$dataset/update.json" \
-      --max-regression "$paired_recall_max_regression" \
-      --output "$paired_output"
+    if [[ "$has_compute" == true && "$has_osd" == true ]]; then
+      paired_output="$run_root/rep-$repetition/paired-quality/$dataset.json"
+      python3 "$repo_root/scripts/compare-paired-recall.py" \
+        "$run_root/rep-$repetition/compute/$dataset/update.json" \
+        "$run_root/rep-$repetition/osd/$dataset/update.json" \
+        --max-regression "$paired_recall_max_regression" \
+        --output "$paired_output"
+    fi
   done
 done
 

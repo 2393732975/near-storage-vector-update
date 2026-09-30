@@ -301,6 +301,11 @@ CLS”的混合路径；runner 将零 CLS 调用作为正式结果的硬门禁�
 所有 OSD 已部署同一提交的 `libcls_hnsw_global.so`，否则 Coordinator 与旧 CLS
 协议不兼容，实验会失败。
 
+默认 `MODES="compute osd"`。只验证不影响 compute baseline 的 OSD 改动时可设置
+`MODES=osd`；runner 仍会为每个数据集、每次重复独立重建池和导入，但不会运行
+compute 或共同前缀 paired Recall。单路径结果只能与相同配置的既有正式结果纵向
+比较，不能生成当轮 compute/OSD 横向加速比。
+
 ```bash
 run_root="$PWD/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"
 test ! -e "$run_root"
@@ -373,6 +378,7 @@ scripts/run-phase0-validation.sh --confirm-reset
 
 | 参数 | baseline | 阶段 0 | 阶段 1 | 建议 |
 | --- | ---: | ---: | ---: | --- |
+| `MODES` | 可选子集 | 固定 OSD | compute、OSD 或两者 | 单路径正式复测使用 `osd` |
 | `DATASETS` | 四数据集 | 四数据集 | 四数据集 | 调试可选子集，正式实验全部运行 |
 | `WINDOW_SECONDS` | 300 | 300 | 300 | 正式对照保持一致 |
 | `UPDATE_PARALLELISM` | 1 | 4 | 4 | 本项目正式基线显式设为 4 |

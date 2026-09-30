@@ -76,6 +76,18 @@ class Phase1SummaryTest(unittest.TestCase):
             self.assertIn("fresh-pool-after-import", text)
             self.assertIn("| gist1m | compute | raw_rados | 12.00 | 0.00", text)
 
+    def test_osd_only_markdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write_run(root, 1, "osd", 80.0, 50.0, 0.79)
+
+            aggregate = MODULE.aggregate(MODULE.load_runs(root))
+            report = root / "summary.md"
+            MODULE.write_markdown(root, aggregate, report)
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("OSD/CLS 单路径正式复测汇总", text)
+            self.assertNotIn("## OSD 相对 Compute", text)
+
 
 if __name__ == "__main__":
     unittest.main()

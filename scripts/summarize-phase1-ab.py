@@ -208,8 +208,17 @@ def percent_change(osd, compute):
 
 
 def write_markdown(root, aggregate_data, output):
+    observed_modes = {
+        mode for modes in aggregate_data.values() for mode in modes
+    }
+    if observed_modes == {"osd"}:
+        title = "# OSD/CLS 单路径正式复测汇总"
+    elif observed_modes == {"compute"}:
+        title = "# Compute/raw-RADOS 单路径正式复测汇总"
+    else:
+        title = "# 阶段 1 Compute/OSD 严格 A/B 汇总"
     lines = [
-        "# 阶段 1 Compute/OSD 严格 A/B 汇总",
+        title,
         "",
         f"结果目录：`{root}`。误差项为独立重复样本均值的 95% Student-t 置信区间。",
         "只有 `failed_updates=0` 且一致性检查通过的完整运行才具备正式比较资格。",
@@ -230,27 +239,28 @@ def write_markdown(root, aggregate_data, output):
                 f'| {fmt(values["p99_latency_ms"])} | {fmt(values["recall_at_k"], 4)} |'
             )
 
-    lines.extend(
-        [
-            "",
-            "## OSD 相对 Compute",
-            "",
-            "| 数据集 | 平均延迟变化 | P99 变化 | 吞吐变化 | Recall 差值 (pp) |",
-            "| --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for dataset, modes in aggregate_data.items():
-        if "compute" not in modes or "osd" not in modes:
-            continue
-        compute = modes["compute"]
-        osd = modes["osd"]
-        lines.append(
-            f'| {dataset} '
-            f'| {percent_change(osd["avg_latency_ms"]["mean"], compute["avg_latency_ms"]["mean"]):+.2f}% '
-            f'| {percent_change(osd["p99_latency_ms"]["mean"], compute["p99_latency_ms"]["mean"]):+.2f}% '
-            f'| {percent_change(osd["throughput"]["mean"], compute["throughput"]["mean"]):+.2f}% '
-            f'| {(osd["recall_at_k"]["mean"] - compute["recall_at_k"]["mean"]) * 100:+.3f} |'
+    if {"compute", "osd"}.issubset(observed_modes):
+        lines.extend(
+            [
+                "",
+                "## OSD 相对 Compute",
+                "",
+                "| 数据集 | 平均延迟变化 | P99 变化 | 吞吐变化 | Recall 差值 (pp) |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
         )
+        for dataset, modes in aggregate_data.items():
+            if "compute" not in modes or "osd" not in modes:
+                continue
+            compute = modes["compute"]
+            osd = modes["osd"]
+            lines.append(
+                f'| {dataset} '
+                f'| {percent_change(osd["avg_latency_ms"]["mean"], compute["avg_latency_ms"]["mean"]):+.2f}% '
+                f'| {percent_change(osd["p99_latency_ms"]["mean"], compute["p99_latency_ms"]["mean"]):+.2f}% '
+                f'| {percent_change(osd["throughput"]["mean"], compute["throughput"]["mean"]):+.2f}% '
+                f'| {(osd["recall_at_k"]["mean"] - compute["recall_at_k"]["mean"]) * 100:+.3f} |'
+            )
 
     lines.extend(
         [
