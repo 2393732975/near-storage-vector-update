@@ -21,20 +21,24 @@ $(BUILD_DIR):
 $(BUILD_DIR)/libcls_hnsw_global.so: src/cls/hnsw_cls.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared -o $@ $<
 
-$(BUILD_DIR)/nsvu-update-coordinator: src/coordinator/update_coordinator.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/nsvu-update-coordinator: src/coordinator/update_coordinator.cc include/nsvu/protocol.hpp include/nsvu/placement.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-$(BUILD_DIR)/nsvu-base-importer: src/importer/base_index_importer.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/nsvu-base-importer: src/importer/base_index_importer.cc include/nsvu/protocol.hpp include/nsvu/placement.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) -I$(HNSWLIB_INCLUDE) $(CXXFLAGS) -fopenmp $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-$(BUILD_DIR)/nsvu-index-checker: src/tools/index_checker.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/nsvu-index-checker: src/tools/index_checker.cc include/nsvu/protocol.hpp include/nsvu/placement.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 $(BUILD_DIR)/protocol-roundtrip-test: tests/protocol_roundtrip.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< /usr/lib/ceph/libceph-common.so.2 -pthread
 
-check: check-config $(BUILD_DIR)/protocol-roundtrip-test
+$(BUILD_DIR)/placement-resolver-test: tests/placement_resolver_test.cc include/nsvu/placement.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $<
+
+check: check-config $(BUILD_DIR)/protocol-roundtrip-test $(BUILD_DIR)/placement-resolver-test
 	$(BUILD_DIR)/protocol-roundtrip-test
+	$(BUILD_DIR)/placement-resolver-test
 
 clean:
 	rm -rf $(BUILD_DIR)

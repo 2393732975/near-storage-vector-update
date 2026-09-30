@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "nsvu/placement.hpp"
 #include "nsvu/protocol.hpp"
 
 namespace {
@@ -92,18 +93,6 @@ bool DecodeScalar(const ceph::bufferlist& value, T* decoded) {
   } catch (const ceph::buffer::error&) {
     return false;
   }
-}
-
-uint32_t OwnerFor(uint64_t global_id, const Config& cfg) {
-  return static_cast<uint32_t>(global_id % cfg.owners);
-}
-
-uint32_t LabelOwnerFor(uint64_t external_label, const Config& cfg) {
-  return static_cast<uint32_t>(external_label % cfg.owners);
-}
-
-uint64_t ChunkFor(uint64_t global_id, const Config& cfg) {
-  return (global_id / cfg.owners) / cfg.points_per_object;
 }
 
 float VectorDistance(
@@ -272,12 +261,13 @@ GlobalMeta ReadGlobalMeta(librados::IoCtx& ioctx, const Config& cfg) {
 
 void VerifyLabels(
     const Config& cfg,
+    const ghnsw::PlacementResolver& placement,
     std::vector<librados::IoCtx>* owner_ioctxs,
     const std::vector<VectorRef>& active_refs,
     Report* report) {
   std::vector<std::set<std::string>> keys(cfg.owners);
   for (const auto& ref : active_refs) {
-    const uint32_t owner = LabelOwnerFor(ref.external_label, cfg);
+    const uint32_t owner = placement.ResolveLabelShard(ref.external_label);
     keys[owner].insert(ghnsw::LabelKey(ref.external_label));
   }
   std::vector<std::map<std::string, ceph::bufferlist>> values(cfg.owners);
@@ -291,7 +281,7 @@ void VerifyLabels(
         "read label batch");
   }
   for (const auto& ref : active_refs) {
-    const uint32_t owner = LabelOwnerFor(ref.external_label, cfg);
+    const uint32_t owner = placement.ResolveLabelShard(ref.external_label);
     const std::string key = ghnsw::LabelKey(ref.external_label);
     auto it = values[owner].find(key);
     uint64_t actual_id = 0;
@@ -312,6 +302,7 @@ void VerifyLabels(
 
 void VerifyBatch(
     const Config& cfg,
+    const ghnsw::PlacementResolver& placement,
     const GlobalMeta& meta,
     uint32_t owner,
     uint64_t chunk,
@@ -353,7 +344,8 @@ void VerifyBatch(
     if (ref.global_id != id) {
       AddError(report, cfg, "VectorRef key/id mismatch for node " + std::to_string(id));
     }
-    if (OwnerFor(id, cfg) != owner || ChunkFor(id, cfg) != chunk) {
+    const auto location = placement.Resolve(id);
+    if (location.shard_id != owner || location.chunk_id != chunk) {
       AddError(report, cfg, "node routed to unexpected object: " + std::to_string(id));
     }
     const uint64_t element_bytes =
@@ -423,17 +415,18 @@ void VerifyBatch(
           AddError(report, cfg, "out-of-range edge " + std::to_string(id) + " -> " +
               std::to_string(neighbor));
         }
-        if (OwnerFor(neighbor, cfg) != owner) {
+        if (placement.Resolve(neighbor).shard_id != owner) {
           report->cross_owner_edges++;
         }
       }
     }
   }
-  VerifyLabels(cfg, owner_ioctxs, active_refs, report);
+  VerifyLabels(cfg, placement, owner_ioctxs, active_refs, report);
 }
 
 void VerifyLabelTargets(
     const Config& cfg,
+    const ghnsw::PlacementResolver& placement,
     std::vector<librados::IoCtx>* owner_ioctxs,
     const std::vector<uint8_t>& node_states,
     Report* report) {
@@ -467,7 +460,7 @@ void VerifyLabelTargets(
           AddError(report, cfg, "invalid label key: " + key);
           continue;
         }
-        if (LabelOwnerFor(label, cfg) != owner) {
+        if (placement.ResolveLabelShard(label) != owner) {
           AddError(report, cfg, "label stored in wrong owner: " + key);
         }
         uint64_t target = 0;
@@ -713,6 +706,7 @@ int Run(const Config& cfg) {
   }
 
   const GlobalMeta meta = ReadGlobalMeta(meta_ioctx, cfg);
+  const ghnsw::PlacementResolver placement(cfg.owners, cfg.points_per_object);
   Report report;
   report.nodes_expected = meta.next_global_id;
   std::vector<uint8_t> node_states(meta.next_global_id, 0);
@@ -745,6 +739,7 @@ int Run(const Config& cfg) {
         }
         VerifyBatch(
             cfg,
+            placement,
             meta,
             owner,
             chunk,
@@ -763,7 +758,7 @@ int Run(const Config& cfg) {
     }
   }
 
-  VerifyLabelTargets(cfg, &owner_ioctxs, node_states, &report);
+  VerifyLabelTargets(cfg, placement, &owner_ioctxs, node_states, &report);
   VerifySemanticLocality(cfg, meta, &semantic_samples, &report);
 
   if (report.nodes_checked != meta.cur_element_count) {

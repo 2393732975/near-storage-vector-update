@@ -15,6 +15,7 @@
 #include <omp.h>
 
 #include "include/ceph_assert.h"
+#include "nsvu/placement.hpp"
 #include "nsvu/protocol.hpp"
 #include <hnswlib/hnswlib.h>
 
@@ -108,18 +109,6 @@ void Ensure(int ret, const std::string& what) {
   if (ret < 0) {
     throw std::runtime_error(what + " failed: " + std::to_string(ret));
   }
-}
-
-uint32_t OwnerFor(uint64_t global_id, const Config& cfg) {
-  return static_cast<uint32_t>(global_id % cfg.owners);
-}
-
-uint32_t LabelOwnerFor(uint64_t external_label, const Config& cfg) {
-  return static_cast<uint32_t>(external_label % cfg.owners);
-}
-
-uint64_t ChunkFor(uint64_t global_id, const Config& cfg) {
-  return (global_id / cfg.owners) / cfg.points_per_object;
 }
 
 std::vector<std::string> OwnerPools(const Config& cfg) {
@@ -352,6 +341,7 @@ Config ParseArgs(int argc, const char** argv) {
 int main(int argc, const char** argv) {
   try {
     Config cfg = ParseArgs(argc, argv);
+    const ghnsw::PlacementResolver placement(cfg.owners, cfg.points_per_object);
     Metrics metrics;
     omp_set_num_threads(std::max(1u, cfg.threads));
 
@@ -457,8 +447,9 @@ int main(int argc, const char** argv) {
       FlushOmapBatch(owner_ioctxs[owner], ghnsw::OwnerMetaOid(), &owner_label_batches[owner]);
     };
     for (uint64_t i = 0; i < cfg.num_vectors; ++i) {
-      const uint32_t owner = OwnerFor(i, cfg);
-      const uint64_t chunk = ChunkFor(i, cfg);
+      const auto location = placement.Resolve(i);
+      const uint32_t owner = location.shard_id;
+      const uint64_t chunk = location.chunk_id;
       if (owner_current_chunk[owner] != chunk) {
         if (owner_current_chunk[owner] != UINT64_MAX) {
           FlushPayloadBatch(
@@ -488,7 +479,7 @@ int main(int argc, const char** argv) {
       owner_payload_batches[owner].append(raw_vectors[i]);
       owner_chunk_bytes[owner] += raw_vectors[i].size();
       owner_data_meta_batches[owner].emplace(ghnsw::VecKey(i), EncodeMsg(ref));
-      const uint32_t label_owner = LabelOwnerFor(i, cfg);
+      const uint32_t label_owner = placement.ResolveLabelShard(i);
       owner_label_batches[label_owner].emplace(ghnsw::LabelKey(i), EncodeU64(i));
       if (owner_data_meta_batches[owner].size() >= static_cast<size_t>(cfg.omap_batch)) {
         flush_owner_data_meta(owner);
@@ -527,8 +518,9 @@ int main(int argc, const char** argv) {
     std::vector<std::map<std::string, librados::bufferlist>> owner_adj_batches(cfg.owners);
     std::vector<uint64_t> owner_adj_chunk(cfg.owners, UINT64_MAX);
     for (uint64_t i = 0; i < cfg.num_vectors; ++i) {
-      const uint32_t owner = OwnerFor(i, cfg);
-      const uint64_t chunk = ChunkFor(i, cfg);
+      const auto location = placement.Resolve(i);
+      const uint32_t owner = location.shard_id;
+      const uint64_t chunk = location.chunk_id;
       if (owner_adj_chunk[owner] != chunk) {
         if (owner_adj_chunk[owner] != UINT64_MAX) {
           FlushOmapBatch(

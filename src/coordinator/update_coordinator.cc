@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "nsvu/placement.hpp"
 #include "nsvu/protocol.hpp"
 
 namespace {
@@ -504,18 +505,6 @@ std::vector<std::string> owner_pools(const Config& cfg) {
   return pools;
 }
 
-uint32_t owner_for(uint64_t global_id, const Config& cfg) {
-  return static_cast<uint32_t>(global_id % cfg.owners);
-}
-
-uint32_t label_owner_for(uint64_t external_label, const Config& cfg) {
-  return static_cast<uint32_t>(external_label % cfg.owners);
-}
-
-uint64_t chunk_for(uint64_t global_id, const Config& cfg) {
-  return (global_id / cfg.owners) / cfg.points_per_object;
-}
-
 struct Neighbor {
   uint64_t id = 0;
   float dist = 0.0f;
@@ -606,7 +595,12 @@ std::mutex& raw_object_mutex(int64_t pool_id, const std::string& oid) {
 
 class CephFacade {
  public:
-  explicit CephFacade(const Config& cfg) : cfg_(cfg) {}
+  explicit CephFacade(const Config& cfg)
+      : cfg_(cfg), placement_(cfg.owners, cfg.points_per_object) {}
+
+  ghnsw::PhysicalLocation Resolve(uint64_t global_id) const {
+    return placement_.Resolve(global_id);
+  }
 
   void Connect() {
     int r = cluster_.init2("client.admin", "client", 0);
@@ -743,8 +737,9 @@ class CephFacade {
     req.level = level;
     req.vector_bytes = vec;
     ceph::bufferlist in = encode_msg(req), out;
-    const uint32_t owner = owner_for(global_id, cfg_);
-    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const auto location = placement_.Resolve(global_id);
+    const uint32_t owner = location.shard_id;
+    const uint64_t chunk = location.chunk_id;
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
         "store_vector", in, &out, metrics);
@@ -769,7 +764,7 @@ class CephFacade {
     }
     std::map<uint32_t, std::vector<std::pair<uint64_t, uint64_t>>> groups;
     for (const auto& entry : labels) {
-      groups[label_owner_for(entry.first, cfg_)].push_back(entry);
+      groups[placement_.ResolveLabelShard(entry.first)].push_back(entry);
     }
     for (const auto& [owner, owner_labels] : groups) {
       LabelUpdateBatchRequest req;
@@ -798,7 +793,7 @@ class CephFacade {
           replacement_global_id,
           metrics);
     }
-    const uint32_t owner = label_owner_for(external_label, cfg_);
+    const uint32_t owner = placement_.ResolveLabelShard(external_label);
     CasLabelRequest req;
     req.external_label = external_label;
     req.expected_global_id = expected_global_id;
@@ -838,7 +833,7 @@ class CephFacade {
     std::unordered_map<uint64_t, uint64_t> result;
     std::map<uint32_t, std::vector<uint64_t>> groups;
     for (uint64_t label : labels) {
-      groups[label_owner_for(label, cfg_)].push_back(label);
+      groups[placement_.ResolveLabelShard(label)].push_back(label);
     }
     for (const auto& [owner, owner_labels] : groups) {
       LabelBatchRequest req;
@@ -1031,12 +1026,13 @@ class CephFacade {
     MarkNodeStaleRequest req;
     req.global_id = global_id;
     ceph::bufferlist in = encode_msg(req), out;
-    const uint32_t owner = owner_for(global_id, cfg_);
-    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const auto location = placement_.Resolve(global_id);
+    const uint32_t owner = location.shard_id;
+    const uint64_t chunk = location.chunk_id;
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
         "mark_node_stale", in, &out, metrics);
-    RecordDataTarget(metrics, owner_for(global_id, cfg_), chunk_for(global_id, cfg_));
+    RecordDataTarget(metrics, owner, chunk);
     if (r < 0) {
       throw CephOperationError("mark_node_stale", r);
     }
@@ -1449,8 +1445,9 @@ class CephFacade {
       Metrics* metrics,
       bool update_label) {
     const double t0 = now_sec();
-    const uint32_t owner = owner_for(global_id, cfg_);
-    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const auto location = placement_.Resolve(global_id);
+    const uint32_t owner = location.shard_id;
+    const uint64_t chunk = location.chunk_id;
     const std::string oid = ghnsw::OwnerDataOid(chunk);
     const std::string key = ghnsw::VecKey(global_id);
     {
@@ -1562,7 +1559,7 @@ class CephFacade {
       Metrics* metrics) {
     std::map<uint32_t, std::map<std::string, ceph::bufferlist>> groups;
     for (const auto& [label, global_id] : labels) {
-      groups[label_owner_for(label, cfg_)].emplace(
+      groups[placement_.ResolveLabelShard(label)].emplace(
           ghnsw::LabelKey(label), encode_scalar(global_id));
     }
     for (const auto& [owner, values] : groups) {
@@ -1584,7 +1581,7 @@ class CephFacade {
       uint64_t expected_global_id,
       uint64_t replacement_global_id,
       Metrics* metrics) {
-    const uint32_t owner = label_owner_for(external_label, cfg_);
+    const uint32_t owner = placement_.ResolveLabelShard(external_label);
     const std::string oid = ghnsw::OwnerMetaOid();
     const std::string key = ghnsw::LabelKey(external_label);
     std::lock_guard<std::mutex> lock(
@@ -1634,7 +1631,7 @@ class CephFacade {
     std::unordered_map<uint64_t, uint64_t> result;
     std::map<uint32_t, std::vector<uint64_t>> groups;
     for (uint64_t label : labels) {
-      groups[label_owner_for(label, cfg_)].push_back(label);
+      groups[placement_.ResolveLabelShard(label)].push_back(label);
     }
     for (const auto& [owner, owner_labels] : groups) {
       std::set<std::string> keys;
@@ -1851,8 +1848,9 @@ class CephFacade {
 
   void RawMarkStale(uint64_t global_id, Metrics* metrics) {
     const double t0 = now_sec();
-    const uint32_t owner = owner_for(global_id, cfg_);
-    const uint64_t chunk = chunk_for(global_id, cfg_);
+    const auto location = placement_.Resolve(global_id);
+    const uint32_t owner = location.shard_id;
+    const uint64_t chunk = location.chunk_id;
     const std::string oid = ghnsw::OwnerDataOid(chunk);
     const std::string key = ghnsw::VecKey(global_id);
     std::lock_guard<std::mutex> lock(
@@ -2087,7 +2085,8 @@ class CephFacade {
       const std::vector<uint64_t>& ids) {
     std::map<std::pair<uint32_t, uint64_t>, std::vector<uint64_t>> groups;
     for (uint64_t id : ids) {
-      groups[{owner_for(id, cfg_), chunk_for(id, cfg_)}].push_back(id);
+      const auto location = placement_.Resolve(id);
+      groups[{location.shard_id, location.chunk_id}].push_back(id);
     }
     return groups;
   }
@@ -2096,7 +2095,8 @@ class CephFacade {
       const std::vector<AdjacencyBlob>& entries) {
     std::map<std::pair<uint32_t, uint64_t>, std::vector<AdjacencyBlob>> groups;
     for (const auto& entry : entries) {
-      groups[{owner_for(entry.global_id, cfg_), chunk_for(entry.global_id, cfg_)}].push_back(entry);
+      const auto location = placement_.Resolve(entry.global_id);
+      groups[{location.shard_id, location.chunk_id}].push_back(entry);
     }
     return groups;
   }
@@ -2150,6 +2150,7 @@ class CephFacade {
   }
 
   Config cfg_;
+  ghnsw::PlacementResolver placement_;
   librados::Rados cluster_;
   librados::IoCtx meta_ioctx_;
   std::vector<librados::IoCtx> owner_ioctxs_;
@@ -2875,7 +2876,8 @@ class Coordinator {
 	      auto& level_neighbors = new_adj.neighbors[l];
 	      for (const auto& nbr : selected) {
 	        level_neighbors.push_back(nbr.id);
-	        if (owner_for(global_id, cfg_) != owner_for(nbr.id, cfg_)) {
+	        if (ctx.ceph.Resolve(global_id).shard_id !=
+	            ctx.ceph.Resolve(nbr.id).shard_id) {
 	          ctx.metrics.cross_owner_neighbor_links++;
 	        }
 	      }
@@ -3153,7 +3155,7 @@ class Coordinator {
       auto& level_neighbors = new_adj.neighbors[l];
       for (const auto& nbr : selected) {
         level_neighbors.push_back(nbr.id);
-        if (owner_for(global_id, cfg_) != owner_for(nbr.id, cfg_)) {
+        if (ceph_.Resolve(global_id).shard_id != ceph_.Resolve(nbr.id).shard_id) {
           metrics_.cross_owner_neighbor_links++;
         }
       }
