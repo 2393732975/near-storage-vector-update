@@ -151,6 +151,10 @@ struct Metrics {
   uint64_t unique_distance_objects_sum = 0;
   uint64_t max_unique_distance_objects = 0;
   std::map<uint64_t, uint64_t> distance_batch_size_histogram;
+  uint64_t frontier_windows = 0;
+  uint64_t frontier_nodes_selected = 0;
+  uint64_t distance_candidates_before_dedupe = 0;
+  uint64_t distance_candidates_after_dedupe = 0;
   uint64_t update_attempts_observed = 0;
   uint64_t unique_data_objects_sum = 0;
   uint64_t unique_data_pgs_sum = 0;
@@ -476,6 +480,12 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   for (const auto& [batch_size, count] : src.distance_batch_size_histogram) {
     dst->distance_batch_size_histogram[batch_size] += count;
   }
+  dst->frontier_windows += src.frontier_windows;
+  dst->frontier_nodes_selected += src.frontier_nodes_selected;
+  dst->distance_candidates_before_dedupe +=
+      src.distance_candidates_before_dedupe;
+  dst->distance_candidates_after_dedupe +=
+      src.distance_candidates_after_dedupe;
   dst->update_attempts_observed += src.update_attempts_observed;
   dst->unique_data_objects_sum += src.unique_data_objects_sum;
   dst->unique_data_pgs_sum += src.unique_data_pgs_sum;
@@ -2853,10 +2863,14 @@ class Coordinator {
       if (cand.dist > top.top().dist) {
         break;
       }
+      ctx.metrics.frontier_windows++;
+      ctx.metrics.frontier_nodes_selected++;
       auto adj = GetAdj(ctx, cand.id);
       if (level >= adj.neighbors.size()) {
         continue;
       }
+      ctx.metrics.distance_candidates_before_dedupe +=
+          adj.neighbors[level].size();
       std::vector<uint64_t> to_score;
       for (uint64_t nbr : adj.neighbors[level]) {
         if (visited.insert(nbr).second) {
@@ -2866,6 +2880,7 @@ class Coordinator {
       if (to_score.empty()) {
         continue;
       }
+      ctx.metrics.distance_candidates_after_dedupe += to_score.size();
       auto dists = DistanceToMany(ctx, query, to_score);
       for (uint64_t nbr : to_score) {
         auto it = dists.find(nbr);
@@ -3132,10 +3147,13 @@ class Coordinator {
       if (cand.dist > top.top().dist) {
         break;
       }
+      metrics_.frontier_windows++;
+      metrics_.frontier_nodes_selected++;
       auto adj = GetAdj(cand.id);
       if (level >= adj.neighbors.size()) {
         continue;
       }
+      metrics_.distance_candidates_before_dedupe += adj.neighbors[level].size();
       std::vector<uint64_t> to_score;
       for (uint64_t nbr : adj.neighbors[level]) {
         if (visited.insert(nbr).second) {
@@ -3145,6 +3163,7 @@ class Coordinator {
       if (to_score.empty()) {
         continue;
       }
+      metrics_.distance_candidates_after_dedupe += to_score.size();
       auto dists = DistanceToMany(query, to_score);
       for (uint64_t nbr : to_score) {
         auto it = dists.find(nbr);
@@ -3519,6 +3538,23 @@ class Coordinator {
         << (metrics_.unique_distance_objects_sum > 0
                 ? static_cast<double>(metrics_.remote_candidates_scored) /
                       static_cast<double>(metrics_.unique_distance_objects_sum)
+                : 0.0)
+        << ",\n";
+    out << "    \"frontier_windows\": " << metrics_.frontier_windows << ",\n";
+    out << "    \"frontier_window_fill\": "
+        << (metrics_.frontier_windows > 0
+                ? static_cast<double>(metrics_.frontier_nodes_selected) /
+                      static_cast<double>(metrics_.frontier_windows)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_candidates_before_dedupe\": "
+        << metrics_.distance_candidates_before_dedupe << ",\n";
+    out << "    \"distance_candidates_after_dedupe\": "
+        << metrics_.distance_candidates_after_dedupe << ",\n";
+    out << "    \"distance_candidate_dedupe_retention_ratio\": "
+        << (metrics_.distance_candidates_before_dedupe > 0
+                ? static_cast<double>(metrics_.distance_candidates_after_dedupe) /
+                      static_cast<double>(metrics_.distance_candidates_before_dedupe)
                 : 0.0)
         << ",\n";
     out << "    \"avg_unique_data_objects_per_update_attempt\": "
