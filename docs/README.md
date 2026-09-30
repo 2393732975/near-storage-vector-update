@@ -10,7 +10,7 @@
 - [阶段 0 正确性与观测基线](correctness-observability-baseline.md)：更新协议、离线检查器和正式验收流程。
 - [阶段耗时与数据移动打点](stage-profiling.md)：compute/OSD 路径、指标边界、统计口径和运行入口。
 - [阶段 0 集群验收报告](reports/phase0-validation-report-2026-09-22.md)：当前零失败、通过一致性检查的正式结果。
-- [阶段 1 Compute/OSD 严格 A/B 报告](reports/phase1-strict-ab-report-2026-09-25.md)：修复 ID 映射后的三次独立重复、质量门禁和瓶颈结论。
+- [阶段 1 Strict Raw-RADOS/OSD A/B 报告](reports/phase1-strict-raw-vs-osd-report-2026-09-30.md)：纯原生 RADOS compute 与 OSD/CLS 的三次独立重复、阶段耗时和瓶颈结论。
 - [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)：PPT 背景数据移动实验的零失败复现结果。
 
 ## 参考材料
@@ -24,6 +24,7 @@
 
 - [早期 PPT 基线复现](archive/ppt-baseline-reproduction-2026-09-18.md)
 - [早期 compute/OSD 对比](archive/compute-vs-osd-comparison-2026-09-22.md)
+- [历史混合路径阶段 1 报告](archive/phase1-mixed-path-report-2026-09-25.md)
 
 新增报告应放入 `reports/` 并在本索引登记；被新结果替代但仍有追溯价值的文档移入
 `archive/`，不要把临时运行说明或本机路径拆成新的独立文档。
