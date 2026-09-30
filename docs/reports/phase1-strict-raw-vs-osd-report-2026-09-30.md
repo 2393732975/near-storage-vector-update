@@ -130,5 +130,9 @@ baseline 定义修正，不能解释为同一实现经过优化后的纵向加�
 - `roundtrip/queue` 包含网络、librados、OSD 排队与线程调度，不能单独归因为网络。
 - compute 原生 read-modify-write 锁只覆盖单 Coordinator 进程；本实验不验证多
   Coordinator 并发事务语义。
-- 正式结果由 `summary.md` 和 `summary.json` 自动汇总；报告提交后，实验池使用带
-  FSID 保护的白名单清理脚本删除，并单独记录最终集群状态。
+- 正式结果由 `summary.md` 和 `summary.json` 自动汇总。确认报告与结果工件落盘后，
+  已使用带 FSID 保护的白名单脚本删除 `nsvu_meta` 和 `nsvu_owner_0`–`4`；最终
+  只保留 `.mgr`、`rbd`，5/5 OSD `up/in`，33/33 PG `active+clean`。
+- 集群仍报告 5 个 OSD 的既有 BlueStore slow-op 计数和 `devicehealth` 模块磁盘 I/O
+  错误；未屏蔽告警，也未为清除计数而强制压缩或重启 OSD。BlueStore 物理空间由
+  后台异步回收。
