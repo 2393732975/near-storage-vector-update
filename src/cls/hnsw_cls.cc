@@ -21,6 +21,7 @@ using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
 using ghnsw::EdgePatchBatchRequest;
+using ghnsw::EmptyRequest;
 using ghnsw::FinalizeInsertRequest;
 using ghnsw::GetAdjBatchReply;
 using ghnsw::GetGlobalMetaReply;
@@ -31,8 +32,10 @@ using ghnsw::LabelBatchRequest;
 using ghnsw::LabelUpdateBatchRequest;
 using ghnsw::LookupLabelBatchReply;
 using ghnsw::MarkNodeStaleRequest;
+using ghnsw::Opcode;
 using ghnsw::ReserveInsertReply;
 using ghnsw::ReserveInsertRequest;
+using ghnsw::RequestEnvelope;
 using ghnsw::SetAdjacencyBatchRequest;
 using ghnsw::StatusReply;
 using ghnsw::StoreVectorReply;
@@ -51,20 +54,27 @@ constexpr const char* kMetaDim = "meta/dim";
 constexpr const char* kMetaVectorKind = "meta/vector_kind";
 constexpr const char* kMetaMetric = "meta/metric";
 
+thread_local RequestEnvelope current_request_envelope;
+
 template <typename T>
-int decode_msg(ceph::bufferlist* in, T* out) {
-  auto it = in->cbegin();
-  try {
-    out->decode(it);
-  } catch (ceph::buffer::error&) {
-    return -EINVAL;
+int decode_msg(
+    ceph::bufferlist* in,
+    Opcode expected_opcode,
+    T* out,
+    RequestEnvelope* envelope = nullptr) {
+  RequestEnvelope local_envelope;
+  RequestEnvelope* decoded_envelope = envelope ? envelope : &local_envelope;
+  const int result =
+      ghnsw::DecodeRequest(*in, expected_opcode, decoded_envelope, out);
+  if (result == 0) {
+    current_request_envelope = *decoded_envelope;
   }
-  return 0;
+  return result;
 }
 
 template <typename T>
 void encode_msg(const T& in, ceph::bufferlist* out) {
-  in.encode(*out);
+  *out = ghnsw::EncodeResponse(current_request_envelope, in);
 }
 
 double cls_now_sec() {
@@ -278,7 +288,7 @@ float compute_distance(
 
 int cls_store_vector(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   StoreVectorRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kStoreVector, &req);
   if (r < 0) {
     return r;
   }
@@ -345,7 +355,7 @@ int cls_store_vector(cls_method_context_t hctx, ceph::bufferlist* in, ceph::buff
 
 int cls_update_label_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   LabelUpdateBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kUpdateLabelBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -363,7 +373,7 @@ int cls_update_label_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph
 
 int cls_cas_label(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   CasLabelRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kCasLabel, &req);
   if (r < 0) {
     return r;
   }
@@ -411,7 +421,7 @@ int cls_cas_label(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferl
 
 int cls_get_node_vector_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   IdBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kGetNodeVectorBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -442,7 +452,7 @@ int cls_get_node_vector_batch(cls_method_context_t hctx, ceph::bufferlist* in, c
 
 int cls_lookup_label_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   LabelBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kLookupLabelBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -474,7 +484,7 @@ int cls_lookup_label_batch(cls_method_context_t hctx, ceph::bufferlist* in, ceph
 int cls_get_node_adjacency_batch(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   IdBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kGetNodeAdjacencyBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -509,7 +519,7 @@ int cls_distance_to_local_batch(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   const double cls_total_t0 = cls_now_sec();
   DistanceBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kDistanceToLocalBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -550,8 +560,14 @@ int cls_distance_to_local_batch(
   return 0;
 }
 
-int cls_timed_noop(cls_method_context_t, ceph::bufferlist*, ceph::bufferlist* out) {
+int cls_timed_noop(
+    cls_method_context_t, ceph::bufferlist* in, ceph::bufferlist* out) {
   const double t0 = cls_now_sec();
+  EmptyRequest req;
+  int r = decode_msg(in, Opcode::kTimedNoop, &req);
+  if (r < 0) {
+    return r;
+  }
   TimedNoopReply reply;
   reply.status = 0;
   reply.cls_total_seconds = cls_now_sec() - t0;
@@ -562,7 +578,7 @@ int cls_timed_noop(cls_method_context_t, ceph::bufferlist*, ceph::bufferlist* ou
 int set_adjacency_common(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   SetAdjacencyBatchRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kSetAdjacencyBatch, &req);
   if (r < 0) {
     return r;
   }
@@ -591,9 +607,10 @@ int set_adjacency_common(
 int cls_apply_edge_patch_batch(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   EdgePatchBatchRequest req;
-  int r = decode_msg(in, &req);
-  if (r < 0) {
-    return r;
+  RequestEnvelope envelope;
+  int r = decode_msg(in, Opcode::kApplyEdgePatchBatch, &req, &envelope);
+  if (r < 0 || envelope.update_id != req.update_id) {
+    return r < 0 ? r : -EINVAL;
   }
   if (req.max_neighbors == 0) {
     return -EINVAL;
@@ -676,7 +693,7 @@ int cls_apply_edge_patch_batch(
 
 int cls_mark_node_stale(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   MarkNodeStaleRequest req;
-  int r = decode_msg(in, &req);
+  int r = decode_msg(in, Opcode::kMarkNodeStale, &req);
   if (r < 0) {
     return r;
   }
@@ -698,9 +715,15 @@ int cls_mark_node_stale(cls_method_context_t hctx, ceph::bufferlist* in, ceph::b
   return r;
 }
 
-int cls_get_global_meta(cls_method_context_t hctx, ceph::bufferlist*, ceph::bufferlist* out) {
+int cls_get_global_meta(
+    cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  EmptyRequest req;
+  int r = decode_msg(in, Opcode::kGetGlobalMeta, &req);
+  if (r < 0) {
+    return r;
+  }
   GlobalMeta meta;
-  int r = read_global_meta(hctx, &meta);
+  r = read_global_meta(hctx, &meta);
   GetGlobalMetaReply reply;
   reply.status = r;
   reply.meta = meta;
@@ -711,8 +734,9 @@ int cls_get_global_meta(cls_method_context_t hctx, ceph::bufferlist*, ceph::buff
 int cls_reserve_insert_id(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   ReserveInsertRequest req;
-  int r = decode_msg(in, &req);
-  if (r < 0 || req.update_id == 0) {
+  RequestEnvelope envelope;
+  int r = decode_msg(in, Opcode::kReserveInsertId, &req, &envelope);
+  if (r < 0 || req.update_id == 0 || envelope.update_id != req.update_id) {
     return r < 0 ? r : -EINVAL;
   }
 
@@ -761,8 +785,9 @@ int cls_reserve_insert_id(
 int cls_finalize_insert(
     cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   FinalizeInsertRequest req;
-  int r = decode_msg(in, &req);
-  if (r < 0 || req.update_id == 0) {
+  RequestEnvelope envelope;
+  int r = decode_msg(in, Opcode::kFinalizeInsert, &req, &envelope);
+  if (r < 0 || req.update_id == 0 || envelope.update_id != req.update_id) {
     return r < 0 ? r : -EINVAL;
   }
 
@@ -811,9 +836,10 @@ int cls_finalize_insert(
 
 int cls_cas_global_meta(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   CasGlobalMetaRequest req;
-  int r = decode_msg(in, &req);
-  if (r < 0) {
-    return r;
+  RequestEnvelope envelope;
+  int r = decode_msg(in, Opcode::kCasGlobalMeta, &req, &envelope);
+  if (r < 0 || envelope.expected_version != req.expected_version) {
+    return r < 0 ? r : -EINVAL;
   }
   GlobalMeta current;
   r = read_global_meta(hctx, &current);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <cstdio>
 #include <stdint.h>
 
@@ -17,6 +18,134 @@ static constexpr uint32_t kVectorKindU8 = 1u;
 static constexpr uint32_t kVectorKindF32 = 2u;
 static constexpr uint32_t kMetricL2 = 1u;
 static constexpr uint32_t kMetricIP = 2u;
+static constexpr uint32_t kProtocolMagic = 0x4e535655u;  // "NSVU"
+static constexpr uint32_t kProtocolSchemaVersion = 1u;
+
+enum class Opcode : uint32_t {
+  kStoreVector = 1,
+  kUpdateLabelBatch = 2,
+  kCasLabel = 3,
+  kGetNodeVectorBatch = 4,
+  kLookupLabelBatch = 5,
+  kGetNodeAdjacencyBatch = 6,
+  kDistanceToLocalBatch = 7,
+  kTimedNoop = 8,
+  kSetAdjacencyBatch = 9,
+  kApplyEdgePatchBatch = 10,
+  kMarkNodeStale = 11,
+  kGetGlobalMeta = 12,
+  kReserveInsertId = 13,
+  kFinalizeInsert = 14,
+  kCasGlobalMeta = 15,
+};
+
+struct RequestEnvelope {
+  uint32_t magic = kProtocolMagic;
+  uint32_t schema_version = kProtocolSchemaVersion;
+  uint32_t opcode = 0;
+  uint64_t request_id = 0;
+  uint64_t update_id = 0;
+  uint64_t expected_version = 0;
+  uint64_t placement_epoch = 0;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(magic, bl);
+    ceph::encode(schema_version, bl);
+    ceph::encode(opcode, bl);
+    ceph::encode(request_id, bl);
+    ceph::encode(update_id, bl);
+    ceph::encode(expected_version, bl);
+    ceph::encode(placement_epoch, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(magic, it);
+    ceph::decode(schema_version, it);
+    ceph::decode(opcode, it);
+    ceph::decode(request_id, it);
+    ceph::decode(update_id, it);
+    ceph::decode(expected_version, it);
+    ceph::decode(placement_epoch, it);
+  }
+};
+
+struct EmptyRequest {
+  void encode(ceph::buffer::list&) const {}
+  void decode(ceph::buffer::list::const_iterator&) {}
+};
+
+inline int ValidateRequestEnvelope(
+    const RequestEnvelope& envelope, Opcode expected_opcode) {
+  if (envelope.magic != kProtocolMagic) {
+    return -EBADMSG;
+  }
+  if (envelope.schema_version != kProtocolSchemaVersion) {
+    return -EPROTONOSUPPORT;
+  }
+  if (envelope.opcode != static_cast<uint32_t>(expected_opcode) ||
+      envelope.request_id == 0) {
+    return -EINVAL;
+  }
+  return 0;
+}
+
+template <typename T>
+ceph::bufferlist EncodeRequest(const RequestEnvelope& envelope, const T& payload) {
+  ceph::bufferlist encoded;
+  envelope.encode(encoded);
+  payload.encode(encoded);
+  return encoded;
+}
+
+template <typename T>
+int DecodeRequest(
+    const ceph::bufferlist& encoded,
+    Opcode expected_opcode,
+    RequestEnvelope* envelope,
+    T* payload) {
+  auto iterator = encoded.cbegin();
+  try {
+    envelope->decode(iterator);
+    const int validation = ValidateRequestEnvelope(*envelope, expected_opcode);
+    if (validation < 0) {
+      return validation;
+    }
+    payload->decode(iterator);
+  } catch (const ceph::buffer::error&) {
+    return -EINVAL;
+  }
+  return 0;
+}
+
+template <typename T>
+ceph::bufferlist EncodeResponse(
+    const RequestEnvelope& request_envelope, const T& payload) {
+  ceph::bufferlist encoded;
+  request_envelope.encode(encoded);
+  payload.encode(encoded);
+  return encoded;
+}
+
+template <typename T>
+int DecodeResponse(
+    const ceph::bufferlist& encoded,
+    Opcode expected_opcode,
+    RequestEnvelope* response_envelope,
+    T* payload) {
+  auto iterator = encoded.cbegin();
+  try {
+    response_envelope->decode(iterator);
+    const int validation =
+        ValidateRequestEnvelope(*response_envelope, expected_opcode);
+    if (validation < 0) {
+      return validation;
+    }
+    payload->decode(iterator);
+  } catch (const ceph::buffer::error&) {
+    return -EINVAL;
+  }
+  return 0;
+}
 
 struct VectorRef {
   uint64_t global_id = 0;

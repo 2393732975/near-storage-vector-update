@@ -130,6 +130,78 @@ void TestCasLabel() {
           "expect_missing did not round-trip");
 }
 
+void TestRequestEnvelope() {
+  ghnsw::IdBatchRequest request;
+  request.global_ids = {7, 11, 13};
+  ghnsw::RequestEnvelope envelope;
+  envelope.opcode = static_cast<uint32_t>(ghnsw::Opcode::kGetNodeVectorBatch);
+  envelope.request_id = 101;
+  envelope.update_id = 202;
+  envelope.expected_version = 303;
+  envelope.placement_epoch = 404;
+
+  const ceph::bufferlist encoded = ghnsw::EncodeRequest(envelope, request);
+  ghnsw::RequestEnvelope decoded_envelope;
+  ghnsw::IdBatchRequest decoded_request;
+  Require(
+      ghnsw::DecodeRequest(
+          encoded,
+          ghnsw::Opcode::kGetNodeVectorBatch,
+          &decoded_envelope,
+          &decoded_request) == 0,
+      "versioned request did not decode");
+  Require(decoded_envelope.request_id == 101, "request_id did not round-trip");
+  Require(decoded_envelope.update_id == 202, "update_id did not round-trip");
+  Require(
+      decoded_envelope.expected_version == 303,
+      "expected_version did not round-trip");
+  Require(
+      decoded_envelope.placement_epoch == 404,
+      "placement_epoch did not round-trip");
+  Require(decoded_request.global_ids == request.global_ids, "payload did not round-trip");
+
+  envelope.schema_version = ghnsw::kProtocolSchemaVersion + 1;
+  const ceph::bufferlist unknown_version = ghnsw::EncodeRequest(envelope, request);
+  Require(
+      ghnsw::DecodeRequest(
+          unknown_version,
+          ghnsw::Opcode::kGetNodeVectorBatch,
+          &decoded_envelope,
+          &decoded_request) == -EPROTONOSUPPORT,
+      "unknown schema version was not rejected");
+
+  envelope.schema_version = ghnsw::kProtocolSchemaVersion;
+  const ceph::bufferlist wrong_opcode = ghnsw::EncodeRequest(envelope, request);
+  Require(
+      ghnsw::DecodeRequest(
+          wrong_opcode,
+          ghnsw::Opcode::kLookupLabelBatch,
+          &decoded_envelope,
+          &decoded_request) == -EINVAL,
+      "unexpected opcode was not rejected");
+
+  ghnsw::StatusReply response;
+  response.status = 0;
+  response.count = 3;
+  envelope.opcode =
+      static_cast<uint32_t>(ghnsw::Opcode::kGetNodeVectorBatch);
+  const ceph::bufferlist encoded_response =
+      ghnsw::EncodeResponse(envelope, response);
+  ghnsw::RequestEnvelope response_envelope;
+  ghnsw::StatusReply decoded_response;
+  Require(
+      ghnsw::DecodeResponse(
+          encoded_response,
+          ghnsw::Opcode::kGetNodeVectorBatch,
+          &response_envelope,
+          &decoded_response) == 0,
+      "versioned response did not decode");
+  Require(
+      response_envelope.request_id == envelope.request_id,
+      "response did not echo request_id");
+  Require(decoded_response.count == 3, "response payload did not round-trip");
+}
+
 }  // namespace
 
 int main() {
@@ -138,6 +210,7 @@ int main() {
     TestInsertLifecycle();
     TestVectorRef();
     TestCasLabel();
+    TestRequestEnvelope();
     std::cout << "protocol round-trip tests passed\n";
     return 0;
   } catch (const std::exception& error) {

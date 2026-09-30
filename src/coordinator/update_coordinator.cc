@@ -41,6 +41,7 @@ using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
 using ghnsw::EdgePatchBatchRequest;
+using ghnsw::EmptyRequest;
 using ghnsw::FinalizeInsertRequest;
 using ghnsw::GetAdjBatchReply;
 using ghnsw::GetGlobalMetaReply;
@@ -51,8 +52,10 @@ using ghnsw::LabelBatchRequest;
 using ghnsw::LabelUpdateBatchRequest;
 using ghnsw::LookupLabelBatchReply;
 using ghnsw::MarkNodeStaleRequest;
+using ghnsw::Opcode;
 using ghnsw::ReserveInsertReply;
 using ghnsw::ReserveInsertRequest;
+using ghnsw::RequestEnvelope;
 using ghnsw::SetAdjacencyBatchRequest;
 using ghnsw::StatusReply;
 using ghnsw::StoreVectorRequest;
@@ -283,6 +286,10 @@ void record_update_failure(Metrics* metrics, const std::exception& error) {
     case -ENOENT:
       metrics->failed_update_not_found++;
       break;
+    case -EBADMSG:
+    case -EPROTONOSUPPORT:
+      metrics->failed_update_protocol++;
+      break;
     default:
       metrics->failed_update_other++;
       break;
@@ -300,10 +307,46 @@ void decode_or_die(const ceph::bufferlist& bl, T* out, const std::string& what) 
 }
 
 template <typename T>
+void decode_cls_reply_or_die(
+    const ceph::bufferlist& bl,
+    Opcode expected_opcode,
+    T* out,
+    const std::string& what) {
+  RequestEnvelope response_envelope;
+  const int result =
+      ghnsw::DecodeResponse(bl, expected_opcode, &response_envelope, out);
+  if (result < 0) {
+    throw ProtocolError(
+        "decode failed: " + what + " (" + std::to_string(result) + ")");
+  }
+}
+
+template <typename T>
 ceph::bufferlist encode_msg(const T& msg) {
   ceph::bufferlist bl;
   msg.encode(bl);
   return bl;
+}
+
+uint64_t next_protocol_request_id() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename T>
+ceph::bufferlist encode_cls_request(
+    Opcode opcode,
+    const T& payload,
+    uint64_t update_id = 0,
+    uint64_t expected_version = 0,
+    uint64_t placement_epoch = 0) {
+  RequestEnvelope envelope;
+  envelope.opcode = static_cast<uint32_t>(opcode);
+  envelope.request_id = next_protocol_request_id();
+  envelope.update_id = update_id;
+  envelope.expected_version = expected_version;
+  envelope.placement_epoch = placement_epoch;
+  return ghnsw::EncodeRequest(envelope, payload);
 }
 
 double now_sec() {
@@ -689,7 +732,8 @@ class CephFacade {
     }
     IdBatchRequest req;
     req.global_ids = ids;
-    ceph::bufferlist in = encode_msg(req), out;
+    ceph::bufferlist in =
+        encode_cls_request(Opcode::kGetNodeVectorBatch, req), out;
     const double t0 = now_sec();
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
@@ -704,7 +748,8 @@ class CephFacade {
       throw CephOperationError("get_node_vector_batch", r);
     }
     GetVectorBatchReply reply;
-    decode_or_die(out, &reply, "GetVectorBatchReply");
+    decode_cls_reply_or_die(
+        out, Opcode::kGetNodeVectorBatch, &reply, "GetVectorBatchReply");
     uint64_t bytes = 0;
     for (auto& kv : reply.values) {
       bytes += kv.second.size();
@@ -721,7 +766,8 @@ class CephFacade {
       const std::string& vec,
       uint32_t level,
       Metrics* metrics,
-      bool update_label = true) {
+      bool update_label = true,
+      uint64_t update_id = 0) {
     if (cfg_.distance_mode == "compute") {
       RawStoreVector(
           global_id, external_label, vec, level, metrics, update_label);
@@ -736,10 +782,11 @@ class CephFacade {
     req.flags = ghnsw::kVectorFlagActive;
     req.level = level;
     req.vector_bytes = vec;
-    ceph::bufferlist in = encode_msg(req), out;
     const auto location = placement_.Resolve(global_id);
     const uint32_t owner = location.shard_id;
     const uint64_t chunk = location.chunk_id;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kStoreVector, req, update_id, 0, location.placement_epoch), out;
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
         "store_vector", in, &out, metrics);
@@ -748,7 +795,7 @@ class CephFacade {
       throw CephOperationError("store_vector", r);
     }
     if (update_label) {
-      UpdateLabels({{external_label, global_id}}, metrics);
+      UpdateLabels({{external_label, global_id}}, metrics, update_id);
     }
     if (metrics) {
       metrics->store_vector_seconds += now_sec() - t0;
@@ -757,7 +804,8 @@ class CephFacade {
 
   void UpdateLabels(
       const std::vector<std::pair<uint64_t, uint64_t>>& labels,
-      Metrics* metrics = nullptr) {
+      Metrics* metrics = nullptr,
+      uint64_t update_id = 0) {
     if (cfg_.distance_mode == "compute") {
       RawUpdateLabels(labels, metrics);
       return;
@@ -769,7 +817,8 @@ class CephFacade {
     for (const auto& [owner, owner_labels] : groups) {
       LabelUpdateBatchRequest req;
       req.entries = owner_labels;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in =
+          encode_cls_request(Opcode::kUpdateLabelBatch, req, update_id), out;
       int r = Exec(
           owner_ioctxs_[owner], ghnsw::OwnerMetaOid(),
           "update_label_batch", in, &out, metrics);
@@ -784,7 +833,8 @@ class CephFacade {
       bool expect_missing,
       uint64_t expected_global_id,
       uint64_t replacement_global_id,
-      Metrics* metrics) {
+      Metrics* metrics,
+      uint64_t update_id = 0) {
     if (cfg_.distance_mode == "compute") {
       return RawCasLabel(
           external_label,
@@ -799,7 +849,8 @@ class CephFacade {
     req.expected_global_id = expected_global_id;
     req.replacement_global_id = replacement_global_id;
     req.expect_missing = expect_missing;
-    ceph::bufferlist in = encode_msg(req), out;
+    ceph::bufferlist in =
+        encode_cls_request(Opcode::kCasLabel, req, update_id), out;
     if (metrics) {
       metrics->label_cas_calls++;
     }
@@ -838,7 +889,8 @@ class CephFacade {
     for (const auto& [owner, owner_labels] : groups) {
       LabelBatchRequest req;
       req.external_labels = owner_labels;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in =
+          encode_cls_request(Opcode::kLookupLabelBatch, req), out;
       int r = Exec(
           owner_ioctxs_[owner], ghnsw::OwnerMetaOid(),
           "lookup_label_batch", in, &out, metrics);
@@ -846,7 +898,8 @@ class CephFacade {
         throw CephOperationError("lookup_label_batch", r);
       }
       LookupLabelBatchReply reply;
-      decode_or_die(out, &reply, "LookupLabelBatchReply");
+      decode_cls_reply_or_die(
+          out, Opcode::kLookupLabelBatch, &reply, "LookupLabelBatchReply");
       for (const auto& kv : reply.values) {
         result.emplace(kv.first, kv.second);
       }
@@ -863,7 +916,8 @@ class CephFacade {
     for (const auto& [owner_chunk, owner_ids] : groups) {
       IdBatchRequest req;
       req.global_ids = owner_ids;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in =
+          encode_cls_request(Opcode::kGetNodeAdjacencyBatch, req), out;
       metrics->remote_adj_calls++;
       metrics->remote_adj_nodes += owner_ids.size();
       int r = Exec(
@@ -874,7 +928,8 @@ class CephFacade {
         throw CephOperationError("get_node_adjacency_batch", r);
       }
       GetAdjBatchReply reply;
-      decode_or_die(out, &reply, "GetAdjBatchReply");
+      decode_cls_reply_or_die(
+          out, Opcode::kGetNodeAdjacencyBatch, &reply, "GetAdjBatchReply");
       for (auto& kv : reply.values) {
         result.emplace(kv.first, std::move(kv.second));
       }
@@ -924,7 +979,12 @@ class CephFacade {
       req.vector_kind = cfg_.vector_kind;
       req.metric = cfg_.metric;
       req.global_ids = owner_ids;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in = encode_cls_request(
+          Opcode::kDistanceToLocalBatch,
+          req,
+          0,
+          0,
+          placement_.placement_epoch()), out;
       metrics->remote_distance_calls++;
       metrics->remote_candidates_scored += owner_ids.size();
       metrics->distance_batches++;
@@ -954,7 +1014,8 @@ class CephFacade {
         throw CephOperationError("distance_to_local_batch", r);
       }
       DistanceBatchReply reply;
-      decode_or_die(out, &reply, "DistanceBatchReply");
+      decode_cls_reply_or_die(
+          out, Opcode::kDistanceToLocalBatch, &reply, "DistanceBatchReply");
       metrics->distance_cls_total_seconds += reply.cls_total_seconds;
       metrics->distance_vector_ref_seconds += reply.vector_ref_seconds;
       metrics->distance_payload_read_seconds += reply.payload_read_seconds;
@@ -966,7 +1027,10 @@ class CephFacade {
     return result;
   }
 
-  void SetAdjacency(const std::vector<AdjacencyBlob>& entries, Metrics* metrics = nullptr) {
+  void SetAdjacency(
+      const std::vector<AdjacencyBlob>& entries,
+      Metrics* metrics = nullptr,
+      uint64_t update_id = 0) {
     if (cfg_.distance_mode == "compute") {
       RawSetAdjacency(entries, metrics);
       return;
@@ -976,7 +1040,12 @@ class CephFacade {
     for (const auto& [owner_chunk, owner_entries] : groups) {
       SetAdjacencyBatchRequest req;
       req.entries = owner_entries;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in = encode_cls_request(
+          Opcode::kSetAdjacencyBatch,
+          req,
+          update_id,
+          0,
+          placement_.placement_epoch()), out;
       int r = Exec(
           owner_ioctxs_[owner_chunk.first], ghnsw::OwnerDataOid(owner_chunk.second),
           "set_adjacency_batch", in, &out, metrics);
@@ -1002,7 +1071,12 @@ class CephFacade {
       req.update_id = update_id;
       req.max_neighbors = cfg_.M;
       req.entries = owner_entries;
-      ceph::bufferlist in = encode_msg(req), out;
+      ceph::bufferlist in = encode_cls_request(
+          Opcode::kApplyEdgePatchBatch,
+          req,
+          update_id,
+          0,
+          placement_.placement_epoch()), out;
       metrics->remote_patch_calls++;
       metrics->total_patched_nodes += owner_entries.size();
       const double t0 = now_sec();
@@ -1017,7 +1091,7 @@ class CephFacade {
     }
   }
 
-  void MarkStale(uint64_t global_id, Metrics* metrics) {
+  void MarkStale(uint64_t global_id, Metrics* metrics, uint64_t update_id = 0) {
     if (cfg_.distance_mode == "compute") {
       RawMarkStale(global_id, metrics);
       return;
@@ -1025,10 +1099,11 @@ class CephFacade {
     const double t0 = now_sec();
     MarkNodeStaleRequest req;
     req.global_id = global_id;
-    ceph::bufferlist in = encode_msg(req), out;
     const auto location = placement_.Resolve(global_id);
     const uint32_t owner = location.shard_id;
     const uint64_t chunk = location.chunk_id;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kMarkNodeStale, req, update_id, 0, location.placement_epoch), out;
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
         "mark_node_stale", in, &out, metrics);
@@ -1052,13 +1127,15 @@ class CephFacade {
     }
     const double t0 = now_sec();
     ceph::bufferlist out;
-    ceph::bufferlist empty;
-    int r = Exec(meta_ioctx_, cfg_.meta_oid, "get_global_meta", empty, &out, metrics);
+    ceph::bufferlist in =
+        encode_cls_request(Opcode::kGetGlobalMeta, EmptyRequest{});
+    int r = Exec(meta_ioctx_, cfg_.meta_oid, "get_global_meta", in, &out, metrics);
     if (r < 0) {
       throw CephOperationError("get_global_meta", r);
     }
     GetGlobalMetaReply reply;
-    decode_or_die(out, &reply, "GetGlobalMetaReply");
+    decode_cls_reply_or_die(
+        out, Opcode::kGetGlobalMeta, &reply, "GetGlobalMetaReply");
     if (metrics) {
       metrics->meta_read_seconds += now_sec() - t0;
     }
@@ -1071,7 +1148,12 @@ class CephFacade {
     }
     ReserveInsertRequest req;
     req.update_id = update_id;
-    ceph::bufferlist in = encode_msg(req), out;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kReserveInsertId,
+        req,
+        update_id,
+        0,
+        placement_.placement_epoch()), out;
     const double t0 = now_sec();
     if (metrics) {
       metrics->global_meta_cas_calls++;
@@ -1121,7 +1203,12 @@ class CephFacade {
     req.update_id = update_id;
     req.global_id = global_id;
     req.level = level;
-    ceph::bufferlist in = encode_msg(req), out;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kFinalizeInsert,
+        req,
+        update_id,
+        0,
+        placement_.placement_epoch()), out;
     const double t0 = now_sec();
     if (metrics) {
       metrics->global_meta_cas_calls++;
@@ -1142,7 +1229,12 @@ class CephFacade {
     CasGlobalMetaRequest req;
     req.expected_version = expected_version;
     req.meta = meta;
-    ceph::bufferlist in = encode_msg(req), out;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kCasGlobalMeta,
+        req,
+        0,
+        expected_version,
+        placement_.placement_epoch()), out;
     const double t0 = now_sec();
     if (metrics) {
       metrics->global_meta_cas_calls++;
@@ -2120,7 +2212,13 @@ class CephFacade {
   }
 
   TimedNoopSample TimedNoop(uint32_t owner, uint64_t chunk, Metrics* metrics) {
-    ceph::bufferlist in, out;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kTimedNoop,
+        EmptyRequest{},
+        0,
+        0,
+        placement_.placement_epoch());
+    ceph::bufferlist out;
     const double t0 = now_sec();
     int r = Exec(
         owner_ioctxs_[owner], ghnsw::OwnerDataOid(chunk),
@@ -2131,7 +2229,7 @@ class CephFacade {
       throw CephOperationError("timed_noop", r);
     }
     TimedNoopReply reply;
-    decode_or_die(out, &reply, "TimedNoopReply");
+    decode_cls_reply_or_die(out, Opcode::kTimedNoop, &reply, "TimedNoopReply");
     TimedNoopSample sample;
     sample.roundtrip_seconds = roundtrip_seconds;
     sample.cls_total_seconds = reply.cls_total_seconds;
@@ -2541,14 +2639,14 @@ class Coordinator {
                   ground_truth_.empty() ? nullptr : &recall_candidates);
               if (!ctx.ceph.CasLabel(
                       label, it == labels.end(), it == labels.end() ? 0 : it->second,
-                      new_id, &ctx.metrics)) {
+                      new_id, &ctx.metrics, update_id)) {
                 ctx.metrics.label_cas_conflicts++;
-                ctx.ceph.MarkStale(new_id, &ctx.metrics);
+                ctx.ceph.MarkStale(new_id, &ctx.metrics, update_id);
                 ctx.metrics.stale_marks++;
                 throw CephOperationError("label CAS", -EAGAIN);
               }
               if (it != labels.end()) {
-                ctx.ceph.MarkStale(it->second, &ctx.metrics);
+                ctx.ceph.MarkStale(it->second, &ctx.metrics, update_id);
                 ctx.metrics.stale_marks++;
               }
               if (!ground_truth_.empty()) {
@@ -2828,7 +2926,8 @@ class Coordinator {
     GlobalMeta meta = reserved.search_meta;
     const uint64_t global_id = reserved.global_id;
     const uint32_t level = SampleLevel(ctx.rng, cfg_.M);
-    ctx.ceph.StoreVector(global_id, external_label, vector, level, &ctx.metrics, false);
+    ctx.ceph.StoreVector(
+        global_id, external_label, vector, level, &ctx.metrics, false, update_id);
 
     AdjacencyBlob new_adj;
     new_adj.global_id = global_id;
@@ -2836,7 +2935,7 @@ class Coordinator {
     new_adj.neighbors.resize(level + 1);
 
     if (meta.cur_element_count == 0 || meta.enterpoint == UINT64_MAX) {
-      ctx.ceph.SetAdjacency({new_adj}, &ctx.metrics);
+      ctx.ceph.SetAdjacency({new_adj}, &ctx.metrics, update_id);
       FinalizeInsertMeta(ctx, update_id, global_id, level);
       return global_id;
     }
@@ -2895,7 +2994,7 @@ class Coordinator {
 	      }
 	    }
 
-	    ctx.ceph.SetAdjacency({new_adj}, &ctx.metrics);
+	    ctx.ceph.SetAdjacency({new_adj}, &ctx.metrics, update_id);
 	    ctx.pending_patches.clear();
 	    const double patch_t0 = now_sec();
 	    for (const auto& [target, levels] : patch_targets) {
@@ -3107,7 +3206,8 @@ class Coordinator {
     GlobalMeta meta = ceph_.GetMeta(&metrics_);
     const uint64_t global_id = meta.next_global_id;
     const uint32_t level = SampleLevel(rng_, cfg_.M);
-    ceph_.StoreVector(global_id, external_label, vector, level, &metrics_, false);
+    ceph_.StoreVector(
+        global_id, external_label, vector, level, &metrics_, false, update_id);
 
     AdjacencyBlob new_adj;
     new_adj.global_id = global_id;
@@ -3115,7 +3215,7 @@ class Coordinator {
     new_adj.neighbors.resize(level + 1);
 
     if (meta.cur_element_count == 0) {
-      ceph_.SetAdjacency({new_adj}, &metrics_);
+      ceph_.SetAdjacency({new_adj}, &metrics_, update_id);
       meta.enterpoint = global_id;
       meta.max_level = level;
       meta.cur_element_count = 1;
@@ -3125,7 +3225,7 @@ class Coordinator {
         throw CephOperationError("meta CAS on first insert", -EAGAIN);
       }
       if (update_label) {
-        ceph_.UpdateLabels({{external_label, global_id}}, &metrics_);
+        ceph_.UpdateLabels({{external_label, global_id}}, &metrics_, update_id);
       }
       return global_id;
     }
@@ -3172,7 +3272,7 @@ class Coordinator {
       }
     }
 
-    ceph_.SetAdjacency({new_adj}, &metrics_);
+    ceph_.SetAdjacency({new_adj}, &metrics_, update_id);
     if (!pending_patches_.empty()) {
       ceph_.ApplyPatches(pending_patches_, update_id, &metrics_);
     }
@@ -3188,7 +3288,7 @@ class Coordinator {
       throw CephOperationError("meta CAS", -EAGAIN);
     }
     if (update_label) {
-      ceph_.UpdateLabels({{external_label, global_id}}, &metrics_);
+      ceph_.UpdateLabels({{external_label, global_id}}, &metrics_, update_id);
     }
     return global_id;
   }
@@ -3371,6 +3471,8 @@ class Coordinator {
     }
     out << "},\n";
     out << "  \"observability\": {\n";
+    out << "    \"protocol_schema_version\": "
+        << ghnsw::kProtocolSchemaVersion << ",\n";
     out << "    \"update_attempts\": " << metrics_.update_attempts_observed << ",\n";
     out << "    \"total_cls_exec_calls\": " << metrics_.total_cls_exec_calls << ",\n";
     out << "    \"total_raw_rados_calls\": "
