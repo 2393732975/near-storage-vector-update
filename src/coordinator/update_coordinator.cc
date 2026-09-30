@@ -138,6 +138,9 @@ struct Metrics {
   uint64_t logical_distance_query_bytes = 0;
   uint64_t distance_batches = 0;
   uint64_t max_candidates_per_distance_batch = 0;
+  uint64_t unique_distance_objects_sum = 0;
+  uint64_t max_unique_distance_objects = 0;
+  std::map<uint64_t, uint64_t> distance_batch_size_histogram;
   uint64_t update_attempts_observed = 0;
   uint64_t unique_data_objects_sum = 0;
   uint64_t unique_data_pgs_sum = 0;
@@ -155,6 +158,7 @@ struct Metrics {
   std::set<std::string> current_data_objects;
   std::set<std::string> current_data_pgs;
   std::set<uint32_t> current_owner_shards;
+  std::set<std::string> current_distance_objects;
   uint64_t time_limit_seconds = 0;
   uint32_t update_parallelism = 1;
   bool stopped_by_time_limit = false;
@@ -221,12 +225,14 @@ void begin_update_observation(Metrics* metrics) {
   metrics->current_data_objects.clear();
   metrics->current_data_pgs.clear();
   metrics->current_owner_shards.clear();
+  metrics->current_distance_objects.clear();
 }
 
 void finish_update_observation(Metrics* metrics) {
   const uint64_t objects = metrics->current_data_objects.size();
   const uint64_t pgs = metrics->current_data_pgs.size();
   const uint64_t owners = metrics->current_owner_shards.size();
+  const uint64_t distance_objects = metrics->current_distance_objects.size();
   metrics->update_attempts_observed++;
   metrics->unique_data_objects_sum += objects;
   metrics->unique_data_pgs_sum += pgs;
@@ -234,9 +240,13 @@ void finish_update_observation(Metrics* metrics) {
   metrics->max_unique_data_objects = std::max(metrics->max_unique_data_objects, objects);
   metrics->max_unique_data_pgs = std::max(metrics->max_unique_data_pgs, pgs);
   metrics->max_unique_owner_shards = std::max(metrics->max_unique_owner_shards, owners);
+  metrics->unique_distance_objects_sum += distance_objects;
+  metrics->max_unique_distance_objects =
+      std::max(metrics->max_unique_distance_objects, distance_objects);
   metrics->current_data_objects.clear();
   metrics->current_data_pgs.clear();
   metrics->current_owner_shards.clear();
+  metrics->current_distance_objects.clear();
 }
 
 void record_update_failure(Metrics* metrics, const std::exception& error) {
@@ -409,6 +419,12 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->distance_batches += src.distance_batches;
   dst->max_candidates_per_distance_batch = std::max(
       dst->max_candidates_per_distance_batch, src.max_candidates_per_distance_batch);
+  dst->unique_distance_objects_sum += src.unique_distance_objects_sum;
+  dst->max_unique_distance_objects = std::max(
+      dst->max_unique_distance_objects, src.max_unique_distance_objects);
+  for (const auto& [batch_size, count] : src.distance_batch_size_histogram) {
+    dst->distance_batch_size_histogram[batch_size] += count;
+  }
   dst->update_attempts_observed += src.update_attempts_observed;
   dst->unique_data_objects_sum += src.unique_data_objects_sum;
   dst->unique_data_pgs_sum += src.unique_data_pgs_sum;
@@ -869,6 +885,8 @@ class CephFacade {
           metrics->distance_batches++;
           metrics->max_candidates_per_distance_batch = std::max<uint64_t>(
               metrics->max_candidates_per_distance_batch, owner_ids.size());
+          RecordDistanceBatch(
+              metrics, owner_chunk.first, owner_chunk.second, owner_ids.size());
         }
         const double batch_t0 = now_sec();
         std::unordered_map<uint64_t, std::string> vectors;
@@ -904,6 +922,8 @@ class CephFacade {
       metrics->logical_distance_query_bytes += query_vec.size();
       metrics->max_candidates_per_distance_batch = std::max<uint64_t>(
           metrics->max_candidates_per_distance_batch, owner_ids.size());
+      RecordDistanceBatch(
+          metrics, owner_chunk.first, owner_chunk.second, owner_ids.size());
       if (cfg_.distance_split_probe && metrics &&
           ShouldSampleNoop(owner_chunk.first, owner_chunk.second)) {
         const TimedNoopSample noop_sample =
@@ -2017,6 +2037,17 @@ class CephFacade {
       metrics->current_data_pgs.insert(
           std::to_string(owner_ioctxs_[owner].get_id()) + ":" + std::to_string(pg));
     }
+  }
+
+  void RecordDistanceBatch(
+      Metrics* metrics, uint32_t owner, uint64_t chunk, uint64_t candidates) {
+    if (!metrics) {
+      return;
+    }
+    metrics->current_distance_objects.insert(
+        std::to_string(owner_ioctxs_[owner].get_id()) + ":" +
+        ghnsw::OwnerDataOid(chunk));
+    metrics->distance_batch_size_histogram[candidates]++;
   }
 
   void RecordExec(
@@ -3326,6 +3357,26 @@ class Coordinator {
         << ",\n";
     out << "    \"max_candidates_per_distance_batch\": "
         << metrics_.max_candidates_per_distance_batch << ",\n";
+    out << "    \"distance_batch_size_histogram\": {";
+    bool first_distance_batch_size = true;
+    for (const auto& [batch_size, count] : metrics_.distance_batch_size_histogram) {
+      if (!first_distance_batch_size) {
+        out << ", ";
+      }
+      first_distance_batch_size = false;
+      out << "\"" << batch_size << "\": " << count;
+    }
+    out << "},\n";
+    out << "    \"avg_unique_distance_objects_per_update_attempt\": "
+        << per_attempt(metrics_.unique_distance_objects_sum) << ",\n";
+    out << "    \"max_unique_distance_objects_per_update_attempt\": "
+        << metrics_.max_unique_distance_objects << ",\n";
+    out << "    \"candidates_per_unique_distance_object\": "
+        << (metrics_.unique_distance_objects_sum > 0
+                ? static_cast<double>(metrics_.remote_candidates_scored) /
+                      static_cast<double>(metrics_.unique_distance_objects_sum)
+                : 0.0)
+        << ",\n";
     out << "    \"avg_unique_data_objects_per_update_attempt\": "
         << per_attempt(metrics_.unique_data_objects_sum) << ",\n";
     out << "    \"max_unique_data_objects_per_update_attempt\": "
