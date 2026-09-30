@@ -20,6 +20,7 @@ semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
 osd_op_timeout_seconds=${OSD_OP_TIMEOUT_SECONDS:-45}
 osd_op_retry_limit=${OSD_OP_RETRY_LIMIT:-3}
 recall_k=${RECALL_K:-10}
+paired_recall_max_regression=${PAIRED_RECALL_MAX_REGRESSION:-0.005}
 read -r -a datasets <<< "${DATASETS:-gist1m text2image10m deep100m sift100m}"
 
 importer="$repo_root/build/nsvu-base-importer"
@@ -46,6 +47,13 @@ PY
 [[ "$osd_op_timeout_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "OSD_OP_TIMEOUT_SECONDS must be positive." >&2; exit 2; }
 [[ "$osd_op_retry_limit" =~ ^[0-9]+$ ]] || { echo "OSD_OP_RETRY_LIMIT must be non-negative." >&2; exit 2; }
 [[ "$recall_k" =~ ^[1-9][0-9]*$ ]] || { echo "RECALL_K must be positive." >&2; exit 2; }
+python3 - "$paired_recall_max_regression" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+if not 0.0 <= value <= 1.0:
+    raise SystemExit("PAIRED_RECALL_MAX_REGRESSION must be in [0, 1].")
+PY
 (( ${#datasets[@]} > 0 )) || { echo "DATASETS must not be empty." >&2; exit 2; }
 
 wait_for_clean_cluster() {
@@ -204,6 +212,7 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "osd_op_timeout_seconds=$osd_op_timeout_seconds"
   echo "osd_op_retry_limit=$osd_op_retry_limit"
   echo "recall_k=$recall_k"
+  echo "paired_recall_max_regression=$paired_recall_max_regression"
   echo "cache_condition=fresh-pool-after-import (not a controlled cold-cache run)"
   echo "datasets=${datasets[*]}"
   for dataset in "${datasets[@]}"; do
@@ -259,6 +268,12 @@ for repetition in $(seq 1 "$repetitions"); do
       validate_run "$mode" "$output/update.json" "$output/index-check.json"
       wait_for_clean_cluster
     done
+    paired_output="$run_root/rep-$repetition/paired-quality/$dataset.json"
+    python3 "$repo_root/scripts/compare-paired-recall.py" \
+      "$run_root/rep-$repetition/compute/$dataset/update.json" \
+      "$run_root/rep-$repetition/osd/$dataset/update.json" \
+      --max-regression "$paired_recall_max_regression" \
+      --output "$paired_output"
   done
 done
 

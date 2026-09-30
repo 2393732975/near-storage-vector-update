@@ -101,6 +101,12 @@ struct OperationMetrics {
   double roundtrip_seconds = 0.0;
 };
 
+struct RecallSample {
+  uint64_t update_sequence = 0;
+  uint64_t hits = 0;
+  uint64_t denominator = 0;
+};
+
 struct Metrics {
   std::string mode;
   uint64_t vectors_processed = 0;
@@ -152,6 +158,7 @@ struct Metrics {
   uint64_t recall_evaluated_updates = 0;
   uint64_t recall_hits = 0;
   uint64_t recall_denominator = 0;
+  std::map<uint64_t, RecallSample> recall_samples;
   std::map<std::string, OperationMetrics> operation_metrics;
   std::map<std::string, OperationMetrics> raw_operation_metrics;
   std::map<std::string, uint64_t> failure_operations;
@@ -439,6 +446,13 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->recall_evaluated_updates += src.recall_evaluated_updates;
   dst->recall_hits += src.recall_hits;
   dst->recall_denominator += src.recall_denominator;
+  for (const auto& [query_index, sample] : src.recall_samples) {
+    auto found = dst->recall_samples.find(query_index);
+    if (found == dst->recall_samples.end() ||
+        sample.update_sequence < found->second.update_sequence) {
+      dst->recall_samples[query_index] = sample;
+    }
+  }
   for (const auto& [operation, values] : src.operation_metrics) {
     auto& aggregate = dst->operation_metrics[operation];
     aggregate.calls += values.calls;
@@ -2538,7 +2552,11 @@ class Coordinator {
               }
               if (!ground_truth_.empty()) {
                 RecordRecall(
-                    &ctx.metrics, recall_candidates, ground_truth_.at(vec_idx));
+                    &ctx.metrics,
+                    vec_idx,
+                    i,
+                    recall_candidates,
+                    ground_truth_.at(vec_idx));
               }
             }
             finish_update_observation(&ctx.metrics);
@@ -2894,6 +2912,8 @@ class Coordinator {
 
   void RecordRecall(
       Metrics* metrics,
+      uint64_t query_index,
+      uint64_t update_sequence,
       const std::vector<uint64_t>& candidates,
       const std::vector<uint32_t>& ground_truth) const {
     const size_t denominator = std::min<size_t>(cfg_.recall_k, ground_truth.size());
@@ -2915,6 +2935,12 @@ class Coordinator {
     metrics->recall_evaluated_updates++;
     metrics->recall_hits += hits;
     metrics->recall_denominator += denominator;
+    auto found = metrics->recall_samples.find(query_index);
+    if (found == metrics->recall_samples.end() ||
+        update_sequence < found->second.update_sequence) {
+      metrics->recall_samples[query_index] = {
+          update_sequence, hits, static_cast<uint64_t>(denominator)};
+    }
   }
 
   float DistanceToOne(const std::string& query, uint64_t id) {
@@ -3283,6 +3309,20 @@ class Coordinator {
                       static_cast<double>(metrics_.recall_denominator)
                 : 0.0)
         << ",\n";
+    out << "    \"paired_query_samples\": [";
+    bool first_recall_sample = true;
+    for (const auto& [query_index, sample] : metrics_.recall_samples) {
+      out << (first_recall_sample ? "\n" : ",\n");
+      first_recall_sample = false;
+      out << "      {\"query_index\": " << query_index
+          << ", \"update_sequence\": " << sample.update_sequence
+          << ", \"hits\": " << sample.hits
+          << ", \"denominator\": " << sample.denominator << "}";
+    }
+    if (!first_recall_sample) {
+      out << "\n    ";
+    }
+    out << "],\n";
     out << "    \"semantics\": "
         << "\"level-0 precommit search against original-base ground truth\"\n";
     out << "  },\n";
