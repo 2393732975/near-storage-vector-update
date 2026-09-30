@@ -9,7 +9,7 @@ LDLIBS := -lrados /usr/lib/ceph/libceph-common.so.2 -pthread
 
 .PHONY: all check clean check-config
 
-all: check-config $(BUILD_DIR)/libcls_hnsw_global.so $(BUILD_DIR)/nsvu-update-coordinator $(BUILD_DIR)/nsvu-base-importer $(BUILD_DIR)/nsvu-index-checker
+all: check-config $(BUILD_DIR)/libcls_hnsw_global.so $(BUILD_DIR)/nsvu-update-coordinator $(BUILD_DIR)/nsvu-base-importer $(BUILD_DIR)/nsvu-index-checker $(BUILD_DIR)/nsvu-cls-replay-probe
 
 check-config:
 	@test -n "$(CEPH_SRC)" || (echo "Set CEPH_SRC to the Ceph src directory."; exit 2)
@@ -28,6 +28,9 @@ $(BUILD_DIR)/nsvu-base-importer: src/importer/base_index_importer.cc include/nsv
 	$(CXX) $(CPPFLAGS) -I$(HNSWLIB_INCLUDE) $(CXXFLAGS) -fopenmp $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 $(BUILD_DIR)/nsvu-index-checker: src/tools/index_checker.cc include/nsvu/protocol.hpp include/nsvu/placement.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+$(BUILD_DIR)/nsvu-cls-replay-probe: src/tools/cls_replay_probe.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 $(BUILD_DIR)/protocol-roundtrip-test: tests/protocol_roundtrip.cc include/nsvu/protocol.hpp | $(BUILD_DIR)
