@@ -12,6 +12,7 @@
 - [阶段 0 集群验收报告](reports/phase0-validation-report-2026-09-22.md)：当前零失败、通过一致性检查的正式结果。
 - [阶段 1 Strict Raw-RADOS/OSD A/B 报告](reports/phase1-strict-raw-vs-osd-report-2026-09-30.md)：纯原生 RADOS compute 与 OSD/CLS 的三次独立重复、阶段耗时和瓶颈结论。
 - [阶段 2 协议与路由抽象验收报告](reports/phase2-protocol-routing-validation-2026-09-30.md)：schema v1 滚动部署、GIST1M smoke、指标闭合与幂等重放验证。
+- [阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)：四数据集三轮 OSD-only 复测、与阶段 1 OSD 的性能对比及具体代码改动。
 - [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)：PPT 背景数据移动实验的零失败复现结果。
 
 ## 参考材料
