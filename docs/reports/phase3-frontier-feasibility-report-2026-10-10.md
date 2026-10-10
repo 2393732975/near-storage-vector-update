@@ -85,3 +85,11 @@ frontier。一个小窗口内的同对象复用不足，而扩大窗口会增加
    公平性；修改型跨 update 批处理仍须等待阶段 4 saga/恢复门禁。
 4. 若异步微批仍被每次 update 的对象扇出限制，推进阶段 7 的图感知有界布局，
    并重新测量跨 owner 边、迁移成本和 Recall。
+
+## 集群收尾
+
+报告和原始工件确认落盘后，已用 FSID 保护的白名单脚本删除 `nsvu_meta` 与
+`nsvu_owner_0`–`4`。最终仅保留 `.mgr`、`rbd`，5/5 OSD `up/in`，33/33 PG
+`active+clean`。集群仍报告 5 个 OSD 的既有 BlueStore slow-op 指示和
+`devicehealth` 模块磁盘 I/O 错误；未屏蔽告警，也未为清除历史计数而强制压缩或
+重启 OSD。BlueStore 物理空间由后台异步回收。
