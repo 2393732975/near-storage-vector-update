@@ -119,6 +119,16 @@ schema v1 envelope 为每次 CLS 请求增加固定字段，因此应用层 CLS 
 对应实现提交为 `93ee0c7`、`6552ede`、`ed5bf8d`、`e40e5f2`、`3d9f3a3`、
 `bdfffb8`；`2978d78` 只改变实验编排和汇总，不改变被测更新算法。
 
+## 集群收尾
+
+确认报告和原始工件落盘后，使用带 FSID 校验的固定白名单脚本删除了
+`nsvu_meta` 和 `nsvu_owner_0`–`4`。最终只保留 `.mgr`、`rbd`，5/5 OSD
+`up/in`，33/33 PG `active+clean`，没有残留实验进程或 `nsvu_*` 池。
+
+清理脚本返回码 3 仅表示集群仍报告 5 个 OSD 的 BlueStore slow-op 指示以及既有
+`devicehealth` 模块磁盘 I/O 错误，不是池删除失败。收尾过程未屏蔽告警、强制压缩
+或重启 OSD；BlueStore 物理空间由后台异步回收。
+
 ## 限制与后续
 
 - 实验池为单副本，只用于隔离研究路径，不能代表生产 Ceph 配置。
