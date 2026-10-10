@@ -14,6 +14,7 @@ run_root=${RUN_ROOT:-"$repo_root/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"}
 repetitions=${REPETITIONS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
 parallelism=${UPDATE_PARALLELISM:-4}
+frontier_window=${FRONTIER_WINDOW:-1}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
 semantic_samples=${SEMANTIC_SAMPLES:-256}
 semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
@@ -36,6 +37,7 @@ ceph_cli=(ceph --keyring "$CEPH_KEYRING")
 [[ "$repetitions" =~ ^[1-9][0-9]*$ ]] || { echo "REPETITIONS must be positive." >&2; exit 2; }
 [[ "$window_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATE_PARALLELISM must be positive." >&2; exit 2; }
+[[ "$frontier_window" =~ ^[1-9][0-9]*$ ]] || { echo "FRONTIER_WINDOW must be positive." >&2; exit 2; }
 [[ "$checker_batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "CHECKER_BATCH_SIZE must be positive." >&2; exit 2; }
 [[ "$semantic_samples" =~ ^[1-9][0-9]*$ ]] || { echo "SEMANTIC_SAMPLES must be positive." >&2; exit 2; }
 python3 - "$semantic_min_edge_win_rate" <<'PY'
@@ -223,6 +225,7 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "repetitions=$repetitions"
   echo "window_seconds=$window_seconds"
   echo "update_parallelism=$parallelism"
+  echo "frontier_window=$frontier_window"
   echo "checker_batch_size=$checker_batch_size"
   echo "semantic_samples=$semantic_samples"
   echo "semantic_min_edge_win_rate=$semantic_min_edge_win_rate"
@@ -270,7 +273,7 @@ for repetition in $(seq 1 "$repetitions"); do
         --num-updates "$updates" --update-offset 0 --target-start 0 \
         --points-per-object "$ppo" --distance-mode "$mode" --distance-split-probe \
         --distance-probe-interval-ms 1000 --time-limit-seconds "$window_seconds" \
-        --update-parallelism "$parallelism" \
+        --update-parallelism "$parallelism" --frontier-window "$frontier_window" \
         --osd-op-timeout-seconds "$osd_op_timeout_seconds" \
         --osd-op-retry-limit "$osd_op_retry_limit" \
         --metrics-out "$output/update.json" --progress-out "$output/update.progress.json"

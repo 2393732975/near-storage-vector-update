@@ -382,6 +382,7 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `DATASETS` | 四数据集 | 四数据集 | 四数据集 | 调试可选子集，正式实验全部运行 |
 | `WINDOW_SECONDS` | 300 | 300 | 300 | 正式对照保持一致 |
 | `UPDATE_PARALLELISM` | 1 | 4 | 4 | 本项目正式基线显式设为 4 |
+| `FRONTIER_WINDOW` | 1 | 1 | 1 | 阶段 3 扫描 4/8/16/32；1 保持逐 frontier 控制组 |
 | `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
 | `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
 | `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |

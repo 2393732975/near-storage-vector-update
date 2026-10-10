@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "nsvu/frontier.hpp"
 #include "nsvu/placement.hpp"
 #include "nsvu/protocol.hpp"
 
@@ -93,6 +94,7 @@ struct Config {
   double distance_probe_interval_seconds = 1.0;
   uint64_t time_limit_seconds = 0;
   uint32_t update_parallelism = 1;
+  uint32_t frontier_window = 1;
   uint32_t osd_op_timeout_seconds = 45;
   uint32_t osd_op_retry_limit = 3;
   uint32_t recall_k = 10;
@@ -153,6 +155,8 @@ struct Metrics {
   std::map<uint64_t, uint64_t> distance_batch_size_histogram;
   uint64_t frontier_windows = 0;
   uint64_t frontier_nodes_selected = 0;
+  uint64_t frontier_speculative_nodes = 0;
+  uint64_t max_frontier_window_fill = 0;
   uint64_t distance_candidates_before_dedupe = 0;
   uint64_t distance_candidates_after_dedupe = 0;
   uint64_t update_attempts_observed = 0;
@@ -482,6 +486,9 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   }
   dst->frontier_windows += src.frontier_windows;
   dst->frontier_nodes_selected += src.frontier_nodes_selected;
+  dst->frontier_speculative_nodes += src.frontier_speculative_nodes;
+  dst->max_frontier_window_fill = std::max(
+      dst->max_frontier_window_fill, src.max_frontier_window_fill);
   dst->distance_candidates_before_dedupe +=
       src.distance_candidates_before_dedupe;
   dst->distance_candidates_after_dedupe +=
@@ -2842,14 +2849,25 @@ class Coordinator {
   std::vector<Neighbor> SearchLayer(
       UpdateContext& ctx, const std::string& query, uint64_t entry, uint32_t level, uint32_t ef) {
     struct MinCmp {
-      bool operator()(const Neighbor& a, const Neighbor& b) const { return a.dist > b.dist; }
+      bool stable_ties = false;
+      bool operator()(const Neighbor& a, const Neighbor& b) const {
+        return a.dist != b.dist ? a.dist > b.dist
+                                : stable_ties && a.id > b.id;
+      }
     };
     struct MaxCmp {
-      bool operator()(const Neighbor& a, const Neighbor& b) const { return a.dist < b.dist; }
+      bool stable_ties = false;
+      bool operator()(const Neighbor& a, const Neighbor& b) const {
+        return a.dist != b.dist ? a.dist < b.dist
+                                : stable_ties && a.id < b.id;
+      }
     };
 
-    std::priority_queue<Neighbor, std::vector<Neighbor>, MinCmp> candidates;
-    std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top;
+    const bool stable_ties = cfg_.frontier_window > 1;
+    std::priority_queue<Neighbor, std::vector<Neighbor>, MinCmp> candidates(
+        MinCmp{stable_ties});
+    std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top(
+        MaxCmp{stable_ties});
     std::set<uint64_t> visited;
 
     float entry_dist = DistanceToOne(ctx, query, entry);
@@ -2858,23 +2876,36 @@ class Coordinator {
     visited.insert(entry);
 
     while (!candidates.empty()) {
-      Neighbor cand = candidates.top();
-      candidates.pop();
-      if (cand.dist > top.top().dist) {
+      const uint32_t window_limit = level == 0 ? cfg_.frontier_window : 1;
+      auto frontier = nsvu::SelectFrontierWindow(
+          &candidates, top.top().dist, window_limit);
+      if (frontier.empty()) {
         break;
       }
       ctx.metrics.frontier_windows++;
-      ctx.metrics.frontier_nodes_selected++;
-      auto adj = GetAdj(ctx, cand.id);
-      if (level >= adj.neighbors.size()) {
-        continue;
+      ctx.metrics.frontier_nodes_selected += frontier.size();
+      ctx.metrics.frontier_speculative_nodes += frontier.size() - 1;
+      ctx.metrics.max_frontier_window_fill = std::max<uint64_t>(
+          ctx.metrics.max_frontier_window_fill, frontier.size());
+
+      std::vector<uint64_t> frontier_ids;
+      frontier_ids.reserve(frontier.size());
+      for (const auto& cand : frontier) {
+        frontier_ids.push_back(cand.id);
       }
-      ctx.metrics.distance_candidates_before_dedupe +=
-          adj.neighbors[level].size();
+      auto adjacencies = ctx.ceph.GetAdjacency(frontier_ids, &ctx.metrics);
       std::vector<uint64_t> to_score;
-      for (uint64_t nbr : adj.neighbors[level]) {
-        if (visited.insert(nbr).second) {
-          to_score.push_back(nbr);
+      for (const auto& cand : frontier) {
+        auto found = adjacencies.find(cand.id);
+        if (found == adjacencies.end() || level >= found->second.neighbors.size()) {
+          continue;
+        }
+        const auto& neighbors = found->second.neighbors[level];
+        ctx.metrics.distance_candidates_before_dedupe += neighbors.size();
+        for (uint64_t nbr : neighbors) {
+          if (visited.insert(nbr).second) {
+            to_score.push_back(nbr);
+          }
         }
       }
       if (to_score.empty()) {
@@ -3126,14 +3157,25 @@ class Coordinator {
   std::vector<Neighbor> SearchLayer(
       const std::string& query, uint64_t entry, uint32_t level, uint32_t ef) {
     struct MinCmp {
-      bool operator()(const Neighbor& a, const Neighbor& b) const { return a.dist > b.dist; }
+      bool stable_ties = false;
+      bool operator()(const Neighbor& a, const Neighbor& b) const {
+        return a.dist != b.dist ? a.dist > b.dist
+                                : stable_ties && a.id > b.id;
+      }
     };
     struct MaxCmp {
-      bool operator()(const Neighbor& a, const Neighbor& b) const { return a.dist < b.dist; }
+      bool stable_ties = false;
+      bool operator()(const Neighbor& a, const Neighbor& b) const {
+        return a.dist != b.dist ? a.dist < b.dist
+                                : stable_ties && a.id < b.id;
+      }
     };
 
-    std::priority_queue<Neighbor, std::vector<Neighbor>, MinCmp> candidates;
-    std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top;
+    const bool stable_ties = cfg_.frontier_window > 1;
+    std::priority_queue<Neighbor, std::vector<Neighbor>, MinCmp> candidates(
+        MinCmp{stable_ties});
+    std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top(
+        MaxCmp{stable_ties});
     std::set<uint64_t> visited;
 
     float entry_dist = DistanceToOne(query, entry);
@@ -3142,22 +3184,36 @@ class Coordinator {
     visited.insert(entry);
 
     while (!candidates.empty()) {
-      Neighbor cand = candidates.top();
-      candidates.pop();
-      if (cand.dist > top.top().dist) {
+      const uint32_t window_limit = level == 0 ? cfg_.frontier_window : 1;
+      auto frontier = nsvu::SelectFrontierWindow(
+          &candidates, top.top().dist, window_limit);
+      if (frontier.empty()) {
         break;
       }
       metrics_.frontier_windows++;
-      metrics_.frontier_nodes_selected++;
-      auto adj = GetAdj(cand.id);
-      if (level >= adj.neighbors.size()) {
-        continue;
+      metrics_.frontier_nodes_selected += frontier.size();
+      metrics_.frontier_speculative_nodes += frontier.size() - 1;
+      metrics_.max_frontier_window_fill = std::max<uint64_t>(
+          metrics_.max_frontier_window_fill, frontier.size());
+
+      std::vector<uint64_t> frontier_ids;
+      frontier_ids.reserve(frontier.size());
+      for (const auto& cand : frontier) {
+        frontier_ids.push_back(cand.id);
       }
-      metrics_.distance_candidates_before_dedupe += adj.neighbors[level].size();
+      auto adjacencies = ceph_.GetAdjacency(frontier_ids, &metrics_);
       std::vector<uint64_t> to_score;
-      for (uint64_t nbr : adj.neighbors[level]) {
-        if (visited.insert(nbr).second) {
-          to_score.push_back(nbr);
+      for (const auto& cand : frontier) {
+        auto found = adjacencies.find(cand.id);
+        if (found == adjacencies.end() || level >= found->second.neighbors.size()) {
+          continue;
+        }
+        const auto& neighbors = found->second.neighbors[level];
+        metrics_.distance_candidates_before_dedupe += neighbors.size();
+        for (uint64_t nbr : neighbors) {
+          if (visited.insert(nbr).second) {
+            to_score.push_back(nbr);
+          }
         }
       }
       if (to_score.empty()) {
@@ -3409,6 +3465,7 @@ class Coordinator {
     out << "},\n";
     out << "  \"time_limit_seconds\": " << metrics_.time_limit_seconds << ",\n";
     out << "  \"update_parallelism\": " << metrics_.update_parallelism << ",\n";
+    out << "  \"frontier_window\": " << cfg_.frontier_window << ",\n";
     out << "  \"stopped_by_time_limit\": "
         << (metrics_.stopped_by_time_limit ? "true" : "false") << ",\n";
     out << "  \"throughput_updates_per_sec\": " << metrics_.throughput_updates_per_sec << ",\n";
@@ -3541,12 +3598,18 @@ class Coordinator {
                 : 0.0)
         << ",\n";
     out << "    \"frontier_windows\": " << metrics_.frontier_windows << ",\n";
+    out << "    \"frontier_nodes_selected\": "
+        << metrics_.frontier_nodes_selected << ",\n";
     out << "    \"frontier_window_fill\": "
         << (metrics_.frontier_windows > 0
                 ? static_cast<double>(metrics_.frontier_nodes_selected) /
                       static_cast<double>(metrics_.frontier_windows)
                 : 0.0)
         << ",\n";
+    out << "    \"frontier_speculative_nodes\": "
+        << metrics_.frontier_speculative_nodes << ",\n";
+    out << "    \"max_frontier_window_fill\": "
+        << metrics_.max_frontier_window_fill << ",\n";
     out << "    \"distance_candidates_before_dedupe\": "
         << metrics_.distance_candidates_before_dedupe << ",\n";
     out << "    \"distance_candidates_after_dedupe\": "
@@ -3723,6 +3786,7 @@ class Coordinator {
     out << "  \"target\": " << (cfg_.mode == "build" ? cfg_.num_vectors : cfg_.num_updates) << ",\n";
     out << "  \"time_limit_seconds\": " << cfg_.time_limit_seconds << ",\n";
     out << "  \"update_parallelism\": " << cfg_.update_parallelism << ",\n";
+    out << "  \"frontier_window\": " << cfg_.frontier_window << ",\n";
     out << "  \"distance_mode\": \"" << cfg_.distance_mode << "\",\n";
     out << "  \"distance_split_probe\": "
         << (cfg_.distance_split_probe ? "true" : "false") << ",\n";
@@ -3848,6 +3912,11 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.update_parallelism = static_cast<uint32_t>(std::stoul(next("--update-parallelism")));
       if (cfg.update_parallelism == 0) {
         throw std::runtime_error("--update-parallelism must be >= 1");
+      }
+    } else if (arg == "--frontier-window") {
+      cfg.frontier_window = static_cast<uint32_t>(std::stoul(next("--frontier-window")));
+      if (cfg.frontier_window == 0) {
+        throw std::runtime_error("--frontier-window must be >= 1");
       }
     } else if (arg == "--osd-op-timeout-seconds") {
       cfg.osd_op_timeout_seconds =
