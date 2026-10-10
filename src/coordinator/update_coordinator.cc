@@ -2846,6 +2846,12 @@ class Coordinator {
         level == 0 && cfg_.frontier_adaptive && window_limit > 1;
     if (adaptive && !candidates->empty()) {
       const float head_distance = candidates->top().dist;
+      // Preserve the HNSW termination rule before deriving a narrower
+      // lookahead bound. Otherwise headroom becomes zero and selecting up to
+      // head_distance would incorrectly expand a candidate beyond lower_bound.
+      if (!nsvu::FrontierHeadWithinSearchBound(head_distance, lower_bound)) {
+        return {};
+      }
       const double headroom = std::max(
           0.0, static_cast<double>(lower_bound) - head_distance);
       selection_bound = static_cast<float>(

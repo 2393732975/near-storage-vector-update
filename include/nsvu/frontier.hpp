@@ -49,6 +49,10 @@ struct AdaptiveFrontierDecision {
   bool budget_limited = false;
 };
 
+inline bool FrontierHeadWithinSearchBound(float head_distance, float lower_bound) {
+  return head_distance <= lower_bound;
+}
+
 inline AdaptiveFrontierDecision DecideAdaptiveFrontierPrefix(
     const std::vector<std::vector<FrontierCandidateRef>>& candidates_by_node,
     const std::set<uint64_t>& visited,

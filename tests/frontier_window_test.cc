@@ -128,6 +128,12 @@ void TestAdaptivePrefixDeduplicatesVisitedCandidates() {
   assert(decision.accepted_nodes == 2);
 }
 
+void TestAdaptiveFrontierPreservesSearchTermination() {
+  assert(nsvu::FrontierHeadWithinSearchBound(1.0F, 1.0F));
+  assert(nsvu::FrontierHeadWithinSearchBound(0.5F, 1.0F));
+  assert(!nsvu::FrontierHeadWithinSearchBound(1.01F, 1.0F));
+}
+
 }  // namespace
 
 int main() {
@@ -139,5 +145,6 @@ int main() {
   TestAdaptivePrefixRejectsNoObjectGain();
   TestAdaptivePrefixEnforcesCumulativeCandidateBudget();
   TestAdaptivePrefixDeduplicatesVisitedCandidates();
+  TestAdaptiveFrontierPreservesSearchTermination();
   return 0;
 }
