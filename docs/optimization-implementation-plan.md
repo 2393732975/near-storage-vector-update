@@ -4,7 +4,9 @@
 
 本方案依据开题答辩 PPT 第 14–18 页的三层设计，并以
 [2026-09-30 Strict Raw-RADOS/OSD A/B 报告](reports/phase1-strict-raw-vs-osd-report-2026-09-30.md)
-作为当前唯一性能基线；PPT 背景数据搬运结论由
+冻结 C0/B0 性能基线，以
+[阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)
+记录当前 M2 实现状态；PPT 背景数据搬运结论由
 [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)
 补充。旧的混合 compute/CLS 结果只用于历史追溯，不参与目标设定。
 
@@ -12,8 +14,11 @@
 
 - **C0（传统存算分离对照）**：全更新链路仅使用原生 librados，候选向量返回
   Coordinator 后算距，CLS 调用严格为 0。
-- **B0（近存储优化起点）**：当前 OSD/CLS 实现，候选向量留在 OSD 内算距；后续
-  B1–B5 的增益均相对 B0 计算，不能把 C0 当作“优化前 OSD”。
+- **B0（冻结的近存储优化起点）**：阶段 1 OSD/CLS 实现，候选向量留在 OSD 内
+  算距；它是长期纵向分母，不能把 C0 当作“优化前 OSD”。
+- **M2（当前执行起点）**：保持 B0 搜索与放置语义，但加入统一路由、schema v1、
+  幂等重放和聚合观测。B1 必须相对同提交的 M2 控制组计算直接收益，同时报告相对
+  冻结 B0 的长期变化，避免把基础重构波动记为搜索聚合收益。
 
 严格 A/B 共 24/24 轮、55,023 次成功更新，全部零失败并通过结构与语义检查：
 
@@ -42,15 +47,19 @@
   优先级；搜索控制在 Deep100M/SIFT100M 已达到 54/47 ms，也应防止随批窗口扩大。
 - B0 global meta 只有约 1.7–1.8 ms/update，且 24 轮无 CAS 重试。元数据改造首先
   服务于恢复和多 Coordinator 扩展，不作为近期平均延迟的主要收益来源。
+- M2 四数据集三轮正式复测表明平均延迟和吞吐相对 B0 的变化绝对值均小于 5%；
+  CLS calls/update 和 distance batches/update 基本不变。schema v1 固定信封使
+  CLS KiB/update 增加约 2.6%–44.1%，但没有改变 RTT/排队与 payload 读取主导的
+  瓶颈结构。
 - cross-owner edge ratio 为 74.9%–80.0%，并且 Deep100M/SIFT100M 分别触达约
   363/293 个对象；图感知有界布局是突破单次更新聚合上限的必要阶段，不再只是
   可选的末端优化。
 
 因此实施路线分为两条相互约束的主线：
 
-1. **性能主线**：B0 冻结 → 单次更新对象聚合 → 只读异步/跨更新微批 → 邻接写
-   聚合 → 拥塞控制 → 图感知有界布局。
-2. **正确性主线**：现有幂等基线 → 协议版本化 → intent/saga 与恢复器 →
+1. **性能主线**：B0 冻结 → M2 协议/路由基础（已完成）→ 单次更新对象聚合 →
+   只读异步/跨更新微批 → 邻接写聚合 → 拥塞控制 → 图感知有界布局。
+2. **正确性主线**：现有幂等基线 → schema v1（已完成）→ intent/saga 与恢复器 →
    多 Coordinator 元数据扩展。
 
 单次更新的只读聚合可以先行；跨 update 的修改型微批必须在恢复协议通过后启用。
@@ -137,9 +146,9 @@ compute 的验收条件为 `storage_access_mode=raw_rados`、
 每个数据集/模式有三次独立样本并报告 95% 置信区间。修复 ID 映射或新 chunk 创建
 语义之前的数据只能作为故障诊断样本。
 
-尚需作为 B1 前置补充的不是重跑 B0，而是增加**相同 query 前缀的配对质量检查**。
-固定时间窗下 C0/B0 处理数量不同，现有 -0.491 至 +0.681 pp 的 Recall 差值不能
-单独证明语义等价；B1 起必须额外在共同前缀上计算 paired Recall delta。
+阶段 2 已补齐**相同 query 前缀的配对质量检查**。固定时间窗下不同路径处理数量
+不同，非配对 Recall 差值仍不能单独证明语义等价；B1 起必须继续在共同前缀上计算
+paired Recall delta，不得只引用各自完整时间窗的静态 Recall。
 
 ## 5. 阶段 2：聚合前置的最小协议与路由抽象
 
@@ -157,10 +166,13 @@ struct PhysicalLocation {
 
 class PlacementResolver {
  public:
+  PlacementResolver(
+      uint32_t shard_count,
+      uint64_t points_per_object,
+      uint64_t placement_epoch = 0);
   PhysicalLocation Resolve(uint64_t global_id);
-  PhysicalLocation SelectForInsert(
-      const NeighborSet& neighbors,
-      const LoadSnapshot& load);
+  PhysicalLocation SelectForInsert(uint64_t global_id);
+  uint32_t ResolveLabelShard(uint64_t external_label);
 };
 ```
 
@@ -173,10 +185,11 @@ schema_version、opcode、request_id；写请求再携带 update_id、expected_v
 每对象批次大小直方图。现有 `avg_unique_data_objects_per_update_attempt` 混合了
 邻接、距离和写路径，不能直接作为距离批次的精确理论下限。
 
-退出条件：modulo 模式的对象映射逐 ID 等价；失败注入仍可幂等重放；新指标在
-GIST1M smoke 中可闭合；重构后 B0 延迟和吞吐变化不超过 5%。
+退出条件：modulo 模式的对象映射逐 ID 等价；失败注入仍可幂等重放；新指标可
+代数闭合；四数据集三次独立复测均零失败并通过一致性检查；重构后相对 B0 的平均
+延迟和吞吐变化均不劣于 5%。
 
-### 5.1 实施状态（2026-09-30）
+### 5.1 最终实施状态（2026-10-10）
 
 阶段 2 的代码改造已经完成：importer、Coordinator 和 checker 共用保持原 modulo
 语义的 `PlacementResolver`；CLS schema v1 的请求与响应统一携带 magic、opcode、
@@ -202,6 +215,21 @@ smoke 最初显示延迟 -2.16%、吞吐 +1.98%；随后完成的四数据集、
 固定字节开销未改变主要瓶颈。M2 状态更新为“完成”，下一步进入阶段 3 的有界
 frontier 聚合；完整证据见阶段 2 集群验收报告与阶段 2 OSD 全量回归报告。
 
+正式回归共 12/12 轮、29,992 次成功更新，所有轮次 `failed_updates=0`，12 次
+离线检查全部 `pass`、0 error、0 warning，图边语义胜率为 0.994480–1.000000：
+
+| 数据集 | B0 延迟 | M2 延迟 | 延迟变化 | B0/M2 吞吐 | 吞吐变化 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GIST1M | 345.387 ms | 350.664 ms | +1.53% | 11.601 / 11.427 | -1.50% |
+| Text2Image10M | 385.269 ms | 403.281 ms | +4.68% | 10.427 / 9.915 | -4.91% |
+| Deep100M | 506.332 ms | 523.354 ms | +3.36% | 7.894 / 7.667 | -2.88% |
+| SIFT100M | 515.311 ms | 504.720 ms | -2.06% | 7.788 / 7.975 | +2.40% |
+
+Deep100M 和 SIFT100M 第三轮存在 P99 长尾，运行期间同时出现 BlueStore slow-op
+指示；因此 M2 的退出结论限定为平均延迟/吞吐无系统性回退，不能宣称 P99 已改善。
+schema v1 的固定字段使低维数据集的相对字节增幅更明显；阶段 3 减少物理调用时
+必须同时验证 calls、query bytes 和 P99，不能只看平均延迟。
+
 ## 6. 阶段 3：最高优先级——单次更新的读路径聚合
 
 这是最新数据指向的首个性能改动。现有 `SearchLayer` 虽然调用
@@ -224,29 +252,30 @@ frontier 聚合；完整证据见阶段 2 集群验收报告与阶段 2 OSD 全�
 
 ### 6.2 对象扇出约束下的验收
 
-B0 的距离批次、候选和全部数据对象扇出如下。最后一列是用当前数据估算的单次
-update 完美对象合并上限；正式实现以阶段 2 新增的 distance-only fan-out 为准。
+M2 的距离批次、候选和 distance-only 对象扇出如下。最后一列是用正式三轮数据
+估算的单次 update 完美对象合并上限，也是阶段 3 的直接执行基线。
 
-| 数据集 | B0 distance batches/update | candidates/batch | data objects/update | 候选/对象上限 | 完美合并批次降幅 |
+| 数据集 | M2 distance batches/update | candidates/batch | distance objects/update | 候选/对象上限 | 完美合并批次降幅 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| GIST1M | 418 | 1.112 | 65 | 7.19 | 84.5% |
-| Text2Image10M | 505 | 1.030 | 155 | 3.36 | 69.3% |
-| Deep100M | 590 | 1.009 | 363 | 1.64 | 38.3% |
-| SIFT100M | 585 | 1.016 | 293 | 2.03 | 49.8% |
+| GIST1M | 418.49 | 1.114 | 64.64 | 7.21 | 84.6% |
+| Text2Image10M | 502.91 | 1.030 | 154.22 | 3.36 | 69.3% |
+| Deep100M | 587.69 | 1.009 | 361.25 | 1.64 | 38.5% |
+| SIFT100M | 582.59 | 1.017 | 291.34 | 2.03 | 50.0% |
 
 因此阶段 3 不再使用所有数据集统一 `<50 batches/update`、`>=8 candidates/batch`
 的不可达门槛。退出条件改为：
 
 - distance batches/update 不高于 `1.2 × unique_distance_objects/update`，并且相对
-  B0：GIST1M 降低至少 75%、Text2Image10M 至少 60%、Deep100M 至少 30%、
+  M2：GIST1M 降低至少 75%、Text2Image10M 至少 60%、Deep100M 至少 30%、
   SIFT100M 至少 40%；
 - candidates/batch 达到测得 `candidates/unique_distance_object` 理论上限的至少
-  70%，同时额外距离计算量不超过 B0 的 20%；
+  70%，同时额外距离计算量不超过 M2 的 20%；
 - query bytes/update 的降幅至少达到实际 distance-batch 降幅的 80%；按当前估算，
   四数据集的最低目标分别为 60%/48%/24%/32%。Deep100M 的当前对象扇出决定了
   阶段 3 不能设置统一 50% query-byte 降幅；
-- distance roundtrip/queue 降低至少 25%；B1 四数据集加权平均延迟相对 B0 降低
-  至少 10%，且任何数据集不回退超过 5%，P99 不回退超过 5%；
+- distance roundtrip/queue 降低至少 25%；B1 四数据集加权平均延迟相对同版本
+  M2 控制组降低至少 10%，且任何数据集不回退超过 5%，P99 不回退超过 5%；同时
+  保留相对冻结 B0 的长期对比；
 - 共同 query 前缀的 Recall@10 下降不超过 0.5 pp，零失败且一致性检查通过。
 
 ### 6.3 可选的同对象融合
@@ -310,7 +339,7 @@ intent/saga 退出条件满足后才能启用。异步化的目标是重叠独�
 返回码。不同对象仍是独立请求；发生局部冲突只重放对应项目。new adjacency、
 label CAS 和生命周期切换不为追求批量而破坏 saga 顺序。
 
-退出条件：全部 CLS calls/update 相对 B0 的 501–747 降低至少 60%；patch
+退出条件：全部 CLS calls/update 相对 M2 的 501–747 降低至少 60%；patch
 calls/update 从约 14–17 降至 5 以下，patch 阶段占完整更新低于 10%；只读异步使
 阶段 3 的独立对象等待得到重叠，但 P99 不回退；写批次零失败且故障恢复测试通过。
 
@@ -359,16 +388,18 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | 版本 | 路径角色 | 读路径聚合 | 恢复协议 | 异步/写微批 | 拥塞 | 布局 |
 | --- | --- | --- | --- | --- | --- | --- |
 | C0 | 传统 compute 对照 | 无 | 单进程 raw 幂等 | 无 | 无 | modulo |
-| B0 | 当前 OSD 基线 | 逐 frontier | 当前 CLS 幂等 | 无 | 无 | modulo |
-| B1 | OSD 优化 | 有界 frontier + 对象聚合 | 当前 CLS 幂等 | 无 | 无 | modulo |
+| B0 | 冻结 OSD 基线 | 逐 frontier | 旧 CLS 幂等 | 无 | 无 | modulo |
+| M2 | 当前执行控制组 | 逐 frontier | schema v1 + 幂等重放 | 无 | 无 | modulo |
+| B1 | OSD 优化 | 有界 frontier + 对象聚合 | schema v1 + 幂等重放 | 无 | 无 | modulo |
 | B2 | OSD 优化 | B1 | intent/saga | 无 | 无 | modulo |
 | B3 | OSD 优化 | B1 | intent/saga | RemoteExecutor | 无 | modulo |
 | B4 | OSD 优化 | B1 | intent/saga | RemoteExecutor | AIMD | modulo |
 | B5 | OSD 优化 | B1 | intent/saga | RemoteExecutor | AIMD | graph-aware |
 
-每个版本运行四数据集、并发度 1/4/8/16；B1–B5 与固定 B0 做同提交或兼容提交的
-交错对照，每个正式配置至少三次独立重导入。C0 在每个主要里程碑重跑，用来确认
-集群环境漂移，但不作为 B1–B5 的直接优化分母。主报告统一使用
+每个版本运行四数据集、并发度 1/4/8/16；B1–B5 与同提交的 M2 控制组做交错
+对照，每个正式配置至少三次独立重导入，并额外报告相对冻结 B0 的长期变化。C0
+在每个主要里程碑重跑，用来确认集群环境漂移，但不作为 B1–B5 的直接优化分母。
+主报告统一使用
 `fresh-pool-after-import`；在建立安全且可复现的缓存清理方法前，不宣称 cold-cache
 结果。PPT 中各层收益比例只作待验证假设，不能把元数据层 30%–50% 当作预测。
 
@@ -389,7 +420,7 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | --- | --- | --- |
 | M0 已完成 | 正确性检查、失败分类、幂等重放 | 最新 24/24 轮复验通过 |
 | M1 已完成 | C0/B0 严格 A/B、Recall、调用/字节/阶段指标 | 四数据集各三次独立重复 |
-| M2 协议与路由 | 最小 PlacementResolver、协议信封、distance-only fan-out | modulo 等价，开销 < 5% |
+| M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
 | M3 读聚合 | level-0 有界 frontier、按对象 batch distance | 达到分数据集扇出门槛 |
 | M4 恢复协议 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
 | M5 执行器 | 异步 RemoteExecutor、写微批 | calls/patch/P99 达标 |
@@ -399,23 +430,28 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 
 ## 13. Git 实施拆分
 
-每个提交只完成一个可验证的逻辑单元，建议顺序如下：
+每个提交只完成一个可验证的逻辑单元。阶段 2 已完成：
 
-1. `feat(metrics): track distance object fanout and batch efficiency`
-2. `test(quality): compare recall on a shared query prefix`
-3. `refactor(storage): introduce minimal placement resolver`
-4. `feat(protocol): version cls requests and responses`
-5. `feat(search): collect a bounded level-zero frontier window`
-6. `feat(search): coalesce adjacency and distance reads by object`
-7. `feat(cls): fuse same-object frontier expansion`
-8. `feat(metadata): persist recoverable update intents`
-9. `feat(recovery): replay incomplete vector updates`
-10. `feat(executor): submit per-object reads asynchronously`
-11. `feat(executor): microbatch independent query subrequests`
-12. `feat(cls): batch idempotent edge patches`
-13. `feat(scheduler): adapt per-target concurrency`
-14. `feat(layout): place nodes in bounded locality groups`
-15. `test(experiments): add c0-b5 ablation suite`
+1. `93ee0c7 feat(metrics): track distance object fanout`
+2. `6552ede test(quality): compare recall on a shared query prefix`
+3. `ed5bf8d refactor(storage): introduce minimal placement resolver`
+4. `e40e5f2 feat(protocol): version CLS requests and responses`
+5. `3d9f3a3 feat(metrics): expose frontier and dedupe efficiency`
+6. `bdfffb8 test(cls): add live idempotent replay probe`
+
+后续建议顺序如下：
+
+1. `feat(search): collect a bounded level-zero frontier window`
+2. `feat(search): coalesce adjacency and distance reads by object`
+3. `feat(cls): fuse same-object frontier expansion`
+4. `feat(metadata): persist recoverable update intents`
+5. `feat(recovery): replay incomplete vector updates`
+6. `feat(executor): submit per-object reads asynchronously`
+7. `feat(executor): microbatch independent query subrequests`
+8. `feat(cls): batch idempotent edge patches`
+9. `feat(scheduler): adapt per-target concurrency`
+10. `feat(layout): place nodes in bounded locality groups`
+11. `test(experiments): add c0-b5 ablation suite`
 
 每个阶段先运行单元测试、小数据集正确性、超时/崩溃注入，再运行四数据集正式实验。
 性能提交和正确性提交不混合，实验报告必须记录完整 commit、二进制哈希和原始结果
