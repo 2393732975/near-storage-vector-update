@@ -73,6 +73,61 @@ void TestZeroWidthIsRejected() {
   assert(queue.size() == 4);
 }
 
+void TestAdaptivePrefixAcceptsObjectReuseWithinBudget() {
+  using Ref = nsvu::FrontierCandidateRef;
+  const std::vector<std::vector<Ref>> candidates = {
+      {{1, 0, 0}, {2, 1, 0}},
+      {{3, 0, 0}, {4, 1, 0}},
+  };
+  const auto decision = nsvu::DecideAdaptiveFrontierPrefix(
+      candidates, {}, 10, 0, 0.20, 0.25);
+  assert(decision.accepted_nodes == 2);
+  assert(decision.first_candidates == 2);
+  assert(decision.incremental_candidates == 2);
+  assert(decision.sequential_batches == 4);
+  assert(decision.merged_batches == 2);
+  assert(decision.predicted_batches_saved == 2);
+}
+
+void TestAdaptivePrefixRejectsNoObjectGain() {
+  using Ref = nsvu::FrontierCandidateRef;
+  const std::vector<std::vector<Ref>> candidates = {
+      {{1, 0, 0}, {2, 1, 0}},
+      {{3, 2, 0}, {4, 3, 0}},
+  };
+  const auto decision = nsvu::DecideAdaptiveFrontierPrefix(
+      candidates, {}, 100, 0, 0.20, 0.25);
+  assert(decision.accepted_nodes == 1);
+  assert(!decision.saw_batch_gain);
+  assert(!decision.budget_limited);
+}
+
+void TestAdaptivePrefixEnforcesCumulativeCandidateBudget() {
+  using Ref = nsvu::FrontierCandidateRef;
+  const std::vector<std::vector<Ref>> candidates = {
+      {{1, 0, 0}, {2, 1, 0}},
+      {{3, 0, 0}, {4, 1, 0}},
+  };
+  const auto decision = nsvu::DecideAdaptiveFrontierPrefix(
+      candidates, {}, 0, 0, 0.20, 0.25);
+  assert(decision.accepted_nodes == 1);
+  assert(decision.saw_batch_gain);
+  assert(decision.budget_limited);
+}
+
+void TestAdaptivePrefixDeduplicatesVisitedCandidates() {
+  using Ref = nsvu::FrontierCandidateRef;
+  const std::vector<std::vector<Ref>> candidates = {
+      {{1, 0, 0}, {2, 1, 0}},
+      {{1, 0, 0}, {3, 1, 0}},
+  };
+  const auto decision = nsvu::DecideAdaptiveFrontierPrefix(
+      candidates, {1}, 10, 0, 0.20, 0.25);
+  assert(decision.first_candidates == 1);
+  assert(decision.incremental_candidates == 1);
+  assert(decision.accepted_nodes == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -80,5 +135,9 @@ int main() {
   TestWindowStopsAtSearchLowerBound();
   TestWindowHonorsConfiguredWidth();
   TestZeroWidthIsRejected();
+  TestAdaptivePrefixAcceptsObjectReuseWithinBudget();
+  TestAdaptivePrefixRejectsNoObjectGain();
+  TestAdaptivePrefixEnforcesCumulativeCandidateBudget();
+  TestAdaptivePrefixDeduplicatesVisitedCandidates();
   return 0;
 }

@@ -383,6 +383,10 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `WINDOW_SECONDS` | 300 | 300 | 300 | 正式对照保持一致 |
 | `UPDATE_PARALLELISM` | 1 | 4 | 4 | 本项目正式基线显式设为 4 |
 | `FRONTIER_WINDOW` | 1 | 1 | 1 | 阶段 3 扫描 4/8/16/32；1 保持逐 frontier 控制组 |
+| `FRONTIER_ADAPTIVE` | false | false | false | 阶段 3 配合 `FRONTIER_WINDOW>=2` 启用收益预算选择 |
+| `FRONTIER_SLACK_FRACTION` | 0.25 | 0.25 | 0.25 | 自适应 lookahead 距离范围，取值 `[0,1]` |
+| `FRONTIER_CANDIDATE_BUDGET` | 0.20 | 0.20 | 0.20 | 自适应额外候选累计预算 |
+| `FRONTIER_MIN_BATCH_SAVINGS_RATIO` | 0.25 | 0.25 | 0.25 | 接受扩窗所需的预计对象批次降幅 |
 | `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
 | `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
 | `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |

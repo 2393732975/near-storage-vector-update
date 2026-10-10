@@ -95,6 +95,10 @@ struct Config {
   uint64_t time_limit_seconds = 0;
   uint32_t update_parallelism = 1;
   uint32_t frontier_window = 1;
+  bool frontier_adaptive = false;
+  double frontier_slack_fraction = 0.25;
+  double frontier_candidate_budget = 0.20;
+  double frontier_min_batch_savings_ratio = 0.25;
   uint32_t osd_op_timeout_seconds = 45;
   uint32_t osd_op_retry_limit = 3;
   uint32_t recall_k = 10;
@@ -157,6 +161,14 @@ struct Metrics {
   uint64_t frontier_nodes_selected = 0;
   uint64_t frontier_speculative_nodes = 0;
   uint64_t max_frontier_window_fill = 0;
+  uint64_t frontier_lookahead_nodes = 0;
+  uint64_t frontier_adaptive_accepted_nodes = 0;
+  uint64_t frontier_rejected_nodes = 0;
+  uint64_t frontier_rejected_no_gain = 0;
+  uint64_t frontier_budget_rejections = 0;
+  uint64_t frontier_predicted_batches_saved = 0;
+  uint64_t frontier_base_candidates = 0;
+  uint64_t frontier_incremental_candidates = 0;
   uint64_t distance_candidates_before_dedupe = 0;
   uint64_t distance_candidates_after_dedupe = 0;
   uint64_t update_attempts_observed = 0;
@@ -489,6 +501,17 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
   dst->frontier_speculative_nodes += src.frontier_speculative_nodes;
   dst->max_frontier_window_fill = std::max(
       dst->max_frontier_window_fill, src.max_frontier_window_fill);
+  dst->frontier_lookahead_nodes += src.frontier_lookahead_nodes;
+  dst->frontier_adaptive_accepted_nodes +=
+      src.frontier_adaptive_accepted_nodes;
+  dst->frontier_rejected_nodes += src.frontier_rejected_nodes;
+  dst->frontier_rejected_no_gain += src.frontier_rejected_no_gain;
+  dst->frontier_budget_rejections += src.frontier_budget_rejections;
+  dst->frontier_predicted_batches_saved +=
+      src.frontier_predicted_batches_saved;
+  dst->frontier_base_candidates += src.frontier_base_candidates;
+  dst->frontier_incremental_candidates +=
+      src.frontier_incremental_candidates;
   dst->distance_candidates_before_dedupe +=
       src.distance_candidates_before_dedupe;
   dst->distance_candidates_after_dedupe +=
@@ -2806,6 +2829,108 @@ class Coordinator {
 	    return GetAdjNoLock(ctx, id);
 	  }
 
+  template <typename Queue>
+  std::vector<Neighbor> SelectSearchFrontier(
+      Queue* candidates,
+      float lower_bound,
+      uint32_t level,
+      CephFacade& ceph,
+      Metrics* metrics,
+      const std::set<uint64_t>& visited,
+      std::unordered_map<uint64_t, AdjacencyBlob>* adjacency_cache,
+      uint64_t* adaptive_base_candidates,
+      uint64_t* adaptive_incremental_candidates) {
+    const uint32_t window_limit = level == 0 ? cfg_.frontier_window : 1;
+    float selection_bound = lower_bound;
+    const bool adaptive =
+        level == 0 && cfg_.frontier_adaptive && window_limit > 1;
+    if (adaptive && !candidates->empty()) {
+      const float head_distance = candidates->top().dist;
+      const double headroom = std::max(
+          0.0, static_cast<double>(lower_bound) - head_distance);
+      selection_bound = static_cast<float>(
+          head_distance + cfg_.frontier_slack_fraction * headroom);
+    }
+
+    auto lookahead = nsvu::SelectFrontierWindow(
+        candidates, selection_bound, window_limit);
+    if (lookahead.empty()) {
+      return lookahead;
+    }
+
+    std::vector<uint64_t> missing_ids;
+    for (const auto& candidate : lookahead) {
+      if (adjacency_cache->count(candidate.id) == 0) {
+        missing_ids.push_back(candidate.id);
+      }
+    }
+    if (!missing_ids.empty()) {
+      auto fetched = ceph.GetAdjacency(missing_ids, metrics);
+      for (uint64_t id : missing_ids) {
+        auto found = fetched.find(id);
+        if (found != fetched.end()) {
+          adjacency_cache->emplace(id, std::move(found->second));
+        } else {
+          AdjacencyBlob empty;
+          empty.global_id = id;
+          adjacency_cache->emplace(id, std::move(empty));
+        }
+      }
+    }
+
+    if (!adaptive) {
+      return lookahead;
+    }
+
+    metrics->frontier_lookahead_nodes += lookahead.size();
+    std::vector<std::vector<nsvu::FrontierCandidateRef>> candidates_by_node;
+    candidates_by_node.reserve(lookahead.size());
+    for (const auto& candidate : lookahead) {
+      std::vector<nsvu::FrontierCandidateRef> refs;
+      const auto found = adjacency_cache->find(candidate.id);
+      if (found != adjacency_cache->end() &&
+          level < found->second.neighbors.size()) {
+        refs.reserve(found->second.neighbors[level].size());
+        for (uint64_t neighbor : found->second.neighbors[level]) {
+          const auto location = ceph.Resolve(neighbor);
+          refs.push_back({neighbor, location.shard_id, location.chunk_id});
+        }
+      }
+      candidates_by_node.push_back(std::move(refs));
+    }
+
+    const auto decision = nsvu::DecideAdaptiveFrontierPrefix(
+        candidates_by_node,
+        visited,
+        *adaptive_base_candidates,
+        *adaptive_incremental_candidates,
+        cfg_.frontier_candidate_budget,
+        cfg_.frontier_min_batch_savings_ratio);
+    *adaptive_base_candidates += decision.first_candidates;
+    *adaptive_incremental_candidates += decision.incremental_candidates;
+    metrics->frontier_adaptive_accepted_nodes += decision.accepted_nodes;
+    metrics->frontier_base_candidates += decision.first_candidates;
+    metrics->frontier_predicted_batches_saved +=
+        decision.predicted_batches_saved;
+    metrics->frontier_incremental_candidates +=
+        decision.incremental_candidates;
+    if (decision.budget_limited) {
+      metrics->frontier_budget_rejections++;
+    }
+    if (decision.accepted_nodes < lookahead.size()) {
+      const uint64_t rejected = lookahead.size() - decision.accepted_nodes;
+      metrics->frontier_rejected_nodes += rejected;
+      if (!decision.saw_batch_gain) {
+        metrics->frontier_rejected_no_gain += rejected;
+      }
+      for (size_t i = decision.accepted_nodes; i < lookahead.size(); ++i) {
+        candidates->push(lookahead[i]);
+      }
+      lookahead.resize(decision.accepted_nodes);
+    }
+    return lookahead;
+  }
+
 	  AdjacencyBlob* FindPendingPatch(std::vector<AdjacencyBlob>& patches, uint64_t id) {
 	    for (auto& patch : patches) {
 	      if (patch.global_id == id) {
@@ -2869,6 +2994,9 @@ class Coordinator {
     std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top(
         MaxCmp{stable_ties});
     std::set<uint64_t> visited;
+    std::unordered_map<uint64_t, AdjacencyBlob> adjacency_cache;
+    uint64_t adaptive_base_candidates = 0;
+    uint64_t adaptive_incremental_candidates = 0;
 
     float entry_dist = DistanceToOne(ctx, query, entry);
     candidates.push({entry, entry_dist});
@@ -2876,9 +3004,16 @@ class Coordinator {
     visited.insert(entry);
 
     while (!candidates.empty()) {
-      const uint32_t window_limit = level == 0 ? cfg_.frontier_window : 1;
-      auto frontier = nsvu::SelectFrontierWindow(
-          &candidates, top.top().dist, window_limit);
+      auto frontier = SelectSearchFrontier(
+          &candidates,
+          top.top().dist,
+          level,
+          ctx.ceph,
+          &ctx.metrics,
+          visited,
+          &adjacency_cache,
+          &adaptive_base_candidates,
+          &adaptive_incremental_candidates);
       if (frontier.empty()) {
         break;
       }
@@ -2888,16 +3023,11 @@ class Coordinator {
       ctx.metrics.max_frontier_window_fill = std::max<uint64_t>(
           ctx.metrics.max_frontier_window_fill, frontier.size());
 
-      std::vector<uint64_t> frontier_ids;
-      frontier_ids.reserve(frontier.size());
-      for (const auto& cand : frontier) {
-        frontier_ids.push_back(cand.id);
-      }
-      auto adjacencies = ctx.ceph.GetAdjacency(frontier_ids, &ctx.metrics);
       std::vector<uint64_t> to_score;
       for (const auto& cand : frontier) {
-        auto found = adjacencies.find(cand.id);
-        if (found == adjacencies.end() || level >= found->second.neighbors.size()) {
+        auto found = adjacency_cache.find(cand.id);
+        if (found == adjacency_cache.end() ||
+            level >= found->second.neighbors.size()) {
           continue;
         }
         const auto& neighbors = found->second.neighbors[level];
@@ -2907,6 +3037,9 @@ class Coordinator {
             to_score.push_back(nbr);
           }
         }
+      }
+      for (const auto& cand : frontier) {
+        adjacency_cache.erase(cand.id);
       }
       if (to_score.empty()) {
         continue;
@@ -3177,6 +3310,9 @@ class Coordinator {
     std::priority_queue<Neighbor, std::vector<Neighbor>, MaxCmp> top(
         MaxCmp{stable_ties});
     std::set<uint64_t> visited;
+    std::unordered_map<uint64_t, AdjacencyBlob> adjacency_cache;
+    uint64_t adaptive_base_candidates = 0;
+    uint64_t adaptive_incremental_candidates = 0;
 
     float entry_dist = DistanceToOne(query, entry);
     candidates.push({entry, entry_dist});
@@ -3184,9 +3320,16 @@ class Coordinator {
     visited.insert(entry);
 
     while (!candidates.empty()) {
-      const uint32_t window_limit = level == 0 ? cfg_.frontier_window : 1;
-      auto frontier = nsvu::SelectFrontierWindow(
-          &candidates, top.top().dist, window_limit);
+      auto frontier = SelectSearchFrontier(
+          &candidates,
+          top.top().dist,
+          level,
+          ceph_,
+          &metrics_,
+          visited,
+          &adjacency_cache,
+          &adaptive_base_candidates,
+          &adaptive_incremental_candidates);
       if (frontier.empty()) {
         break;
       }
@@ -3196,16 +3339,11 @@ class Coordinator {
       metrics_.max_frontier_window_fill = std::max<uint64_t>(
           metrics_.max_frontier_window_fill, frontier.size());
 
-      std::vector<uint64_t> frontier_ids;
-      frontier_ids.reserve(frontier.size());
-      for (const auto& cand : frontier) {
-        frontier_ids.push_back(cand.id);
-      }
-      auto adjacencies = ceph_.GetAdjacency(frontier_ids, &metrics_);
       std::vector<uint64_t> to_score;
       for (const auto& cand : frontier) {
-        auto found = adjacencies.find(cand.id);
-        if (found == adjacencies.end() || level >= found->second.neighbors.size()) {
+        auto found = adjacency_cache.find(cand.id);
+        if (found == adjacency_cache.end() ||
+            level >= found->second.neighbors.size()) {
           continue;
         }
         const auto& neighbors = found->second.neighbors[level];
@@ -3215,6 +3353,9 @@ class Coordinator {
             to_score.push_back(nbr);
           }
         }
+      }
+      for (const auto& cand : frontier) {
+        adjacency_cache.erase(cand.id);
       }
       if (to_score.empty()) {
         continue;
@@ -3466,6 +3607,14 @@ class Coordinator {
     out << "  \"time_limit_seconds\": " << metrics_.time_limit_seconds << ",\n";
     out << "  \"update_parallelism\": " << metrics_.update_parallelism << ",\n";
     out << "  \"frontier_window\": " << cfg_.frontier_window << ",\n";
+    out << "  \"frontier_adaptive\": "
+        << (cfg_.frontier_adaptive ? "true" : "false") << ",\n";
+    out << "  \"frontier_slack_fraction\": "
+        << cfg_.frontier_slack_fraction << ",\n";
+    out << "  \"frontier_candidate_budget\": "
+        << cfg_.frontier_candidate_budget << ",\n";
+    out << "  \"frontier_min_batch_savings_ratio\": "
+        << cfg_.frontier_min_batch_savings_ratio << ",\n";
     out << "  \"stopped_by_time_limit\": "
         << (metrics_.stopped_by_time_limit ? "true" : "false") << ",\n";
     out << "  \"throughput_updates_per_sec\": " << metrics_.throughput_updates_per_sec << ",\n";
@@ -3610,6 +3759,28 @@ class Coordinator {
         << metrics_.frontier_speculative_nodes << ",\n";
     out << "    \"max_frontier_window_fill\": "
         << metrics_.max_frontier_window_fill << ",\n";
+    out << "    \"frontier_lookahead_nodes\": "
+        << metrics_.frontier_lookahead_nodes << ",\n";
+    out << "    \"frontier_adaptive_accepted_nodes\": "
+        << metrics_.frontier_adaptive_accepted_nodes << ",\n";
+    out << "    \"frontier_rejected_nodes\": "
+        << metrics_.frontier_rejected_nodes << ",\n";
+    out << "    \"frontier_rejected_no_gain\": "
+        << metrics_.frontier_rejected_no_gain << ",\n";
+    out << "    \"frontier_budget_rejections\": "
+        << metrics_.frontier_budget_rejections << ",\n";
+    out << "    \"frontier_predicted_batches_saved\": "
+        << metrics_.frontier_predicted_batches_saved << ",\n";
+    out << "    \"frontier_base_candidates\": "
+        << metrics_.frontier_base_candidates << ",\n";
+    out << "    \"frontier_incremental_candidates\": "
+        << metrics_.frontier_incremental_candidates << ",\n";
+    out << "    \"frontier_candidate_inflation_ratio\": "
+        << (metrics_.frontier_base_candidates > 0
+                ? static_cast<double>(metrics_.frontier_incremental_candidates) /
+                      static_cast<double>(metrics_.frontier_base_candidates)
+                : 0.0)
+        << ",\n";
     out << "    \"distance_candidates_before_dedupe\": "
         << metrics_.distance_candidates_before_dedupe << ",\n";
     out << "    \"distance_candidates_after_dedupe\": "
@@ -3787,6 +3958,8 @@ class Coordinator {
     out << "  \"time_limit_seconds\": " << cfg_.time_limit_seconds << ",\n";
     out << "  \"update_parallelism\": " << cfg_.update_parallelism << ",\n";
     out << "  \"frontier_window\": " << cfg_.frontier_window << ",\n";
+    out << "  \"frontier_adaptive\": "
+        << (cfg_.frontier_adaptive ? "true" : "false") << ",\n";
     out << "  \"distance_mode\": \"" << cfg_.distance_mode << "\",\n";
     out << "  \"distance_split_probe\": "
         << (cfg_.distance_split_probe ? "true" : "false") << ",\n";
@@ -3918,6 +4091,26 @@ Config ParseArgs(int argc, const char** argv) {
       if (cfg.frontier_window == 0) {
         throw std::runtime_error("--frontier-window must be >= 1");
       }
+    } else if (arg == "--frontier-adaptive") {
+      cfg.frontier_adaptive = true;
+    } else if (arg == "--frontier-slack-fraction") {
+      cfg.frontier_slack_fraction = std::stod(next("--frontier-slack-fraction"));
+      if (cfg.frontier_slack_fraction < 0.0 || cfg.frontier_slack_fraction > 1.0) {
+        throw std::runtime_error("--frontier-slack-fraction must be in [0, 1]");
+      }
+    } else if (arg == "--frontier-candidate-budget") {
+      cfg.frontier_candidate_budget = std::stod(next("--frontier-candidate-budget"));
+      if (cfg.frontier_candidate_budget < 0.0 || cfg.frontier_candidate_budget > 1.0) {
+        throw std::runtime_error("--frontier-candidate-budget must be in [0, 1]");
+      }
+    } else if (arg == "--frontier-min-batch-savings-ratio") {
+      cfg.frontier_min_batch_savings_ratio =
+          std::stod(next("--frontier-min-batch-savings-ratio"));
+      if (cfg.frontier_min_batch_savings_ratio < 0.0 ||
+          cfg.frontier_min_batch_savings_ratio > 1.0) {
+        throw std::runtime_error(
+            "--frontier-min-batch-savings-ratio must be in [0, 1]");
+      }
     } else if (arg == "--osd-op-timeout-seconds") {
       cfg.osd_op_timeout_seconds =
           static_cast<uint32_t>(std::stoul(next("--osd-op-timeout-seconds")));
@@ -3928,6 +4121,10 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.osd_op_retry_limit =
           static_cast<uint32_t>(std::stoul(next("--osd-op-retry-limit")));
     }
+  }
+  if (cfg.frontier_adaptive && cfg.frontier_window < 2) {
+    throw std::runtime_error(
+        "--frontier-adaptive requires --frontier-window >= 2");
   }
   return cfg;
 }

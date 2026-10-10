@@ -15,6 +15,10 @@ repetitions=${REPETITIONS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
 parallelism=${UPDATE_PARALLELISM:-4}
 frontier_window=${FRONTIER_WINDOW:-1}
+frontier_adaptive=${FRONTIER_ADAPTIVE:-false}
+frontier_slack_fraction=${FRONTIER_SLACK_FRACTION:-0.25}
+frontier_candidate_budget=${FRONTIER_CANDIDATE_BUDGET:-0.20}
+frontier_min_batch_savings_ratio=${FRONTIER_MIN_BATCH_SAVINGS_RATIO:-0.25}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
 semantic_samples=${SEMANTIC_SAMPLES:-256}
 semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
@@ -38,6 +42,14 @@ ceph_cli=(ceph --keyring "$CEPH_KEYRING")
 [[ "$window_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATE_PARALLELISM must be positive." >&2; exit 2; }
 [[ "$frontier_window" =~ ^[1-9][0-9]*$ ]] || { echo "FRONTIER_WINDOW must be positive." >&2; exit 2; }
+[[ "$frontier_adaptive" == true || "$frontier_adaptive" == false ]] || {
+  echo "FRONTIER_ADAPTIVE must be true or false." >&2
+  exit 2
+}
+if [[ "$frontier_adaptive" == true && "$frontier_window" -lt 2 ]]; then
+  echo "FRONTIER_ADAPTIVE=true requires FRONTIER_WINDOW >= 2." >&2
+  exit 2
+fi
 [[ "$checker_batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "CHECKER_BATCH_SIZE must be positive." >&2; exit 2; }
 [[ "$semantic_samples" =~ ^[1-9][0-9]*$ ]] || { echo "SEMANTIC_SAMPLES must be positive." >&2; exit 2; }
 python3 - "$semantic_min_edge_win_rate" <<'PY'
@@ -57,6 +69,18 @@ value = float(sys.argv[1])
 if not 0.0 <= value <= 1.0:
     raise SystemExit("PAIRED_RECALL_MAX_REGRESSION must be in [0, 1].")
 PY
+python3 - "$frontier_slack_fraction" "$frontier_candidate_budget" \
+  "$frontier_min_batch_savings_ratio" <<'PY'
+import sys
+
+for name, raw in zip(
+    ("FRONTIER_SLACK_FRACTION", "FRONTIER_CANDIDATE_BUDGET",
+     "FRONTIER_MIN_BATCH_SAVINGS_RATIO"),
+    sys.argv[1:]):
+    value = float(raw)
+    if not 0.0 <= value <= 1.0:
+        raise SystemExit(f"{name} must be in [0, 1].")
+PY
 (( ${#datasets[@]} > 0 )) || { echo "DATASETS must not be empty." >&2; exit 2; }
 (( ${#requested_modes[@]} > 0 )) || { echo "MODES must not be empty." >&2; exit 2; }
 has_compute=false
@@ -74,6 +98,16 @@ for mode in "${requested_modes[@]}"; do
     *) echo "Unsupported mode in MODES: $mode" >&2; exit 2 ;;
   esac
 done
+
+frontier_args=(
+  --frontier-window "$frontier_window"
+  --frontier-slack-fraction "$frontier_slack_fraction"
+  --frontier-candidate-budget "$frontier_candidate_budget"
+  --frontier-min-batch-savings-ratio "$frontier_min_batch_savings_ratio"
+)
+if [[ "$frontier_adaptive" == true ]]; then
+  frontier_args+=(--frontier-adaptive)
+fi
 
 wait_for_clean_cluster() {
   local deadline=$((SECONDS + 300)) osd_stat pg_stat
@@ -226,6 +260,10 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "window_seconds=$window_seconds"
   echo "update_parallelism=$parallelism"
   echo "frontier_window=$frontier_window"
+  echo "frontier_adaptive=$frontier_adaptive"
+  echo "frontier_slack_fraction=$frontier_slack_fraction"
+  echo "frontier_candidate_budget=$frontier_candidate_budget"
+  echo "frontier_min_batch_savings_ratio=$frontier_min_batch_savings_ratio"
   echo "checker_batch_size=$checker_batch_size"
   echo "semantic_samples=$semantic_samples"
   echo "semantic_min_edge_win_rate=$semantic_min_edge_win_rate"
@@ -273,7 +311,7 @@ for repetition in $(seq 1 "$repetitions"); do
         --num-updates "$updates" --update-offset 0 --target-start 0 \
         --points-per-object "$ppo" --distance-mode "$mode" --distance-split-probe \
         --distance-probe-interval-ms 1000 --time-limit-seconds "$window_seconds" \
-        --update-parallelism "$parallelism" --frontier-window "$frontier_window" \
+        --update-parallelism "$parallelism" "${frontier_args[@]}" \
         --osd-op-timeout-seconds "$osd_op_timeout_seconds" \
         --osd-op-retry-limit "$osd_op_retry_limit" \
         --metrics-out "$output/update.json" --progress-out "$output/update.progress.json"
