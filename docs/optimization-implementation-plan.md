@@ -237,23 +237,52 @@ schema v1 的固定字段使低维数据集的相对字节增幅更明显；阶�
 每个对象通常只剩一个候选。第一版直接复用现有 `get_node_adjacency_batch` 和
 `distance_to_local_batch`，先改 Coordinator 调用形态，不立即增加融合 CLS。
 
-### 6.1 有界 frontier 窗口
+### 6.1 固定窗口首轮验证与计划修正（2026-10-10）
 
-1. 保留标准 HNSW 最小距离候选作为窗口头，根据当前 lower bound 一次选择最多
-   `W=4/8/16/32` 个可安全或可投机展开的 frontier 节点；上层 `GreedySearch`
-   仍保持串行，先只优化占主要工作的 level 0。
-2. 对窗口内节点去重，按 adjacency 对象分组，一次调用读取同对象多个邻接表。
-3. 合并邻居 ID 后先做 visited 去重，再按**距离数据对象**分组；同一对象的一批
-   candidate 只携带一次 query。
-4. 批内和 completion 合并都使用 `(distance, global_id)` 稳定排序，确保同距离
-   tie-break 可复现；记录额外投机展开的节点数，避免用无界额外工作换 RPC 数。
-5. 第一版同步提交对象批次，用于隔离“聚合”本身的收益；阶段 5 再并行提交和跨
-   update 微批，避免一次同时改变搜索语义、并发和排队。
+提交 `53284fc` 已实现默认关闭的 level-0 窗口、批量邻接读取、合并后 visited
+去重、按对象 batch distance、稳定 tie-break 和投机工作指标。`W=1` 保持 M2
+控制语义；`W>1` 才启用窗口。GIST1M、OSD、30 s、并发度 4 的同提交 smoke 如下：
 
-### 6.2 对象扇出约束下的验收
+| 窗口 | 更新数 | 候选/update | distance batches/update | candidates/batch | 平均延迟 | P99 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 240 | 502.35 | 455.47 | 1.103 | 452.96 ms | 737.97 ms |
+| 4 | 229 | 592.30 | 458.89 | 1.291 | 476.53 ms | 909.28 ms |
+| 8 | 210 | 702.05 | 454.59 | 1.544 | 518.49 ms | 847.69 ms |
+
+三轮均为零失败、checker `pass`；W4/W8 的共同前缀 Recall 没有退化。但 W4
+虽然把额外候选控制在 17.9%，distance batch 反而增加 0.75%，平均延迟/P99
+分别回退 5.2%/23.2%；W8 的候选增加 39.8%，batch 仅下降 0.19%，平均延迟/P99
+回退 14.5%/14.9%。W8 的距离对象扇出仍约 64.93/update，与 W1 的 64.66 基本
+相同；query bytes 也只下降 0.19%。因此固定 `W=4/8/16/32` 扫描不能作为 B1：
+更大的窗口提高了批内密度，却用投机距离工作抵消了物理调用收益。W16/W32 不再
+继续执行。
+
+### 6.2 自适应有界 frontier 窗口
+
+1. `W=1` 继续作为默认值和同提交 M2 控制组；固定 W 只保留为诊断开关，不直接
+   作为正式优化配置。
+2. level 0 可查看最多 8 个有序候选，上层 `GreedySearch` 始终串行。先按
+   `(distance, global_id)` 排序，并用 placement resolver 计算 adjacency 对象；
+   未被选中的 lookahead 必须原样放回候选堆。
+3. 批量读取 lookahead 邻接后，对每个候选前缀估算距离对象调用减少量、合并后的
+   唯一邻居数和新增 payload 工作。收益模型使用 W1 实测的每批
+   roundtrip/queue 与每候选 payload/compute 成本；只有预计节省为正且带安全余量
+   时才扩大窗口，否则本次展开退化为 W1。
+4. 每次 update 的窗口外推节点和新增唯一候选均受预算约束；滚动候选膨胀不得超过
+   W1 控制统计的 20%。若实际 distance batches 未下降或候选预算超限，熔断后续
+   自适应展开并记录原因，禁止用无界额外工作换取更大的 candidates/batch。
+5. 合并邻居 ID 后先做 visited 去重，再按**距离数据对象**分组；同一对象的一批
+   candidate 只携带一次 query。第一版保持同步提交，阶段 5 再引入异步与跨 update
+   微批，避免同时改变搜索语义和排队。
+6. 新增 `lookahead_nodes`、`accepted_frontier_nodes`、`rejected_no_gain`、
+   `predicted_batches_saved`、`incremental_candidates` 和熔断计数；报告必须同时展示
+   候选膨胀、物理 batch、query bytes、平均延迟和 P99。
+
+### 6.3 对象扇出约束下的验收
 
 M2 的距离批次、候选和 distance-only 对象扇出如下。最后一列是用正式三轮数据
-估算的单次 update 完美对象合并上限，也是阶段 3 的直接执行基线。
+估算的单次 update 完美对象合并上限；首轮 smoke 后将其定位为长期理论参考，而非
+阶段 3 同步窗口可直接达到的执行基线。
 
 | 数据集 | M2 distance batches/update | candidates/batch | distance objects/update | 候选/对象上限 | 完美合并批次降幅 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -262,23 +291,24 @@ M2 的距离批次、候选和 distance-only 对象扇出如下。最后一列�
 | Deep100M | 587.69 | 1.009 | 361.25 | 1.64 | 38.5% |
 | SIFT100M | 582.59 | 1.017 | 291.34 | 2.03 | 50.0% |
 
-因此阶段 3 不再使用所有数据集统一 `<50 batches/update`、`>=8 candidates/batch`
-的不可达门槛。退出条件改为：
+这里的“完美合并”是整次 update 的理论下限；首轮 smoke 证明同步有界窗口无法在
+不做投机工作的情况下直接达到它。因此它移作 B5 的长期参考，不再作为 M3 的直接
+退出线。阶段 3 采用两级门禁：
 
-- distance batches/update 不高于 `1.2 × unique_distance_objects/update`，并且相对
-  M2：GIST1M 降低至少 75%、Text2Image10M 至少 60%、Deep100M 至少 30%、
-  SIFT100M 至少 40%；
-- candidates/batch 达到测得 `candidates/unique_distance_object` 理论上限的至少
-  70%，同时额外距离计算量不超过 M2 的 20%；
-- query bytes/update 的降幅至少达到实际 distance-batch 降幅的 80%；按当前估算，
-  四数据集的最低目标分别为 60%/48%/24%/32%。Deep100M 的当前对象扇出决定了
-  阶段 3 不能设置统一 50% query-byte 降幅；
-- distance roundtrip/queue 降低至少 25%；B1 四数据集加权平均延迟相对同版本
-  M2 控制组降低至少 10%，且任何数据集不回退超过 5%，P99 不回退超过 5%；同时
-  保留相对冻结 B0 的长期对比；
+- GIST1M feasibility smoke 必须相对同提交 W1 将 distance batches 和 query bytes
+  至少降低 10%，候选膨胀不超过 20%，平均延迟与 P99 均不回退；否则不得启动
+  四数据集正式实验；
+- 正式 B1 要求四数据集 distance batches/query bytes 均下降，distance
+  roundtrip/queue 加权下降至少 10%，四数据集加权平均延迟下降至少 5%，任何
+  数据集平均延迟或 P99 不回退超过 5%，同时报告相对冻结 B0 的长期变化；
 - 共同 query 前缀的 Recall@10 下降不超过 0.5 pp，零失败且一致性检查通过。
 
-### 6.3 可选的同对象融合
+达到 feasibility gate 后，再根据实际窗口可合并率设定 M3 最终 batch 降幅目标，
+不得继续用整次 update 的唯一对象数虚构同步窗口可以达到的收益。如果自适应窗口
+仍过不了 gate，应把结果记录为 Coordinator-only 聚合的负结论，并提前评估阶段 5
+的异步重叠或阶段 7 的布局，而不是放宽正确性和尾延迟门禁。
+
+### 6.4 可选的同对象融合
 
 只有 Coordinator 聚合达到对象扇出下限后，再增加只读
 `expand_frontier_batch`：在一个对象内读取多个 frontier 的邻接，直接计算其中
@@ -421,7 +451,7 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | M0 已完成 | 正确性检查、失败分类、幂等重放 | 最新 24/24 轮复验通过 |
 | M1 已完成 | C0/B0 严格 A/B、Recall、调用/字节/阶段指标 | 四数据集各三次独立重复 |
 | M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
-| M3 读聚合 | level-0 有界 frontier、按对象 batch distance | 达到分数据集扇出门槛 |
+| M3 进行中 | 自适应 level-0 frontier、按对象 batch distance | 先通过 GIST feasibility gate，再定正式降幅 |
 | M4 恢复协议 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
 | M5 执行器 | 异步 RemoteExecutor、写微批 | calls/patch/P99 达标 |
 | M6 拥塞控制 | per-target AIMD 与 deadline flush | queue/P99 达标 |
@@ -441,17 +471,18 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 
 后续建议顺序如下：
 
-1. `feat(search): collect a bounded level-zero frontier window`
-2. `feat(search): coalesce adjacency and distance reads by object`
-3. `feat(cls): fuse same-object frontier expansion`
-4. `feat(metadata): persist recoverable update intents`
-5. `feat(recovery): replay incomplete vector updates`
-6. `feat(executor): submit per-object reads asynchronously`
-7. `feat(executor): microbatch independent query subrequests`
-8. `feat(cls): batch idempotent edge patches`
-9. `feat(scheduler): adapt per-target concurrency`
-10. `feat(layout): place nodes in bounded locality groups`
-11. `test(experiments): add c0-b5 ablation suite`
+1. `53284fc feat(search): batch bounded frontier expansion`（已完成；固定 W 性能门禁失败）
+2. `feat(search): select frontier windows with a measured benefit budget`
+3. `test(search): gate adaptive windows against same-commit W1`
+4. `feat(cls): fuse same-object frontier expansion`（仅在 Coordinator gate 通过后）
+5. `feat(metadata): persist recoverable update intents`
+6. `feat(recovery): replay incomplete vector updates`
+7. `feat(executor): submit per-object reads asynchronously`
+8. `feat(executor): microbatch independent query subrequests`
+9. `feat(cls): batch idempotent edge patches`
+10. `feat(scheduler): adapt per-target concurrency`
+11. `feat(layout): place nodes in bounded locality groups`
+12. `test(experiments): add c0-b5 ablation suite`
 
 每个阶段先运行单元测试、小数据集正确性、超时/崩溃注入，再运行四数据集正式实验。
 性能提交和正确性提交不混合，实验报告必须记录完整 commit、二进制哈希和原始结果
