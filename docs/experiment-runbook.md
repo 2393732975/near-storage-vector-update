@@ -349,6 +349,43 @@ python3 scripts/summarize-phase1-ab.py "$run_root" \
   --output "$run_root/summary.md" --json-output "$run_root/summary.json"
 ```
 
+### 6.1 阶段 5A 只读 RemoteExecutor smoke
+
+阶段 5A 只改变 OSD 距离读取：同一次搜索中不同对象的请求并发提交，不同 update
+发往同一对象的请求可在短等待窗口内合并为一个 multi-query CLS RPC。每个子请求
+保留独立 query 和候选集合，HNSW frontier 顺序不变。该开关禁止与 `compute`
+同时运行，也不启用任何修改型微批。
+
+协议包含新的 CLS 方法，因此必须在得到部署授权后，先把当前提交构建的
+`libcls_hnsw_global.so` 部署到全部 OSD，再运行最小 GIST1M smoke：
+
+```bash
+run_root="$PWD/results/stage5-read-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$run_root"
+
+env \
+  CEPH_KEYRING="$CEPH_KEYRING" \
+  DATASET_ROOT="$DATASET_ROOT" \
+  MODES=osd \
+  DATASETS=gist1m \
+  REPETITIONS=1 \
+  WINDOW_SECONDS=30 \
+  UPDATE_PARALLELISM=4 \
+  DISTANCE_MICROBATCH=true \
+  DISTANCE_MICROBATCH_WAIT_US=100 \
+  DISTANCE_MICROBATCH_MAX_BYTES=262144 \
+  DISTANCE_MICROBATCH_MAX_CANDIDATES=256 \
+  DISTANCE_MICROBATCH_MAX_SUBREQUESTS=32 \
+  DISTANCE_EXECUTOR_THREADS=5 \
+  RUN_ROOT="$run_root" \
+  scripts/run-phase1-ab.sh --confirm-reset
+```
+
+runner 会强制检查 multi-query RPC 和逻辑子请求均大于 0。`update.json` 还记录
+`distance_subrequests_per_rpc`、`distance_queries_per_rpc`、候选复用率、微批排队
+时间和物理 RPC/update。正式性能判断必须另跑同提交、同参数且关闭
+`DISTANCE_MICROBATCH` 的 M2 控制组；smoke 只验证协议、正确性和合批是否发生。
+
 ## 7. 运行阶段 0 正确性验收
 
 阶段 0 固定使用 OSD 模式，每个数据集只导入一次，然后连续更新三轮；每轮结束后
@@ -387,6 +424,12 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `FRONTIER_SLACK_FRACTION` | 0.25 | 0.25 | 0.25 | 自适应 lookahead 距离范围，取值 `[0,1]` |
 | `FRONTIER_CANDIDATE_BUDGET` | 0.20 | 0.20 | 0.20 | 自适应额外候选累计预算 |
 | `FRONTIER_MIN_BATCH_SAVINGS_RATIO` | 0.25 | 0.25 | 0.25 | 接受扩窗所需的预计对象批次降幅 |
+| `DISTANCE_MICROBATCH` | false | false | false | 阶段 5A 仅在 `MODES=osd` 时启用 |
+| `DISTANCE_MICROBATCH_WAIT_US` | 100 | 100 | 100 | 阶段 5A 扫描 50/100/250/500 μs |
+| `DISTANCE_MICROBATCH_MAX_BYTES` | 262144 | 262144 | 262144 | 单个物理 RPC 的近似请求字节上限 |
+| `DISTANCE_MICROBATCH_MAX_CANDIDATES` | 256 | 256 | 256 | 所有子请求候选总数上限 |
+| `DISTANCE_MICROBATCH_MAX_SUBREQUESTS` | 32 | 32 | 32 | 单个物理 RPC 的 query 子请求上限 |
+| `DISTANCE_EXECUTOR_THREADS` | 5 | 5 | 5 | 初始与实验 OSD 数一致；正式扫描需记录 |
 | `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
 | `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
 | `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |

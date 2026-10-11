@@ -396,8 +396,31 @@ intent/saga 退出条件满足后才能启用。异步化的目标是重叠独�
 返回码。不同对象仍是独立请求；发生局部冲突只重放对应项目。new adjacency、
 label CAS 和生命周期切换不为追求批量而破坏 saga 顺序。
 
-退出条件：全部 CLS calls/update 相对 M2 的 501–747 降低至少 60%；patch
-calls/update 从约 14–17 降至 5 以下，patch 阶段占完整更新低于 10%；只读异步使
+### 8.3 阶段 5A 实施状态与门禁（2026-10-11）
+
+阶段 3 已证明同步 frontier 扩窗不能稳定降低延迟，因此先实现不改变搜索语义的
+只读执行器。当前实现新增 `distance_multi_query_batch` 只读 CLS 方法和共享
+`DistanceReadExecutor`：Coordinator 先按 owner/chunk 拆分一次逻辑距离请求，
+并发提交独立对象；执行器再按同一物理对象聚合来自不同 update 的子请求。OSD
+只对重叠 candidate ID 复用 VectorRef/payload 读取，每个 query 独立算距并返回
+逐子请求状态。HNSW frontier 的产生和终止顺序不变。
+
+第一版默认关闭，初始参数为等待 100 μs、256 KiB、256 candidates、32 个
+subrequests 和 5 个执行线程。它只允许 `mode=update`、`distance-mode=osd`；runner
+进一步要求 `MODES=osd`，防止污染纯 Raw-RADOS 的 C0。新增观测包括物理
+multi-query RPC、逻辑 subrequest、queries/RPC、candidates/subrequest、候选复用
+率、微批排队时间和批大小直方图。修改型请求仍走 M2 原路径，未绕过阶段 4 门禁。
+
+代码完成后先执行 GIST1M 30 s smoke，要求零失败、checker 通过、multi-query
+RPC 大于 0；然后在同一提交上对 M2 控制组和 50/100/250/500 μs 等候窗口做独立
+重导入对照。可行性门槛为距离等待或端到端平均延迟至少降低 5%、P99 不回退超过
+5%、静态 Recall 与语义检查通过。`subrequests/RPC` 必须如实报告；如果它接近 1
+但延迟改善，结论只能归因于独立对象异步重叠，不能宣称跨 update 合批成功。若
+平均延迟无收益或 P99 恶化，则关闭 Stage 5A 默认开关并提前进入阶段 7 布局验证。
+
+完整阶段 5 的退出条件（不是 5A 只读 feasibility gate）：全部 CLS calls/update
+相对 M2 的 501–747 降低至少 60%；patch calls/update 从约 14–17 降至 5 以下，
+patch 阶段占完整更新低于 10%；只读异步使
 阶段 3 的独立对象等待得到重叠，但 P99 不回退；写批次零失败且故障恢复测试通过。
 
 ## 9. 阶段 6：拥塞感知调度
