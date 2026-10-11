@@ -6,16 +6,20 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -41,6 +45,9 @@ using ghnsw::CasGlobalMetaRequest;
 using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
+using ghnsw::DistanceMultiQueryBatchReply;
+using ghnsw::DistanceMultiQueryBatchRequest;
+using ghnsw::DistanceMultiQuerySubrequest;
 using ghnsw::EdgePatchBatchRequest;
 using ghnsw::EmptyRequest;
 using ghnsw::FinalizeInsertRequest;
@@ -99,6 +106,12 @@ struct Config {
   double frontier_slack_fraction = 0.25;
   double frontier_candidate_budget = 0.20;
   double frontier_min_batch_savings_ratio = 0.25;
+  bool distance_microbatch = false;
+  uint32_t distance_microbatch_wait_us = 100;
+  uint64_t distance_microbatch_max_bytes = 256 * 1024;
+  uint32_t distance_microbatch_max_candidates = 256;
+  uint32_t distance_microbatch_max_subrequests = 32;
+  uint32_t distance_executor_threads = 5;
   uint32_t osd_op_timeout_seconds = 45;
   uint32_t osd_op_retry_limit = 3;
   uint32_t recall_k = 10;
@@ -171,6 +184,14 @@ struct Metrics {
   uint64_t frontier_incremental_candidates = 0;
   uint64_t distance_candidates_before_dedupe = 0;
   uint64_t distance_candidates_after_dedupe = 0;
+  uint64_t distance_logical_subrequests = 0;
+  uint64_t distance_multi_query_rpcs = 0;
+  uint64_t distance_multi_query_subrequests = 0;
+  uint64_t distance_multi_query_candidates = 0;
+  uint64_t distance_multi_query_unique_candidates = 0;
+  uint64_t max_distance_subrequests_per_rpc = 0;
+  double distance_microbatch_queue_seconds = 0.0;
+  std::map<uint64_t, uint64_t> distance_subrequests_per_rpc_histogram;
   uint64_t update_attempts_observed = 0;
   uint64_t unique_data_objects_sum = 0;
   uint64_t unique_data_pgs_sum = 0;
@@ -516,6 +537,21 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
       src.distance_candidates_before_dedupe;
   dst->distance_candidates_after_dedupe +=
       src.distance_candidates_after_dedupe;
+  dst->distance_logical_subrequests += src.distance_logical_subrequests;
+  dst->distance_multi_query_rpcs += src.distance_multi_query_rpcs;
+  dst->distance_multi_query_subrequests +=
+      src.distance_multi_query_subrequests;
+  dst->distance_multi_query_candidates += src.distance_multi_query_candidates;
+  dst->distance_multi_query_unique_candidates +=
+      src.distance_multi_query_unique_candidates;
+  dst->max_distance_subrequests_per_rpc = std::max(
+      dst->max_distance_subrequests_per_rpc,
+      src.max_distance_subrequests_per_rpc);
+  dst->distance_microbatch_queue_seconds +=
+      src.distance_microbatch_queue_seconds;
+  for (const auto& [size, count] : src.distance_subrequests_per_rpc_histogram) {
+    dst->distance_subrequests_per_rpc_histogram[size] += count;
+  }
   dst->update_attempts_observed += src.update_attempts_observed;
   dst->unique_data_objects_sum += src.unique_data_objects_sum;
   dst->unique_data_pgs_sum += src.unique_data_pgs_sum;
@@ -1065,6 +1101,104 @@ class CephFacade {
       }
     }
     return result;
+  }
+
+  DistanceMultiQueryBatchReply DistanceMultiQuery(
+      uint32_t owner,
+      uint64_t chunk,
+      const std::vector<DistanceMultiQuerySubrequest>& subrequests,
+      Metrics* metrics) {
+    if (cfg_.distance_mode != "osd") {
+      throw ProtocolError("multi-query distance execution requires OSD mode");
+    }
+    if (subrequests.empty()) {
+      throw ProtocolError("multi-query distance batch must not be empty");
+    }
+    DistanceMultiQueryBatchRequest request;
+    request.subrequests = subrequests;
+    ceph::bufferlist in = encode_cls_request(
+        Opcode::kDistanceMultiQueryBatch,
+        request,
+        0,
+        0,
+        placement_.placement_epoch());
+    ceph::bufferlist out;
+
+    uint64_t logical_candidates = 0;
+    std::set<uint64_t> unique_candidates;
+    for (const auto& subrequest : subrequests) {
+      logical_candidates += subrequest.global_ids.size();
+      unique_candidates.insert(
+          subrequest.global_ids.begin(), subrequest.global_ids.end());
+      if (metrics) {
+        metrics->logical_distance_query_bytes += subrequest.query_vector.size();
+      }
+    }
+    if (metrics) {
+      metrics->remote_distance_calls++;
+      metrics->remote_candidates_scored += logical_candidates;
+      metrics->distance_batches++;
+      metrics->distance_logical_subrequests += subrequests.size();
+      metrics->distance_multi_query_rpcs++;
+      metrics->distance_multi_query_subrequests += subrequests.size();
+      metrics->distance_multi_query_candidates += logical_candidates;
+      metrics->distance_multi_query_unique_candidates += unique_candidates.size();
+      metrics->max_distance_subrequests_per_rpc = std::max<uint64_t>(
+          metrics->max_distance_subrequests_per_rpc, subrequests.size());
+      metrics->max_candidates_per_distance_batch = std::max<uint64_t>(
+          metrics->max_candidates_per_distance_batch, logical_candidates);
+      metrics->distance_subrequests_per_rpc_histogram[subrequests.size()]++;
+      RecordDistanceBatch(metrics, owner, chunk, logical_candidates);
+    }
+    if (cfg_.distance_split_probe && metrics && ShouldSampleNoop(owner, chunk)) {
+      const TimedNoopSample noop_sample = TimedNoop(owner, chunk, metrics);
+      metrics->remote_noop_calls++;
+      metrics->distance_noop_roundtrip_seconds += noop_sample.roundtrip_seconds;
+      metrics->distance_noop_cls_total_seconds += noop_sample.cls_total_seconds;
+      metrics->distance_network_roundtrip_est_seconds +=
+          noop_sample.baseline_non_cls_seconds;
+      metrics->distance_osd_queue_est_seconds += noop_sample.queue_est_seconds;
+    }
+
+    int r = Exec(
+        owner_ioctxs_[owner],
+        ghnsw::OwnerDataOid(chunk),
+        "distance_multi_query_batch",
+        in,
+        &out,
+        metrics);
+    RecordDataTarget(metrics, owner, chunk);
+    if (r < 0) {
+      throw CephOperationError("distance_multi_query_batch", r);
+    }
+    DistanceMultiQueryBatchReply reply;
+    decode_cls_reply_or_die(
+        out,
+        Opcode::kDistanceMultiQueryBatch,
+        &reply,
+        "DistanceMultiQueryBatchReply");
+    if (reply.status < 0) {
+      throw CephOperationError("distance_multi_query_batch reply", reply.status);
+    }
+    if (metrics) {
+      metrics->distance_cls_total_seconds += reply.cls_total_seconds;
+      metrics->distance_vector_ref_seconds += reply.vector_ref_seconds;
+      metrics->distance_payload_read_seconds += reply.payload_read_seconds;
+      for (const auto& subreply : reply.subreplies) {
+        metrics->distance_compute_seconds += subreply.compute_seconds;
+      }
+    }
+    return reply;
+  }
+
+  void ObserveDistanceTarget(uint32_t owner, uint64_t chunk, Metrics* metrics) {
+    if (!metrics) {
+      return;
+    }
+    RecordDataTarget(metrics, owner, chunk);
+    metrics->current_distance_objects.insert(
+        std::to_string(owner_ioctxs_[owner].get_id()) + ":" +
+        ghnsw::OwnerDataOid(chunk));
   }
 
   void SetAdjacency(
@@ -2296,6 +2430,264 @@ class CephFacade {
   std::unordered_map<std::string, double> noop_noncls_floor_;
 };
 
+class DistanceReadExecutor {
+ public:
+  struct Result {
+    std::unordered_map<uint64_t, float> distances;
+  };
+
+  using Future = std::future<Result>;
+
+  explicit DistanceReadExecutor(const Config& cfg) : cfg_(cfg) {
+    const uint32_t thread_count =
+        std::max<uint32_t>(1, cfg_.distance_executor_threads);
+    facades_.reserve(thread_count);
+    for (uint32_t i = 0; i < thread_count; ++i) {
+      auto facade = std::make_unique<CephFacade>(cfg_);
+      facade->Connect();
+      facades_.push_back(std::move(facade));
+    }
+    workers_.reserve(thread_count);
+    for (uint32_t i = 0; i < thread_count; ++i) {
+      workers_.emplace_back([this, i]() { WorkerLoop(*facades_[i]); });
+    }
+  }
+
+  ~DistanceReadExecutor() {
+    Shutdown();
+  }
+
+  DistanceReadExecutor(const DistanceReadExecutor&) = delete;
+  DistanceReadExecutor& operator=(const DistanceReadExecutor&) = delete;
+
+  Future Submit(
+      uint32_t owner,
+      uint64_t chunk,
+      const std::string& query,
+      const std::vector<uint64_t>& ids) {
+    auto pending = std::make_shared<Pending>();
+    pending->subrequest.subrequest_id =
+        next_subrequest_id_.fetch_add(1, std::memory_order_relaxed);
+    pending->subrequest.query_vector = query;
+    pending->subrequest.dim = cfg_.dim;
+    pending->subrequest.vector_kind = cfg_.vector_kind;
+    pending->subrequest.metric = cfg_.metric;
+    pending->subrequest.global_ids = ids;
+    pending->enqueued = Clock::now();
+    Future future = pending->promise.get_future();
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (stopping_) {
+        throw std::runtime_error("distance read executor is stopping");
+      }
+      queues_[{owner, chunk}].push_back(std::move(pending));
+    }
+    queue_cv_.notify_one();
+    return future;
+  }
+
+  Metrics SnapshotMetrics() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    return metrics_;
+  }
+
+  void Shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (stopping_) {
+        return;
+      }
+      stopping_ = true;
+    }
+    queue_cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  using Target = std::pair<uint32_t, uint64_t>;
+
+  struct Pending {
+    DistanceMultiQuerySubrequest subrequest;
+    Clock::time_point enqueued;
+    std::promise<Result> promise;
+  };
+
+  using PendingPtr = std::shared_ptr<Pending>;
+
+  uint64_t EstimatedBytes(const Pending& pending) const {
+    return 64 + pending.subrequest.query_vector.size() +
+        pending.subrequest.global_ids.size() * sizeof(uint64_t);
+  }
+
+  bool HasQueuedRequestsLocked() const {
+    for (const auto& entry : queues_) {
+      if (!entry.second.empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::pair<Target, Clock::time_point> OldestTargetLocked() const {
+    Target target{};
+    Clock::time_point oldest = Clock::time_point::max();
+    for (const auto& [candidate_target, queue] : queues_) {
+      if (!queue.empty() && queue.front()->enqueued < oldest) {
+        target = candidate_target;
+        oldest = queue.front()->enqueued;
+      }
+    }
+    return {target, oldest};
+  }
+
+  std::vector<PendingPtr> PopBatchLocked(const Target& target) {
+    auto found = queues_.find(target);
+    if (found == queues_.end() || found->second.empty()) {
+      return {};
+    }
+    std::vector<PendingPtr> batch;
+    uint64_t bytes = 0;
+    uint64_t candidates = 0;
+    auto& queue = found->second;
+    while (!queue.empty() &&
+           batch.size() < cfg_.distance_microbatch_max_subrequests) {
+      const PendingPtr& next = queue.front();
+      const uint64_t next_bytes = EstimatedBytes(*next);
+      const uint64_t next_candidates = next->subrequest.global_ids.size();
+      if (!batch.empty() &&
+          (bytes + next_bytes > cfg_.distance_microbatch_max_bytes ||
+           candidates + next_candidates >
+               cfg_.distance_microbatch_max_candidates)) {
+        break;
+      }
+      bytes += next_bytes;
+      candidates += next_candidates;
+      batch.push_back(std::move(queue.front()));
+      queue.pop_front();
+    }
+    if (queue.empty()) {
+      queues_.erase(found);
+    }
+    return batch;
+  }
+
+  void MergePhysicalMetrics(const Metrics& local) {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    merge_update_metrics(&metrics_, local);
+  }
+
+  void ExecuteBatch(
+      CephFacade& facade,
+      const Target& target,
+      const std::vector<PendingPtr>& batch) {
+    Metrics local;
+    const auto dispatch_time = Clock::now();
+    for (const auto& pending : batch) {
+      local.distance_microbatch_queue_seconds +=
+          std::chrono::duration_cast<std::chrono::duration<double>>(
+              dispatch_time - pending->enqueued)
+              .count();
+    }
+    std::vector<DistanceMultiQuerySubrequest> subrequests;
+    subrequests.reserve(batch.size());
+    for (const auto& pending : batch) {
+      subrequests.push_back(pending->subrequest);
+    }
+
+    try {
+      const auto reply = facade.DistanceMultiQuery(
+          target.first, target.second, subrequests, &local);
+      std::unordered_map<uint64_t, const ghnsw::DistanceMultiQuerySubreply*>
+          replies;
+      for (const auto& subreply : reply.subreplies) {
+        if (!replies.emplace(subreply.subrequest_id, &subreply).second) {
+          throw ProtocolError("duplicate multi-query subreply id");
+        }
+      }
+      for (const auto& pending : batch) {
+        const auto found = replies.find(pending->subrequest.subrequest_id);
+        if (found == replies.end()) {
+          pending->promise.set_exception(std::make_exception_ptr(
+              ProtocolError("missing multi-query subreply")));
+          continue;
+        }
+        if (found->second->status < 0) {
+          pending->promise.set_exception(std::make_exception_ptr(
+              CephOperationError(
+                  "distance_multi_query_subrequest",
+                  found->second->status)));
+          continue;
+        }
+        Result result;
+        for (const auto& distance : found->second->distances) {
+          result.distances.emplace(distance.first, distance.second);
+        }
+        pending->promise.set_value(std::move(result));
+      }
+    } catch (...) {
+      const std::exception_ptr error = std::current_exception();
+      for (const auto& pending : batch) {
+        try {
+          pending->promise.set_exception(error);
+        } catch (const std::future_error&) {
+        }
+      }
+    }
+    MergePhysicalMetrics(local);
+  }
+
+  void WorkerLoop(CephFacade& facade) {
+    const auto wait_duration =
+        std::chrono::microseconds(cfg_.distance_microbatch_wait_us);
+    while (true) {
+      Target target{};
+      std::vector<PendingPtr> batch;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        while (!HasQueuedRequestsLocked()) {
+          if (stopping_) {
+            return;
+          }
+          queue_cv_.wait(lock);
+        }
+        while (true) {
+          const auto oldest = OldestTargetLocked();
+          const auto ready_at = oldest.second + wait_duration;
+          const auto now = Clock::now();
+          if (now >= ready_at || stopping_) {
+            target = oldest.first;
+            batch = PopBatchLocked(target);
+            break;
+          }
+          queue_cv_.wait_until(lock, ready_at);
+          if (!HasQueuedRequestsLocked()) {
+            break;
+          }
+        }
+      }
+      if (!batch.empty()) {
+        ExecuteBatch(facade, target, batch);
+      }
+    }
+  }
+
+  Config cfg_;
+  mutable std::mutex metrics_mutex_;
+  Metrics metrics_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::map<Target, std::deque<PendingPtr>> queues_;
+  bool stopping_ = false;
+  std::atomic<uint64_t> next_subrequest_id_{1};
+  std::vector<std::unique_ptr<CephFacade>> facades_;
+  std::vector<std::thread> workers_;
+};
+
 size_t element_size_for_kind(uint32_t vector_kind) {
   return vector_kind == ghnsw::kVectorKindF32 ? sizeof(float) : sizeof(uint8_t);
 }
@@ -2539,10 +2931,16 @@ class Coordinator {
 
  private:
   struct UpdateContext {
-    explicit UpdateContext(CephFacade& ceph_ref, uint64_t seed)
-        : ceph(ceph_ref), rng(seed) {}
+    explicit UpdateContext(
+        CephFacade& ceph_ref,
+        DistanceReadExecutor* distance_executor_ref,
+        uint64_t seed)
+        : ceph(ceph_ref),
+          distance_executor(distance_executor_ref),
+          rng(seed) {}
 
     CephFacade& ceph;
+    DistanceReadExecutor* distance_executor = nullptr;
     Metrics metrics;
     std::mt19937_64 rng;
     std::vector<AdjacencyBlob> pending_patches;
@@ -2626,6 +3024,10 @@ class Coordinator {
 	    std::mutex progress_mu;
 	    std::vector<std::thread> threads;
 	    threads.reserve(cfg_.update_parallelism);
+    std::unique_ptr<DistanceReadExecutor> distance_executor;
+    if (cfg_.distance_microbatch) {
+      distance_executor = std::make_unique<DistanceReadExecutor>(cfg_);
+    }
 
 	    auto worker = [&](uint32_t tid) {
 	      CephFacade worker_ceph(cfg_);
@@ -2641,7 +3043,11 @@ class Coordinator {
 	        stop.store(true, std::memory_order_relaxed);
 	        return;
 	      }
-	      UpdateContext ctx(worker_ceph, static_cast<uint64_t>(cfg_.seed) + 0x9e3779b97f4a7c15ULL * (tid + 1));
+      UpdateContext ctx(
+          worker_ceph,
+          distance_executor.get(),
+          static_cast<uint64_t>(cfg_.seed) +
+              0x9e3779b97f4a7c15ULL * (tid + 1));
       ctx.metrics.mode = "update";
       ctx.metrics.time_limit_seconds = cfg_.time_limit_seconds;
       ctx.metrics.update_parallelism = cfg_.update_parallelism;
@@ -2750,6 +3156,10 @@ class Coordinator {
     for (auto& thread : threads) {
       thread.join();
     }
+    if (distance_executor) {
+      distance_executor->Shutdown();
+      merge_update_metrics(&metrics_, distance_executor->SnapshotMetrics());
+    }
     if (first_error) {
       std::rethrow_exception(first_error);
     }
@@ -2801,6 +3211,31 @@ class Coordinator {
 
   std::unordered_map<uint64_t, float> DistanceToMany(
       UpdateContext& ctx, const std::string& query, const std::vector<uint64_t>& ids) {
+    if (ctx.distance_executor != nullptr) {
+      std::map<std::pair<uint32_t, uint64_t>, std::vector<uint64_t>> groups;
+      for (uint64_t id : ids) {
+        const auto location = ctx.ceph.Resolve(id);
+        groups[{location.shard_id, location.chunk_id}].push_back(id);
+      }
+      struct PendingResult {
+        DistanceReadExecutor::Future future;
+      };
+      std::vector<PendingResult> pending;
+      pending.reserve(groups.size());
+      for (const auto& [target, target_ids] : groups) {
+        ctx.ceph.ObserveDistanceTarget(target.first, target.second, &ctx.metrics);
+        pending.push_back({ctx.distance_executor->Submit(
+            target.first, target.second, query, target_ids)});
+      }
+      const double wait_t0 = now_sec();
+      std::unordered_map<uint64_t, float> result;
+      for (auto& request : pending) {
+        auto values = request.future.get();
+        result.insert(values.distances.begin(), values.distances.end());
+      }
+      ctx.metrics.remote_distance_seconds += now_sec() - wait_t0;
+      return result;
+    }
     return ctx.ceph.Distances(query, ids, &ctx.metrics);
   }
 
@@ -3571,6 +4006,18 @@ class Coordinator {
         << (cfg_.distance_split_probe ? "true" : "false") << ",\n";
     out << "  \"distance_probe_interval_seconds\": "
         << cfg_.distance_probe_interval_seconds << ",\n";
+    out << "  \"distance_microbatch\": "
+        << (cfg_.distance_microbatch ? "true" : "false") << ",\n";
+    out << "  \"distance_microbatch_wait_us\": "
+        << cfg_.distance_microbatch_wait_us << ",\n";
+    out << "  \"distance_microbatch_max_bytes\": "
+        << cfg_.distance_microbatch_max_bytes << ",\n";
+    out << "  \"distance_microbatch_max_candidates\": "
+        << cfg_.distance_microbatch_max_candidates << ",\n";
+    out << "  \"distance_microbatch_max_subrequests\": "
+        << cfg_.distance_microbatch_max_subrequests << ",\n";
+    out << "  \"distance_executor_threads\": "
+        << cfg_.distance_executor_threads << ",\n";
     out << "  \"vectors_processed\": " << metrics_.vectors_processed << ",\n";
     out << "  \"load_seconds\": " << metrics_.load_seconds << ",\n";
     out << "  \"graph_seconds\": " << metrics_.graph_seconds << ",\n";
@@ -3797,6 +4244,65 @@ class Coordinator {
                       static_cast<double>(metrics_.distance_candidates_before_dedupe)
                 : 0.0)
         << ",\n";
+    out << "    \"distance_logical_subrequests\": "
+        << metrics_.distance_logical_subrequests << ",\n";
+    out << "    \"distance_multi_query_rpcs\": "
+        << metrics_.distance_multi_query_rpcs << ",\n";
+    out << "    \"distance_multi_query_subrequests\": "
+        << metrics_.distance_multi_query_subrequests << ",\n";
+    out << "    \"distance_subrequests_per_rpc\": "
+        << (metrics_.distance_multi_query_rpcs > 0
+                ? static_cast<double>(metrics_.distance_multi_query_subrequests) /
+                      static_cast<double>(metrics_.distance_multi_query_rpcs)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_queries_per_rpc\": "
+        << (metrics_.distance_multi_query_rpcs > 0
+                ? static_cast<double>(metrics_.distance_multi_query_subrequests) /
+                      static_cast<double>(metrics_.distance_multi_query_rpcs)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_multi_query_rpcs_per_update_attempt\": "
+        << per_attempt(metrics_.distance_multi_query_rpcs) << ",\n";
+    out << "    \"max_distance_subrequests_per_rpc\": "
+        << metrics_.max_distance_subrequests_per_rpc << ",\n";
+    out << "    \"distance_candidates_per_subrequest\": "
+        << (metrics_.distance_multi_query_subrequests > 0
+                ? static_cast<double>(metrics_.distance_multi_query_candidates) /
+                      static_cast<double>(metrics_.distance_multi_query_subrequests)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_unique_candidates_per_rpc\": "
+        << (metrics_.distance_multi_query_rpcs > 0
+                ? static_cast<double>(metrics_.distance_multi_query_unique_candidates) /
+                      static_cast<double>(metrics_.distance_multi_query_rpcs)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_candidate_reuse_ratio\": "
+        << (metrics_.distance_multi_query_candidates > 0
+                ? 1.0 - static_cast<double>(
+                            metrics_.distance_multi_query_unique_candidates) /
+                            static_cast<double>(
+                                metrics_.distance_multi_query_candidates)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_microbatch_queue_ms_per_subrequest\": "
+        << (metrics_.distance_multi_query_subrequests > 0
+                ? metrics_.distance_microbatch_queue_seconds * 1000.0 /
+                      static_cast<double>(metrics_.distance_multi_query_subrequests)
+                : 0.0)
+        << ",\n";
+    out << "    \"distance_subrequests_per_rpc_histogram\": {";
+    bool first_distance_subrequests = true;
+    for (const auto& [subrequests, count] :
+         metrics_.distance_subrequests_per_rpc_histogram) {
+      if (!first_distance_subrequests) {
+        out << ", ";
+      }
+      first_distance_subrequests = false;
+      out << "\"" << subrequests << "\": " << count;
+    }
+    out << "},\n";
     out << "    \"avg_unique_data_objects_per_update_attempt\": "
         << per_attempt(metrics_.unique_data_objects_sum) << ",\n";
     out << "    \"max_unique_data_objects_per_update_attempt\": "
@@ -3971,11 +4477,23 @@ class Coordinator {
         << (cfg_.distance_split_probe ? "true" : "false") << ",\n";
     out << "  \"distance_probe_interval_seconds\": "
         << cfg_.distance_probe_interval_seconds << ",\n";
+    out << "  \"distance_microbatch\": "
+        << (cfg_.distance_microbatch ? "true" : "false") << ",\n";
+    out << "  \"distance_microbatch_wait_us\": "
+        << cfg_.distance_microbatch_wait_us << ",\n";
+    out << "  \"distance_microbatch_max_subrequests\": "
+        << cfg_.distance_microbatch_max_subrequests << ",\n";
+    out << "  \"distance_executor_threads\": "
+        << cfg_.distance_executor_threads << ",\n";
     out << "  \"remote_adj_calls\": " << metrics_.remote_adj_calls << ",\n";
     out << "  \"remote_distance_calls\": " << metrics_.remote_distance_calls << ",\n";
     out << "  \"remote_noop_calls\": " << metrics_.remote_noop_calls << ",\n";
     out << "  \"remote_patch_calls\": " << metrics_.remote_patch_calls << ",\n";
     out << "  \"remote_candidates_scored\": " << metrics_.remote_candidates_scored << ",\n";
+    out << "  \"distance_multi_query_rpcs\": "
+        << metrics_.distance_multi_query_rpcs << ",\n";
+    out << "  \"distance_multi_query_subrequests\": "
+        << metrics_.distance_multi_query_subrequests << ",\n";
     out << "  \"remote_adj_nodes\": " << metrics_.remote_adj_nodes << ",\n";
     out << "  \"total_patched_nodes\": " << metrics_.total_patched_nodes << ",\n";
     out << "  \"total_neighbor_links\": " << metrics_.total_neighbor_links << ",\n";
@@ -4117,6 +4635,38 @@ Config ParseArgs(int argc, const char** argv) {
         throw std::runtime_error(
             "--frontier-min-batch-savings-ratio must be in [0, 1]");
       }
+    } else if (arg == "--distance-microbatch") {
+      cfg.distance_microbatch = true;
+    } else if (arg == "--distance-microbatch-wait-us") {
+      cfg.distance_microbatch_wait_us = static_cast<uint32_t>(
+          std::stoul(next("--distance-microbatch-wait-us")));
+    } else if (arg == "--distance-microbatch-max-bytes") {
+      cfg.distance_microbatch_max_bytes =
+          std::stoull(next("--distance-microbatch-max-bytes"));
+      if (cfg.distance_microbatch_max_bytes == 0) {
+        throw std::runtime_error(
+            "--distance-microbatch-max-bytes must be >= 1");
+      }
+    } else if (arg == "--distance-microbatch-max-candidates") {
+      cfg.distance_microbatch_max_candidates = static_cast<uint32_t>(
+          std::stoul(next("--distance-microbatch-max-candidates")));
+      if (cfg.distance_microbatch_max_candidates == 0) {
+        throw std::runtime_error(
+            "--distance-microbatch-max-candidates must be >= 1");
+      }
+    } else if (arg == "--distance-microbatch-max-subrequests") {
+      cfg.distance_microbatch_max_subrequests = static_cast<uint32_t>(
+          std::stoul(next("--distance-microbatch-max-subrequests")));
+      if (cfg.distance_microbatch_max_subrequests == 0) {
+        throw std::runtime_error(
+            "--distance-microbatch-max-subrequests must be >= 1");
+      }
+    } else if (arg == "--distance-executor-threads") {
+      cfg.distance_executor_threads = static_cast<uint32_t>(
+          std::stoul(next("--distance-executor-threads")));
+      if (cfg.distance_executor_threads == 0) {
+        throw std::runtime_error("--distance-executor-threads must be >= 1");
+      }
     } else if (arg == "--osd-op-timeout-seconds") {
       cfg.osd_op_timeout_seconds =
           static_cast<uint32_t>(std::stoul(next("--osd-op-timeout-seconds")));
@@ -4131,6 +4681,13 @@ Config ParseArgs(int argc, const char** argv) {
   if (cfg.frontier_adaptive && cfg.frontier_window < 2) {
     throw std::runtime_error(
         "--frontier-adaptive requires --frontier-window >= 2");
+  }
+  if (cfg.distance_microbatch && cfg.distance_mode != "osd") {
+    throw std::runtime_error(
+        "--distance-microbatch requires --distance-mode osd");
+  }
+  if (cfg.distance_microbatch && cfg.mode != "update") {
+    throw std::runtime_error("--distance-microbatch requires --mode update");
   }
   return cfg;
 }

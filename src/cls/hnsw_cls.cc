@@ -56,6 +56,9 @@ constexpr const char* kMetaEf = "meta/ef";
 constexpr const char* kMetaDim = "meta/dim";
 constexpr const char* kMetaVectorKind = "meta/vector_kind";
 constexpr const char* kMetaMetric = "meta/metric";
+constexpr uint64_t kMaxMultiQuerySubrequests = 1024;
+constexpr uint64_t kMaxMultiQueryCandidates = 65536;
+constexpr uint64_t kMaxMultiQueryQueryBytes = 64 * 1024 * 1024;
 
 thread_local RequestEnvelope current_request_envelope;
 
@@ -590,10 +593,26 @@ int cls_distance_multi_query_batch(
   if (r < 0) {
     return r;
   }
+  if (request.subrequests.empty() ||
+      request.subrequests.size() > kMaxMultiQuerySubrequests) {
+    return -E2BIG;
+  }
 
   DistanceMultiQueryBatchReply reply;
   std::set<uint64_t> unique_ids;
+  std::set<uint64_t> subrequest_ids;
+  uint64_t logical_candidates = 0;
+  uint64_t query_bytes = 0;
   for (const auto& subrequest : request.subrequests) {
+    if (!subrequest_ids.insert(subrequest.subrequest_id).second) {
+      return -EINVAL;
+    }
+    logical_candidates += subrequest.global_ids.size();
+    query_bytes += subrequest.query_vector.size();
+    if (logical_candidates > kMaxMultiQueryCandidates ||
+        query_bytes > kMaxMultiQueryQueryBytes) {
+      return -E2BIG;
+    }
     if (valid_distance_subrequest(subrequest)) {
       unique_ids.insert(
           subrequest.global_ids.begin(), subrequest.global_ids.end());

@@ -19,6 +19,12 @@ frontier_adaptive=${FRONTIER_ADAPTIVE:-false}
 frontier_slack_fraction=${FRONTIER_SLACK_FRACTION:-0.25}
 frontier_candidate_budget=${FRONTIER_CANDIDATE_BUDGET:-0.20}
 frontier_min_batch_savings_ratio=${FRONTIER_MIN_BATCH_SAVINGS_RATIO:-0.25}
+distance_microbatch=${DISTANCE_MICROBATCH:-false}
+distance_microbatch_wait_us=${DISTANCE_MICROBATCH_WAIT_US:-100}
+distance_microbatch_max_bytes=${DISTANCE_MICROBATCH_MAX_BYTES:-262144}
+distance_microbatch_max_candidates=${DISTANCE_MICROBATCH_MAX_CANDIDATES:-256}
+distance_microbatch_max_subrequests=${DISTANCE_MICROBATCH_MAX_SUBREQUESTS:-32}
+distance_executor_threads=${DISTANCE_EXECUTOR_THREADS:-5}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
 semantic_samples=${SEMANTIC_SAMPLES:-256}
 semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
@@ -50,6 +56,30 @@ if [[ "$frontier_adaptive" == true && "$frontier_window" -lt 2 ]]; then
   echo "FRONTIER_ADAPTIVE=true requires FRONTIER_WINDOW >= 2." >&2
   exit 2
 fi
+[[ "$distance_microbatch" == true || "$distance_microbatch" == false ]] || {
+  echo "DISTANCE_MICROBATCH must be true or false." >&2
+  exit 2
+}
+[[ "$distance_microbatch_wait_us" =~ ^[0-9]+$ ]] || {
+  echo "DISTANCE_MICROBATCH_WAIT_US must be non-negative." >&2
+  exit 2
+}
+[[ "$distance_microbatch_max_bytes" =~ ^[1-9][0-9]*$ ]] || {
+  echo "DISTANCE_MICROBATCH_MAX_BYTES must be positive." >&2
+  exit 2
+}
+[[ "$distance_microbatch_max_candidates" =~ ^[1-9][0-9]*$ ]] || {
+  echo "DISTANCE_MICROBATCH_MAX_CANDIDATES must be positive." >&2
+  exit 2
+}
+[[ "$distance_microbatch_max_subrequests" =~ ^[1-9][0-9]*$ ]] || {
+  echo "DISTANCE_MICROBATCH_MAX_SUBREQUESTS must be positive." >&2
+  exit 2
+}
+[[ "$distance_executor_threads" =~ ^[1-9][0-9]*$ ]] || {
+  echo "DISTANCE_EXECUTOR_THREADS must be positive." >&2
+  exit 2
+}
 [[ "$checker_batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "CHECKER_BATCH_SIZE must be positive." >&2; exit 2; }
 [[ "$semantic_samples" =~ ^[1-9][0-9]*$ ]] || { echo "SEMANTIC_SAMPLES must be positive." >&2; exit 2; }
 python3 - "$semantic_min_edge_win_rate" <<'PY'
@@ -98,6 +128,10 @@ for mode in "${requested_modes[@]}"; do
     *) echo "Unsupported mode in MODES: $mode" >&2; exit 2 ;;
   esac
 done
+if [[ "$distance_microbatch" == true && "$has_compute" == true ]]; then
+  echo "DISTANCE_MICROBATCH=true requires an OSD-only MODES list." >&2
+  exit 2
+fi
 
 frontier_args=(
   --frontier-window "$frontier_window"
@@ -107,6 +141,18 @@ frontier_args=(
 )
 if [[ "$frontier_adaptive" == true ]]; then
   frontier_args+=(--frontier-adaptive)
+fi
+
+distance_microbatch_args=()
+if [[ "$distance_microbatch" == true ]]; then
+  distance_microbatch_args=(
+    --distance-microbatch
+    --distance-microbatch-wait-us "$distance_microbatch_wait_us"
+    --distance-microbatch-max-bytes "$distance_microbatch_max_bytes"
+    --distance-microbatch-max-candidates "$distance_microbatch_max_candidates"
+    --distance-microbatch-max-subrequests "$distance_microbatch_max_subrequests"
+    --distance-executor-threads "$distance_executor_threads"
+  )
 fi
 
 wait_for_clean_cluster() {
@@ -173,13 +219,14 @@ record_placement() {
 
 validate_run() {
   local mode=$1 update_json=$2 check_json=$3
-  python3 - "$mode" "$update_json" "$check_json" <<'PY'
+  python3 - "$mode" "$distance_microbatch" "$update_json" "$check_json" <<'PY'
 import json
 import sys
 
 mode = sys.argv[1]
-update = json.load(open(sys.argv[2], encoding="utf-8"))
-check = json.load(open(sys.argv[3], encoding="utf-8"))
+expect_microbatch = sys.argv[2] == "true"
+update = json.load(open(sys.argv[3], encoding="utf-8"))
+check = json.load(open(sys.argv[4], encoding="utf-8"))
 quality = update.get("quality", {})
 observability = update.get("observability", {})
 summary = {
@@ -213,6 +260,13 @@ elif mode == "osd":
         raise SystemExit("OSD mode did not report CLS access")
     if not observability.get("total_cls_exec_calls", 0):
         raise SystemExit("OSD mode made no CLS calls")
+if update.get("distance_microbatch") != expect_microbatch:
+    raise SystemExit("distance microbatch mode mismatch")
+if expect_microbatch:
+    if not observability.get("distance_multi_query_rpcs", 0):
+        raise SystemExit("distance microbatch made no multi-query RPCs")
+    if not observability.get("distance_multi_query_subrequests", 0):
+        raise SystemExit("distance microbatch processed no logical subrequests")
 if update["failed_updates"] != 0 or check["status"] != "pass":
     raise SystemExit(1)
 if not quality.get("ground_truth_enabled"):
@@ -264,6 +318,12 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "frontier_slack_fraction=$frontier_slack_fraction"
   echo "frontier_candidate_budget=$frontier_candidate_budget"
   echo "frontier_min_batch_savings_ratio=$frontier_min_batch_savings_ratio"
+  echo "distance_microbatch=$distance_microbatch"
+  echo "distance_microbatch_wait_us=$distance_microbatch_wait_us"
+  echo "distance_microbatch_max_bytes=$distance_microbatch_max_bytes"
+  echo "distance_microbatch_max_candidates=$distance_microbatch_max_candidates"
+  echo "distance_microbatch_max_subrequests=$distance_microbatch_max_subrequests"
+  echo "distance_executor_threads=$distance_executor_threads"
   echo "checker_batch_size=$checker_batch_size"
   echo "semantic_samples=$semantic_samples"
   echo "semantic_min_edge_win_rate=$semantic_min_edge_win_rate"
@@ -312,6 +372,7 @@ for repetition in $(seq 1 "$repetitions"); do
         --points-per-object "$ppo" --distance-mode "$mode" --distance-split-probe \
         --distance-probe-interval-ms 1000 --time-limit-seconds "$window_seconds" \
         --update-parallelism "$parallelism" "${frontier_args[@]}" \
+        "${distance_microbatch_args[@]}" \
         --osd-op-timeout-seconds "$osd_op_timeout_seconds" \
         --osd-op-retry-limit "$osd_op_retry_limit" \
         --metrics-out "$output/update.json" --progress-out "$output/update.progress.json"
