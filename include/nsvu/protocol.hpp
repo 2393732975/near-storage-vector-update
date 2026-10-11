@@ -37,6 +37,7 @@ enum class Opcode : uint32_t {
   kReserveInsertId = 13,
   kFinalizeInsert = 14,
   kCasGlobalMeta = 15,
+  kDistanceMultiQueryBatch = 16,
 };
 
 struct RequestEnvelope {
@@ -501,6 +502,112 @@ struct DistanceBatchReply {
       payload_read_seconds = 0.0;
       compute_seconds = 0.0;
     }
+  }
+};
+
+struct DistanceMultiQuerySubrequest {
+  uint64_t subrequest_id = 0;
+  std::string query_vector;
+  uint32_t dim = 0;
+  uint32_t vector_kind = kVectorKindU8;
+  uint32_t metric = kMetricL2;
+  std::vector<uint64_t> global_ids;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(subrequest_id, bl);
+    ceph::encode(query_vector, bl);
+    ceph::encode(dim, bl);
+    ceph::encode(vector_kind, bl);
+    ceph::encode(metric, bl);
+    ceph::encode(global_ids, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(subrequest_id, it);
+    ceph::decode(query_vector, it);
+    ceph::decode(dim, it);
+    ceph::decode(vector_kind, it);
+    ceph::decode(metric, it);
+    ceph::decode(global_ids, it);
+  }
+};
+
+struct DistanceMultiQueryBatchRequest {
+  std::vector<DistanceMultiQuerySubrequest> subrequests;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(static_cast<uint32_t>(subrequests.size()), bl);
+    for (const auto& subrequest : subrequests) {
+      subrequest.encode(bl);
+    }
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    uint32_t count = 0;
+    ceph::decode(count, it);
+    subrequests.clear();
+    subrequests.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      DistanceMultiQuerySubrequest subrequest;
+      subrequest.decode(it);
+      subrequests.push_back(std::move(subrequest));
+    }
+  }
+};
+
+struct DistanceMultiQuerySubreply {
+  uint64_t subrequest_id = 0;
+  int32_t status = 0;
+  std::vector<std::pair<uint64_t, float>> distances;
+  double compute_seconds = 0.0;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(subrequest_id, bl);
+    ceph::encode(status, bl);
+    ceph::encode(distances, bl);
+    ceph::encode(compute_seconds, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(subrequest_id, it);
+    ceph::decode(status, it);
+    ceph::decode(distances, it);
+    ceph::decode(compute_seconds, it);
+  }
+};
+
+struct DistanceMultiQueryBatchReply {
+  int32_t status = 0;
+  std::vector<DistanceMultiQuerySubreply> subreplies;
+  double cls_total_seconds = 0.0;
+  double vector_ref_seconds = 0.0;
+  double payload_read_seconds = 0.0;
+
+  void encode(ceph::buffer::list& bl) const {
+    ceph::encode(status, bl);
+    ceph::encode(static_cast<uint32_t>(subreplies.size()), bl);
+    for (const auto& subreply : subreplies) {
+      subreply.encode(bl);
+    }
+    ceph::encode(cls_total_seconds, bl);
+    ceph::encode(vector_ref_seconds, bl);
+    ceph::encode(payload_read_seconds, bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& it) {
+    ceph::decode(status, it);
+    uint32_t count = 0;
+    ceph::decode(count, it);
+    subreplies.clear();
+    subreplies.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      DistanceMultiQuerySubreply subreply;
+      subreply.decode(it);
+      subreplies.push_back(std::move(subreply));
+    }
+    ceph::decode(cls_total_seconds, it);
+    ceph::decode(vector_ref_seconds, it);
+    ceph::decode(payload_read_seconds, it);
   }
 };
 

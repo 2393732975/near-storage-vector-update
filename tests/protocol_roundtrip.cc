@@ -202,6 +202,73 @@ void TestRequestEnvelope() {
   Require(decoded_response.count == 3, "response payload did not round-trip");
 }
 
+void TestDistanceMultiQueryBatch() {
+  ghnsw::DistanceMultiQueryBatchRequest request;
+  ghnsw::DistanceMultiQuerySubrequest first;
+  first.subrequest_id = 41;
+  first.query_vector = std::string(8, '\x01');
+  first.dim = 8;
+  first.vector_kind = ghnsw::kVectorKindU8;
+  first.metric = ghnsw::kMetricL2;
+  first.global_ids = {11, 13};
+  ghnsw::DistanceMultiQuerySubrequest second = first;
+  second.subrequest_id = 43;
+  second.query_vector = std::string(8, '\x02');
+  second.global_ids = {13, 17};
+  request.subrequests = {first, second};
+
+  ghnsw::RequestEnvelope envelope;
+  envelope.opcode =
+      static_cast<uint32_t>(ghnsw::Opcode::kDistanceMultiQueryBatch);
+  envelope.request_id = 47;
+  const ceph::bufferlist encoded = ghnsw::EncodeRequest(envelope, request);
+  ghnsw::RequestEnvelope decoded_envelope;
+  ghnsw::DistanceMultiQueryBatchRequest decoded;
+  Require(
+      ghnsw::DecodeRequest(
+          encoded,
+          ghnsw::Opcode::kDistanceMultiQueryBatch,
+          &decoded_envelope,
+          &decoded) == 0,
+      "multi-query request did not decode");
+  Require(decoded.subrequests.size() == 2, "multi-query request count changed");
+  Require(
+      decoded.subrequests[0].subrequest_id == first.subrequest_id &&
+          decoded.subrequests[0].global_ids == first.global_ids &&
+          decoded.subrequests[1].query_vector == second.query_vector,
+      "multi-query request payload changed");
+
+  ghnsw::DistanceMultiQueryBatchReply reply;
+  ghnsw::DistanceMultiQuerySubreply first_reply;
+  first_reply.subrequest_id = first.subrequest_id;
+  first_reply.distances = {{11, 1.5F}, {13, 2.5F}};
+  first_reply.compute_seconds = 0.001;
+  ghnsw::DistanceMultiQuerySubreply second_reply;
+  second_reply.subrequest_id = second.subrequest_id;
+  second_reply.status = -EINVAL;
+  reply.subreplies = {first_reply, second_reply};
+  reply.cls_total_seconds = 0.004;
+  reply.vector_ref_seconds = 0.001;
+  reply.payload_read_seconds = 0.002;
+
+  const ceph::bufferlist encoded_reply =
+      ghnsw::EncodeResponse(envelope, reply);
+  ghnsw::DistanceMultiQueryBatchReply decoded_reply;
+  Require(
+      ghnsw::DecodeResponse(
+          encoded_reply,
+          ghnsw::Opcode::kDistanceMultiQueryBatch,
+          &decoded_envelope,
+          &decoded_reply) == 0,
+      "multi-query reply did not decode");
+  Require(decoded_reply.subreplies.size() == 2,
+          "multi-query reply count changed");
+  Require(decoded_reply.subreplies[0].distances == first_reply.distances,
+          "multi-query distances changed");
+  Require(decoded_reply.subreplies[1].status == -EINVAL,
+          "multi-query subrequest status changed");
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +278,7 @@ int main() {
     TestVectorRef();
     TestCasLabel();
     TestRequestEnvelope();
+    TestDistanceMultiQueryBatch();
     std::cout << "protocol round-trip tests passed\n";
     return 0;
   } catch (const std::exception& error) {

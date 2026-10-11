@@ -20,6 +20,9 @@ using ghnsw::CasGlobalMetaRequest;
 using ghnsw::CasLabelRequest;
 using ghnsw::DistanceBatchReply;
 using ghnsw::DistanceBatchRequest;
+using ghnsw::DistanceMultiQueryBatchReply;
+using ghnsw::DistanceMultiQueryBatchRequest;
+using ghnsw::DistanceMultiQuerySubreply;
 using ghnsw::EdgePatchBatchRequest;
 using ghnsw::EmptyRequest;
 using ghnsw::FinalizeInsertRequest;
@@ -560,6 +563,122 @@ int cls_distance_to_local_batch(
   return 0;
 }
 
+bool valid_distance_subrequest(
+    const ghnsw::DistanceMultiQuerySubrequest& request) {
+  if (request.subrequest_id == 0 || request.dim == 0) {
+    return false;
+  }
+  uint64_t expected_bytes = 0;
+  if (request.vector_kind == ghnsw::kVectorKindU8 &&
+      request.metric == ghnsw::kMetricL2) {
+    expected_bytes = request.dim;
+  } else if (request.vector_kind == ghnsw::kVectorKindF32 &&
+             (request.metric == ghnsw::kMetricL2 ||
+              request.metric == ghnsw::kMetricIP)) {
+    expected_bytes = static_cast<uint64_t>(request.dim) * sizeof(float);
+  } else {
+    return false;
+  }
+  return request.query_vector.size() == expected_bytes;
+}
+
+int cls_distance_multi_query_batch(
+    cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  const double cls_total_t0 = cls_now_sec();
+  DistanceMultiQueryBatchRequest request;
+  int r = decode_msg(in, Opcode::kDistanceMultiQueryBatch, &request);
+  if (r < 0) {
+    return r;
+  }
+
+  DistanceMultiQueryBatchReply reply;
+  std::set<uint64_t> unique_ids;
+  for (const auto& subrequest : request.subrequests) {
+    if (valid_distance_subrequest(subrequest)) {
+      unique_ids.insert(
+          subrequest.global_ids.begin(), subrequest.global_ids.end());
+    }
+  }
+
+  std::map<uint64_t, std::string> vectors;
+  for (uint64_t id : unique_ids) {
+    VectorRef ref;
+    double t0 = cls_now_sec();
+    r = read_vector_ref(hctx, id, &ref);
+    reply.vector_ref_seconds += cls_now_sec() - t0;
+    if (r == -ENOENT) {
+      continue;
+    }
+    if (r < 0) {
+      reply.status = r;
+      reply.cls_total_seconds = cls_now_sec() - cls_total_t0;
+      encode_msg(reply, out);
+      return r;
+    }
+    ceph::bufferlist payload;
+    t0 = cls_now_sec();
+    r = cls_cxx_read2(
+        hctx,
+        static_cast<int>(ref.offset),
+        static_cast<int>(ref.bytes),
+        &payload,
+        0);
+    reply.payload_read_seconds += cls_now_sec() - t0;
+    if (r < 0) {
+      reply.status = r;
+      reply.cls_total_seconds = cls_now_sec() - cls_total_t0;
+      encode_msg(reply, out);
+      return r;
+    }
+    vectors.emplace(id, std::string(payload.c_str(), payload.length()));
+  }
+
+  reply.subreplies.reserve(request.subrequests.size());
+  for (const auto& subrequest : request.subrequests) {
+    DistanceMultiQuerySubreply subreply;
+    subreply.subrequest_id = subrequest.subrequest_id;
+    if (!valid_distance_subrequest(subrequest)) {
+      subreply.status = -EINVAL;
+      reply.subreplies.push_back(std::move(subreply));
+      continue;
+    }
+    bool schema_mismatch = false;
+    for (uint64_t id : subrequest.global_ids) {
+      const auto found = vectors.find(id);
+      if (found != vectors.end() &&
+          found->second.size() != subrequest.query_vector.size()) {
+        schema_mismatch = true;
+        break;
+      }
+    }
+    if (schema_mismatch) {
+      subreply.status = -EINVAL;
+      reply.subreplies.push_back(std::move(subreply));
+      continue;
+    }
+    const double compute_t0 = cls_now_sec();
+    for (uint64_t id : subrequest.global_ids) {
+      const auto found = vectors.find(id);
+      if (found == vectors.end()) {
+        continue;
+      }
+      subreply.distances.emplace_back(
+          id,
+          compute_distance(
+              subrequest.query_vector,
+              found->second,
+              subrequest.dim,
+              subrequest.vector_kind,
+              subrequest.metric));
+    }
+    subreply.compute_seconds = cls_now_sec() - compute_t0;
+    reply.subreplies.push_back(std::move(subreply));
+  }
+  reply.cls_total_seconds = cls_now_sec() - cls_total_t0;
+  encode_msg(reply, out);
+  return 0;
+}
+
 int cls_timed_noop(
     cls_method_context_t, ceph::bufferlist* in, ceph::bufferlist* out) {
   const double t0 = cls_now_sec();
@@ -871,6 +990,7 @@ CLS_INIT(hnsw_global) {
   cls_method_handle_t h_lookup_label_batch;
   cls_method_handle_t h_get_node_adjacency_batch;
   cls_method_handle_t h_distance_to_local_batch;
+  cls_method_handle_t h_distance_multi_query_batch;
   cls_method_handle_t h_timed_noop;
   cls_method_handle_t h_set_adjacency_batch;
   cls_method_handle_t h_apply_edge_patch_batch;
@@ -919,6 +1039,12 @@ CLS_INIT(hnsw_global) {
       CLS_METHOD_RD,
       cls_distance_to_local_batch,
       &h_distance_to_local_batch);
+  cls_register_cxx_method(
+      h_class,
+      "distance_multi_query_batch",
+      CLS_METHOD_RD,
+      cls_distance_multi_query_batch,
+      &h_distance_multi_query_batch);
   cls_register_cxx_method(
       h_class,
       "timed_noop",
