@@ -14,6 +14,7 @@
 - [阶段 2 协议与路由抽象验收报告](reports/phase2-protocol-routing-validation-2026-09-30.md)：schema v1 滚动部署、GIST1M smoke、指标闭合与幂等重放验证。
 - [阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)：四数据集三轮 OSD-only 复测、与阶段 1 OSD 的性能对比及具体代码改动。
 - [阶段 3 Frontier 聚合可行性报告](reports/phase3-frontier-feasibility-report-2026-10-10.md)：固定窗口与自适应窗口的 GIST1M 验证、失败根因和停止结论。
+- [阶段 5A 只读执行器可行性报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)：同提交 M2 与四个等待窗口的 GIST1M 对照、异步收益来源和后续并行度门禁。
 - [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)：PPT 背景数据移动实验的零失败复现结果。
 
 ## 参考材料

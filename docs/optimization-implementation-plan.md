@@ -396,7 +396,7 @@ intent/saga 退出条件满足后才能启用。异步化的目标是重叠独�
 返回码。不同对象仍是独立请求；发生局部冲突只重放对应项目。new adjacency、
 label CAS 和生命周期切换不为追求批量而破坏 saga 顺序。
 
-### 8.3 阶段 5A 实施状态与门禁（2026-10-11）
+### 8.3 阶段 5A 实施状态与门禁（2026-10-12）
 
 阶段 3 已证明同步 frontier 扩窗不能稳定降低延迟，因此先实现不改变搜索语义的
 只读执行器。当前实现新增 `distance_multi_query_batch` 只读 CLS 方法和共享
@@ -417,6 +417,25 @@ RPC 大于 0；然后在同一提交上对 M2 控制组和 50/100/250/500 μs �
 5%、静态 Recall 与语义检查通过。`subrequests/RPC` 必须如实报告；如果它接近 1
 但延迟改善，结论只能归因于独立对象异步重叠，不能宣称跨 update 合批成功。若
 平均延迟无收益或 P99 恶化，则关闭 Stage 5A 默认开关并提前进入阶段 7 布局验证。
+
+### 8.4 阶段 5A 单轮可行性结果（2026-10-12）
+
+提交 `35f7f1f` 上完成同提交 M2 控制组和 50/100/250/500 μs 等待窗口的 GIST1M
+独立重导入对照。更新并发度固定为 4，执行器线程为 5。四个异步配置相对控制组的
+平均延迟降低 20.35%–23.19%，P99 降低 10.93%–17.23%，吞吐提高
+25.30%–30.01%；所有轮次零失败且 checker 通过。
+
+收益来自异步重叠而非充分合批：`subrequests/RPC` 仅 1.108–1.116，约 89% 的
+物理 RPC 只有一个子请求，候选读取复用率低于 0.11%。distance batches/update
+只下降 7.65%–8.90%，但距离 RTT/排队由 238.61 降至 123.38–133.28 ms/update。
+因此 5A 证明了只读异步执行器的方向可行，没有达到完整阶段 5 的调用数目标。
+
+250 μs 是唯一通过单轮共同 235-query Recall 门禁的候选值，差值为 -0.468 pp；
+其余窗口为 -0.638 至 -2.511 pp。等待窗口不改变搜索语义，这些差异必须通过独立
+重复和可复现调度复核，不能直接归因为算法退化，也不能忽略门禁。默认开关继续
+关闭。下一步先做 250 μs 至少三次重复，再扫描执行器线程 `1/2/5/10` 和更新并发
+度 `1/2/4/8`；通过后才运行四数据集正式实验。完整证据见
+[阶段 5A 只读执行器可行性报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)。
 
 完整阶段 5 的退出条件（不是 5A 只读 feasibility gate）：全部 CLS calls/update
 相对 M2 的 501–747 降低至少 60%；patch calls/update 从约 14–17 降至 5 以下，
@@ -501,9 +520,10 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | M0 已完成 | 正确性检查、失败分类、幂等重放 | 最新 24/24 轮复验通过 |
 | M1 已完成 | C0/B0 严格 A/B、Recall、调用/字节/阶段指标 | 四数据集各三次独立重复 |
 | M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
-| M3 进行中 | 自适应 level-0 frontier、按对象 batch distance | 先通过 GIST feasibility gate，再定正式降幅 |
-| M4 恢复协议 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
-| M5 执行器 | 异步 RemoteExecutor、写微批 | calls/patch/P99 达标 |
+| M3 已关闭（负结论） | 自适应 level-0 frontier、按对象 batch distance | 同步扩窗门禁失败，默认关闭 |
+| M4 未开始 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
+| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 单轮 GIST 性能门禁通过，待重复与并行度消融 |
+| M5B 被 M4 阻塞 | 幂等邻接写微批 | M4 通过后验证 calls/patch/P99 |
 | M6 拥塞控制 | per-target AIMD 与 deadline flush | queue/P99 达标 |
 | M7 图感知布局 | locality group、bounded object layout | distance object fan-out 降低 ≥30% |
 | M8 集成评估 | B0–B5 消融、统计报告和图表 | 综合目标验证 |
@@ -522,13 +542,13 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 后续建议顺序如下：
 
 1. `53284fc feat(search): batch bounded frontier expansion`（已完成；固定 W 性能门禁失败）
-2. `feat(search): select frontier windows with a measured benefit budget`
-3. `test(search): gate adaptive windows against same-commit W1`
+2. `a96b608 feat(search): budget adaptive frontier expansion`（已完成；门禁失败）
+3. `2f7c60f fix(search): preserve adaptive frontier termination`（已完成）
 4. `feat(cls): fuse same-object frontier expansion`（仅在 Coordinator gate 通过后）
 5. `feat(metadata): persist recoverable update intents`
 6. `feat(recovery): replay incomplete vector updates`
-7. `feat(executor): submit per-object reads asynchronously`
-8. `feat(executor): microbatch independent query subrequests`
+7. `7640e80 feat(cls): add multi-query distance batches`（已完成）
+8. `da6ec8f feat(executor): batch asynchronous distance reads`（已完成；进入并行度消融）
 9. `feat(cls): batch idempotent edge patches`
 10. `feat(scheduler): adapt per-target concurrency`
 11. `feat(layout): place nodes in bounded locality groups`
