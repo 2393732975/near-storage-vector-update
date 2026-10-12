@@ -38,15 +38,35 @@ ensure_pool_placement() {
   "$ceph_cmd" "${ceph_args[@]}" pg map "$pgid"
 }
 
+ensure_single_pg_pool() {
+  local pool=$1 pg_num autoscale_mode
+  pg_num=$(
+    "$ceph_cmd" "${ceph_args[@]}" osd pool get "$pool" pg_num |
+      awk '$1 == "pg_num:" {print $2}'
+  )
+  autoscale_mode=$(
+    "$ceph_cmd" "${ceph_args[@]}" osd pool get "$pool" pg_autoscale_mode |
+      awk '$1 == "pg_autoscale_mode:" {print $2}'
+  )
+  if [[ "$pg_num" != "1" || "$autoscale_mode" != "off" ]]; then
+    echo "Invalid experiment pool geometry: $pool pg_num=$pg_num autoscale=$autoscale_mode" >&2
+    exit 1
+  fi
+}
+
 for pool in "$meta_pool" $(seq 0 $((owners - 1)) | sed "s#^#${prefix}#"); do
   if "$ceph_cmd" "${ceph_args[@]}" osd pool ls | grep -Fxq "$pool"; then
     "$ceph_cmd" "${ceph_args[@]}" osd pool rm "$pool" "$pool" --yes-i-really-really-mean-it
   fi
-  "$ceph_cmd" "${ceph_args[@]}" osd pool create "$pool" 1 1 replicated
+  # Disable autoscaling atomically with pool creation. Setting it afterward
+  # leaves a race in which the mgr can expand a freshly created one-PG pool.
+  "$ceph_cmd" "${ceph_args[@]}" osd pool create "$pool" 1 1 replicated \
+    --pg-num-min 1 --pg-num-max 1 --autoscale-mode off
   "$ceph_cmd" "${ceph_args[@]}" osd pool set "$pool" size 1 --yes-i-really-mean-it
   "$ceph_cmd" "${ceph_args[@]}" osd pool set "$pool" min_size 1
   "$ceph_cmd" "${ceph_args[@]}" osd pool set "$pool" pg_autoscale_mode off
   "$ceph_cmd" "${ceph_args[@]}" osd pool application enable "$pool" rados
+  ensure_single_pg_pool "$pool"
 done
 
 ensure_pool_placement "$meta_pool" 0
