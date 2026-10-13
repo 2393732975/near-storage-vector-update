@@ -154,7 +154,11 @@ roundtrip/queue 由 231.01 降到 126.45 ms/update（-45.26%）；payload 读取
 
 ## 集群收尾
 
-单轮扫描使用的实验池已经清理。三轮重复结果和本报告提交后，将使用带 FSID 保护
-的白名单脚本删除本轮 `nsvu_meta` 与 `nsvu_owner_0`–`4`，再记录最终 OSD、PG 和
-健康状态。不会屏蔽既有告警，也不会为消除告警而强制压缩或重启 OSD；BlueStore
+单轮扫描和三轮重复使用的实验池均已清理。确认报告和原始工件落盘后，使用 FSID
+`c83da116-1e8b-11f1-933d-cd48aa44d216` 保护的白名单脚本删除 `nsvu_meta` 与
+`nsvu_owner_0`–`4`。最终没有 `nsvu_*` 残留，只保留 `.mgr`、`rbd`；5/5 OSD
+`up/in`，33/33 PG `active+clean`。
+
+清理脚本返回码 3，因为集群仍报告既有的 `devicehealth` 模块磁盘 I/O 错误；这不
+表示池删除失败。未屏蔽告警，也未为消除告警而强制压缩或重启 OSD；BlueStore
 物理空间由后台异步回收。
