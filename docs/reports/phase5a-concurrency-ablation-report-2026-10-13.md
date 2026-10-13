@@ -122,6 +122,11 @@ payload 读取和 OSD 算距没有随并发机制本质改变。并发度 4 的 
 
 ## 集群收尾
 
-报告和原始工件提交后，使用带 FSID 保护的白名单脚本删除 `nsvu_meta` 和
-`nsvu_owner_0`–`4`，再记录最终集群状态。不会屏蔽既有告警或为消除告警而重启
-OSD；BlueStore 物理空间由后台异步回收。
+报告与原始工件落盘后，已使用 FSID
+`c83da116-1e8b-11f1-933d-cd48aa44d216` 保护的白名单脚本删除
+`nsvu_meta` 和 `nsvu_owner_0`–`4`。最终仅保留 `.mgr` 和 `rbd`，5/5 OSD
+`up/in`，33/33 PG `active+clean`，无 `nsvu_*` 池残留。
+
+清理脚本返回码为 3，原因是集群仍报告既有的 `devicehealth` 模块磁盘 I/O
+错误，不是池删除失败。本次未屏蔽告警，也未为清除告警而重启 OSD；BlueStore
+物理空间由后台异步回收。
