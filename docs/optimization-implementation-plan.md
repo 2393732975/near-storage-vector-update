@@ -67,12 +67,13 @@
 单次更新的只读聚合可以先行；跨 update 的修改型微批必须在恢复协议通过后启用。
 所有性能结论必须同时满足零失败、图一致性检查和配对 Recall 门槛。
 
-阶段 5A 最新三轮 GIST1M 结果进一步确认：在更新并发度 4、执行器线程 5、等待
-250 μs 时，只读异步执行将平均延迟降低 20.67%、P99 降低 16.93%、吞吐提高
-25.89%，三轮配对 Recall 均通过。与此同时 `subrequests/RPC` 仍只有 1.112，说明
-收益主要来自独立对象 I/O 等待重叠，而非充分的跨 update 合批。近期优先级因此
-调整为“先完成线程数与更新并发度消融，再决定是否四数据集验证”；扩大 batch
-容量或继续增加等待窗口不作为下一步。
+阶段 5A 三轮重复和并发度消融进一步确认：在更新并发度 4、执行器线程 5、等待
+250 μs 时，只读异步执行的三轮平均延迟降低 20.67%、P99 降低 16.93%、吞吐
+提高 25.89%。并发度 1 时 `subrequests/RPC=1.000` 仍获得 46.84% 延迟收益，证明
+核心机制是独立对象 I/O 等待重叠，而非跨 update 合批；并发度 8 虽把
+`subrequests/RPC` 提高到 1.459，却因饱和使延迟回退 3.05%。近期优先级调整为
+“先补齐可复现更新轨迹质量门禁，再以 5 线程、250 μs、并发度 4 做四数据集正式
+A/B”；扩大 batch 容量或继续增加等待窗口不作为下一步。
 
 ## 2. 目标架构与 Ceph 边界
 
@@ -460,11 +461,35 @@ GIST1M、OSD-only、30 s、更新并发度 4、执行器线程 5；6/6 轮零失
 仅 1.112。由此 M5A 的“异步重叠可重复”门禁通过，而“充分跨 update 合批”和
 完整阶段 5 调用数门禁仍未通过。
 
-下一步固定 250 μs，先扫描执行器线程 `1/2/5/10`，再固定最佳线程数扫描更新并发
-度 `1/2/4/8`。必须报告端到端延迟、P99、吞吐、物理调用数、
-`subrequests/RPC`、执行器排队和配对 Recall。若线程数 5 的收益只在并发度 4
-出现，结论应限定为该负载下的 I/O 重叠；若低并发无收益且高并发只增加排队，
-应转向阶段 7 降低对象扇出。默认开关在消融完成前保持关闭。
+据此随后固定 250 μs，扫描了执行器线程 `1/2/5/10`，并固定候选线程数
+扫描更新并发度 `1/2/4/8`。执行结果、新质量门禁和参数决策见 8.6 节；
+消融完成前默认开关保持关闭。
+
+### 8.6 阶段 5A 并发度消融结论（2026-10-13）
+
+提交 `d17fbab` 上完成 13 个 GIST1M 单轮配置，所有更新零失败，13/13 次 checker
+通过。线程扫描固定更新并发度 4：1/2/5/10 线程的平均延迟相对 M2 分别变化
++132.04%、+35.48%、-21.25%、-30.83%。10 线程虽性能最佳，但配对 Recall
+下降 1.213 pp；5 线程是唯一同时通过性能、P99 和单轮 Recall 门禁的配置。
+
+固定 5 线程后，并发度 1/2/4/8 的平均延迟变化分别为 -46.84%、-35.88%、
+-21.08%、+3.05%，吞吐变化为 +87.60%、+56.31%、+26.40%、-2.85%。并发度
+1 没有跨 update 合并，却获得最大相对收益；并发度 8 的 calls/update 和
+distance batches/update 分别下降 24.46% 和 29.31%，性能反而回退。因此当前
+Stage 5A 的有效机制是对象级异步并发，微批只是随负载增加的次要收益；不能把
+更大的 `subrequests/RPC` 当作性能目标。
+
+并发度 4 本轮性能通过但共同前缀 Recall 下降 1.369 pp，与此前三轮均通过的结果
+不一致。所有结构和语义边检查均通过，差异来自独立重导入、固定时间窗和并发提交
+顺序共同影响的可能性较高，但本轮仍按预设门禁记为质量失败。四数据集正式 A/B
+前新增固定 update 数、固定目标序列和可复现提交轨迹门禁；至少用并发度 1 验证
+确定性语义，再用并发度 4 做多次性能/质量复核。完整证据见
+[阶段 5A 并发度消融报告](reports/phase5a-concurrency-ablation-report-2026-10-13.md)。
+
+参数决策冻结为候选 `wait=250 μs`、`executor_threads=5`、正式性能并发度 4；
+并发度 8 排除。默认开关继续关闭，直至固定轨迹质量门禁和四数据集正式 A/B
+通过。阶段 6 的 per-target inflight/queue 控制提前成为后续性能重点，但不在
+Stage 5A 报告中提前宣称实现。
 
 完整阶段 5 的退出条件（不是 5A 只读 feasibility gate）：全部 CLS calls/update
 相对 M2 的 501–747 降低至少 60%；patch calls/update 从约 14–17 降至 5 以下，
@@ -551,7 +576,7 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
 | M3 已关闭（负结论） | 自适应 level-0 frontier、按对象 batch distance | 同步扩窗门禁失败，默认关闭 |
 | M4 未开始 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
-| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 三轮 GIST 重复通过，待线程数与更新并发度消融 |
+| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 三轮重复和并发度消融完成；待固定轨迹质量门禁与四数据集 A/B |
 | M5B 被 M4 阻塞 | 幂等邻接写微批 | M4 通过后验证 calls/patch/P99 |
 | M6 拥塞控制 | per-target AIMD 与 deadline flush | queue/P99 达标 |
 | M7 图感知布局 | locality group、bounded object layout | distance object fan-out 降低 ≥30% |
@@ -578,10 +603,11 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 6. `feat(recovery): replay incomplete vector updates`
 7. `7640e80 feat(cls): add multi-query distance batches`（已完成）
 8. `da6ec8f feat(executor): batch asynchronous distance reads`（已完成；三轮重复通过，进入并行度消融）
-9. `feat(cls): batch idempotent edge patches`
-10. `feat(scheduler): adapt per-target concurrency`
-11. `feat(layout): place nodes in bounded locality groups`
-12. `test(experiments): add c0-b5 ablation suite`
+9. `d17fbab feat(runner): automate Stage 5A concurrency ablation`（已完成；5 线程候选，排除并发度 8）
+10. `feat(cls): batch idempotent edge patches`
+11. `feat(scheduler): adapt per-target concurrency`
+12. `feat(layout): place nodes in bounded locality groups`
+13. `test(experiments): add c0-b5 ablation suite`
 
 每个阶段先运行单元测试、小数据集正确性、超时/崩溃注入，再运行四数据集正式实验。
 性能提交和正确性提交不混合，实验报告必须记录完整 commit、二进制哈希和原始结果

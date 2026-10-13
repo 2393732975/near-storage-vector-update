@@ -15,6 +15,7 @@
 - [阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)：四数据集三轮 OSD-only 复测、与阶段 1 OSD 的性能对比及具体代码改动。
 - [阶段 3 Frontier 聚合可行性报告](reports/phase3-frontier-feasibility-report-2026-10-10.md)：固定窗口与自适应窗口的 GIST1M 验证、失败根因和停止结论。
 - [阶段 5A 只读执行器可行性与重复验证报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)：等待窗口扫描、250 μs 三轮正式重复、配对 Recall、异步收益来源和后续并行度门禁。
+- [阶段 5A 并发度消融报告](reports/phase5a-concurrency-ablation-report-2026-10-13.md)：执行器线程与更新并发度扫描、异步/合批收益拆分、饱和点和质量门禁限制。
 - [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)：PPT 背景数据移动实验的零失败复现结果。
 
 ## 参考材料
