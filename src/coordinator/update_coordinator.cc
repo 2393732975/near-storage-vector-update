@@ -128,6 +128,10 @@ struct RecallSample {
   uint64_t update_sequence = 0;
   uint64_t hits = 0;
   uint64_t denominator = 0;
+  uint64_t target_label = 0;
+  uint64_t inserted_global_id = 0;
+  uint32_t inserted_level = 0;
+  uint64_t candidate_hash = 0;
 };
 
 struct Metrics {
@@ -3077,12 +3081,14 @@ class Coordinator {
 	              auto it = labels.find(label);
               const uint64_t update_id = NextUpdateId();
               std::vector<uint64_t> recall_candidates;
+              uint32_t inserted_level = 0;
               const uint64_t new_id = InsertOneParallel(
                   ctx,
                   vectors[vec_idx],
                   label,
                   update_id,
-                  ground_truth_.empty() ? nullptr : &recall_candidates);
+                  ground_truth_.empty() ? nullptr : &recall_candidates,
+                  &inserted_level);
               if (!ctx.ceph.CasLabel(
                       label, it == labels.end(), it == labels.end() ? 0 : it->second,
                       new_id, &ctx.metrics, update_id)) {
@@ -3100,6 +3106,9 @@ class Coordinator {
                     &ctx.metrics,
                     vec_idx,
                     i,
+                    label,
+                    new_id,
+                    inserted_level,
                     recall_candidates,
                     ground_truth_.at(vec_idx));
               }
@@ -3541,11 +3550,15 @@ class Coordinator {
       const std::string& vector,
       uint64_t external_label,
       uint64_t update_id,
-      std::vector<uint64_t>* recall_candidates) {
+      std::vector<uint64_t>* recall_candidates,
+      uint32_t* inserted_level) {
     ReservedInsert reserved = ReserveInsertId(ctx, update_id);
     GlobalMeta meta = reserved.search_meta;
     const uint64_t global_id = reserved.global_id;
     const uint32_t level = SampleLevel(ctx.rng, cfg_.M);
+    if (inserted_level != nullptr) {
+      *inserted_level = level;
+    }
     ctx.ceph.StoreVector(
         global_id, external_label, vector, level, &ctx.metrics, false, update_id);
 
@@ -3635,6 +3648,9 @@ class Coordinator {
       Metrics* metrics,
       uint64_t query_index,
       uint64_t update_sequence,
+      uint64_t target_label,
+      uint64_t inserted_global_id,
+      uint32_t inserted_level,
       const std::vector<uint64_t>& candidates,
       const std::vector<uint32_t>& ground_truth) const {
     const size_t denominator = std::min<size_t>(cfg_.recall_k, ground_truth.size());
@@ -3653,6 +3669,13 @@ class Coordinator {
         ++hits;
       }
     }
+    uint64_t candidate_hash = 1469598103934665603ULL;
+    candidate_hash ^= static_cast<uint64_t>(candidate_count);
+    candidate_hash *= 1099511628211ULL;
+    for (size_t i = 0; i < candidate_count; ++i) {
+      candidate_hash ^= candidates[i];
+      candidate_hash *= 1099511628211ULL;
+    }
     metrics->recall_evaluated_updates++;
     metrics->recall_hits += hits;
     metrics->recall_denominator += denominator;
@@ -3660,7 +3683,13 @@ class Coordinator {
     if (found == metrics->recall_samples.end() ||
         update_sequence < found->second.update_sequence) {
       metrics->recall_samples[query_index] = {
-          update_sequence, hits, static_cast<uint64_t>(denominator)};
+          update_sequence,
+          hits,
+          static_cast<uint64_t>(denominator),
+          target_label,
+          inserted_global_id,
+          inserted_level,
+          candidate_hash};
     }
   }
 
@@ -4097,7 +4126,11 @@ class Coordinator {
       out << "      {\"query_index\": " << query_index
           << ", \"update_sequence\": " << sample.update_sequence
           << ", \"hits\": " << sample.hits
-          << ", \"denominator\": " << sample.denominator << "}";
+          << ", \"denominator\": " << sample.denominator
+          << ", \"target_label\": " << sample.target_label
+          << ", \"inserted_global_id\": " << sample.inserted_global_id
+          << ", \"inserted_level\": " << sample.inserted_level
+          << ", \"candidate_hash\": " << sample.candidate_hash << "}";
     }
     if (!first_recall_sample) {
       out << "\n    ";

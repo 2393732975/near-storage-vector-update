@@ -13,6 +13,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 run_root=${RUN_ROOT:-"$repo_root/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"}
 repetitions=${REPETITIONS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
+fixed_num_updates=${FIXED_NUM_UPDATES:-}
 parallelism=${UPDATE_PARALLELISM:-4}
 frontier_window=${FRONTIER_WINDOW:-1}
 frontier_adaptive=${FRONTIER_ADAPTIVE:-false}
@@ -45,7 +46,19 @@ ceph_cli=(ceph --keyring "$CEPH_KEYRING")
   exit 2
 }
 [[ "$repetitions" =~ ^[1-9][0-9]*$ ]] || { echo "REPETITIONS must be positive." >&2; exit 2; }
-[[ "$window_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
+[[ "$window_seconds" =~ ^[0-9]+$ ]] || { echo "WINDOW_SECONDS must be non-negative." >&2; exit 2; }
+if [[ -n "$fixed_num_updates" ]]; then
+  [[ "$fixed_num_updates" =~ ^[1-9][0-9]*$ ]] || {
+    echo "FIXED_NUM_UPDATES must be a positive integer." >&2
+    exit 2
+  }
+  [[ "$window_seconds" == 0 ]] || {
+    echo "FIXED_NUM_UPDATES requires WINDOW_SECONDS=0." >&2
+    exit 2
+  }
+else
+  (( window_seconds > 0 )) || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
+fi
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATE_PARALLELISM must be positive." >&2; exit 2; }
 [[ "$frontier_window" =~ ^[1-9][0-9]*$ ]] || { echo "FRONTIER_WINDOW must be positive." >&2; exit 2; }
 [[ "$frontier_adaptive" == true || "$frontier_adaptive" == false ]] || {
@@ -202,6 +215,13 @@ load_dataset_config() {
       ;;
     *) echo "Unknown dataset: $dataset" >&2; return 2 ;;
   esac
+  if [[ -n "$fixed_num_updates" ]]; then
+    (( fixed_num_updates <= updates )) || {
+      echo "FIXED_NUM_UPDATES=$fixed_num_updates exceeds $dataset update count $updates." >&2
+      return 2
+    }
+    updates=$fixed_num_updates
+  fi
   for path in "$input" "$update" "$ground_truth"; do
     [[ -r "$path" ]] || { echo "Required dataset file is not readable: $path" >&2; return 2; }
   done
@@ -219,7 +239,8 @@ record_placement() {
 
 validate_run() {
   local mode=$1 update_json=$2 check_json=$3
-  python3 - "$mode" "$distance_microbatch" "$update_json" "$check_json" <<'PY'
+  python3 - "$mode" "$distance_microbatch" "$update_json" "$check_json" \
+    "$fixed_num_updates" <<'PY'
 import json
 import sys
 
@@ -227,6 +248,7 @@ mode = sys.argv[1]
 expect_microbatch = sys.argv[2] == "true"
 update = json.load(open(sys.argv[3], encoding="utf-8"))
 check = json.load(open(sys.argv[4], encoding="utf-8"))
+fixed_num_updates = int(sys.argv[5]) if sys.argv[5] else None
 quality = update.get("quality", {})
 observability = update.get("observability", {})
 summary = {
@@ -269,6 +291,14 @@ if expect_microbatch:
         raise SystemExit("distance microbatch processed no logical subrequests")
 if update["failed_updates"] != 0 or check["status"] != "pass":
     raise SystemExit(1)
+if fixed_num_updates is not None:
+    if update["vectors_processed"] != fixed_num_updates:
+        raise SystemExit(
+            "fixed-update run processed an unexpected count: "
+            f"expected={fixed_num_updates}, actual={update['vectors_processed']}"
+        )
+    if update.get("stopped_by_time_limit"):
+        raise SystemExit("fixed-update run unexpectedly stopped by a time limit")
 if not quality.get("ground_truth_enabled"):
     raise SystemExit("ground truth was not enabled")
 if quality.get("evaluated_updates") != update["vectors_processed"]:
@@ -312,6 +342,8 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "ceph_fsid=$("${ceph_cli[@]}" fsid)"
   echo "repetitions=$repetitions"
   echo "window_seconds=$window_seconds"
+  echo "fixed_num_updates=${fixed_num_updates:-disabled}"
+  echo "execution_limit=$([[ -n "$fixed_num_updates" ]] && echo fixed_updates || echo time_window)"
   echo "update_parallelism=$parallelism"
   echo "frontier_window=$frontier_window"
   echo "frontier_adaptive=$frontier_adaptive"

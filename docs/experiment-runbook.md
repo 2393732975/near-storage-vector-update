@@ -461,6 +461,28 @@ runner 在 `thread-scan/selection.json` 记录线程选择，在顶层 `summary.
 
 缩短窗口、减少数据集或降低检查规模只能用于 smoke test，不能与正式结果混合。
 
+### 阶段 5A 固定更新轨迹门禁
+
+并发度消融后，用固定数量的前 200 个 GIST1M query 分离语义门禁与
+时间窗性能指标。并发度 1 要求控制组和优化组的 query 序号、目标 label、
+新 global ID、随机层级、top-K 候选哈希和 Recall 命中数逐项一致；并发度 4
+做三次独立重导入，仍要求零失败、checker 通过、Recall 下降不超过
+0.5 pp，且三轮平均延迟至少改善 5%、P99 不回退超过 5%。
+
+```bash
+run_root="$PWD/results/stage5a-fixed-trace-$(date -u +%Y%m%dT%H%M%SZ)"
+env \
+  CEPH_KEYRING=/path/to/untracked.keyring \
+  DATASET_ROOT=/path/to/datasets \
+  FIXED_NUM_UPDATES=200 \
+  PARALLEL_REPETITIONS=3 \
+  RUN_ROOT="$run_root" \
+  scripts/run-stage5a-fixed-trace.sh --confirm-reset
+```
+
+通用 `run-phase1-ab.sh` 仅在显式同时设置 `FIXED_NUM_UPDATES=N` 和
+`WINDOW_SECONDS=0` 时切换为固定数量模式；默认仍是 300 s 时间窗。
+
 ## 9. 进度、输出与汇总
 
 启动前先确认没有重复 runner：
