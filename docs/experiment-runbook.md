@@ -439,6 +439,26 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `OSD_OP_TIMEOUT_SECONDS` | 45 | 45 | 45 | 不为掩盖 slow-op 而任意增大 |
 | `OSD_OP_RETRY_LIMIT` | 3 | 3 | 3 | 记录在 manifest |
 
+### 阶段 5A 执行器线程与更新并发度消融
+
+三轮 250 μs 重复门禁通过后，使用专用 runner 先扫描执行器线程
+`1/2/5/10`（更新并发度固定为 4），再从通过性能与配对 Recall 门禁的配置中选择
+平均延迟最低者，扫描更新并发度 `1/2/4/8`。每个配置都会独立重建实验池并重新
+导入 GIST1M；控制组关闭 microbatch，实验组固定等待窗口 250 μs。
+
+```bash
+run_root="$PWD/results/stage5a-concurrency-$(date -u +%Y%m%dT%H%M%SZ)"
+env \
+  CEPH_KEYRING=/path/to/untracked.keyring \
+  DATASET_ROOT=/path/to/datasets \
+  RUN_ROOT="$run_root" \
+  scripts/run-stage5a-concurrency-ablation.sh --confirm-reset
+```
+
+runner 在 `thread-scan/selection.json` 记录线程选择，在顶层 `summary.md` 和
+`summary.json` 汇总两级扫描。线程配置只有在共同前缀 Recall 下降不超过
+0.5 pp、平均延迟至少降低 5% 且 P99 不回退超过 5% 时才可进入第二级扫描。
+
 缩短窗口、减少数据集或降低检查规模只能用于 smoke test，不能与正式结果混合。
 
 ## 9. 进度、输出与汇总
