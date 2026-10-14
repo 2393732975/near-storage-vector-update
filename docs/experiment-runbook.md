@@ -464,7 +464,9 @@ runner 在 `thread-scan/selection.json` 记录线程选择，在顶层 `summary.
 ### 阶段 5A 固定更新轨迹门禁
 
 并发度消融后，用固定数量的前 200 个 GIST1M query 分离语义门禁与
-时间窗性能指标。并发度 1 要求控制组和优化组的 query 序号、目标 label、
+时间窗性能指标。runner 首先生成一份 HNSW index cache，之后的每次独立建池
+都加载同一份索引，并在每轮前后核对 SHA-256，避免多线程 Importer 重建出不同
+基础图。并发度 1 要求控制组和优化组的 query 序号、目标 label、
 新 global ID、随机层级、top-K 候选哈希和 Recall 命中数逐项一致；并发度 4
 做三次独立重导入，仍要求零失败、checker 通过、Recall 下降不超过
 0.5 pp，且三轮平均延迟至少改善 5%、P99 不回退超过 5%。
@@ -482,6 +484,8 @@ env \
 
 通用 `run-phase1-ab.sh` 仅在显式同时设置 `FIXED_NUM_UPDATES=N` 和
 `WINDOW_SECONDS=0` 时切换为固定数量模式；默认仍是 300 s 时间窗。
+`HNSW_INDEX_CACHE=/path/index.bin` 必须与 `HNSW_INDEX_CACHE_MODE=build|load`
+成对使用；`build` 拒绝覆盖已有文件，`load` 会校验节点数、维度和 M。
 
 ## 9. 进度、输出与汇总
 

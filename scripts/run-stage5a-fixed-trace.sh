@@ -16,6 +16,8 @@ parallel_repetitions=${PARALLEL_REPETITIONS:-3}
 max_regression=${PAIRED_RECALL_MAX_REGRESSION:-0.005}
 runner="$repo_root/scripts/run-phase1-ab.sh"
 compare="$repo_root/scripts/compare-paired-recall.py"
+index_cache="$run_root/cache/gist1m.hnsw"
+index_cache_sha=""
 
 [[ "$fixed_updates" =~ ^[1-9][0-9]*$ ]] || {
   echo "FIXED_NUM_UPDATES must be positive." >&2
@@ -36,6 +38,7 @@ else
 fi
 
 exec > >(tee -a "$run_root/fixed-trace.log") 2>&1
+mkdir -p "$run_root/cache"
 
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
@@ -46,9 +49,19 @@ update_json() {
 }
 
 run_case() {
-  local output=$1 microbatch=$2 parallelism=$3
+  local output=$1 microbatch=$2 parallelism=$3 cache_mode=$4
+  if [[ "$cache_mode" == load ]]; then
+    [[ -s "$index_cache" && -n "$index_cache_sha" ]] || {
+      echo "HNSW index cache is unavailable before load case: $index_cache" >&2
+      return 1
+    }
+    [[ "$(sha256sum "$index_cache" | awk '{print $1}')" == "$index_cache_sha" ]] || {
+      echo "HNSW index cache changed before load case: $index_cache" >&2
+      return 1
+    }
+  fi
   mkdir -p "$output"
-  log "START output=$output microbatch=$microbatch parallelism=$parallelism updates=$fixed_updates"
+  log "START output=$output microbatch=$microbatch parallelism=$parallelism updates=$fixed_updates cache_mode=$cache_mode"
   env \
     CEPH_KEYRING="$CEPH_KEYRING" \
     DATASET_ROOT="$DATASET_ROOT" \
@@ -57,6 +70,8 @@ run_case() {
     REPETITIONS=1 \
     WINDOW_SECONDS=0 \
     FIXED_NUM_UPDATES="$fixed_updates" \
+    HNSW_INDEX_CACHE="$index_cache" \
+    HNSW_INDEX_CACHE_MODE="$cache_mode" \
     UPDATE_PARALLELISM="$parallelism" \
     FRONTIER_WINDOW=1 \
     FRONTIER_ADAPTIVE=false \
@@ -74,6 +89,11 @@ run_case() {
     RECALL_K=10 \
     RUN_ROOT="$output" \
     "$runner" --confirm-reset >"$output/runner.log" 2>&1
+  if [[ "$cache_mode" == load &&
+        "$(sha256sum "$index_cache" | awk '{print $1}')" != "$index_cache_sha" ]]; then
+    echo "HNSW index cache changed during load case: $index_cache" >&2
+    return 1
+  fi
   log "PASS output=$output"
 }
 
@@ -253,8 +273,11 @@ PY
 write_manifest
 log "Stage 5A fixed-trace gate started"
 
-run_case "$run_root/deterministic/control" false 1
-run_case "$run_root/deterministic/optimized" true 1
+run_case "$run_root/deterministic/control" false 1 build
+index_cache_sha=$(sha256sum "$index_cache" | awk '{print $1}')
+echo "hnsw_index_cache_sha256=$index_cache_sha" >>"$run_root/manifest.txt"
+echo "hnsw_index_cache_bytes=$(stat -c %s "$index_cache")" >>"$run_root/manifest.txt"
+run_case "$run_root/deterministic/optimized" true 1 load
 python3 "$compare" \
   "$(update_json "$run_root/deterministic/control")" \
   "$(update_json "$run_root/deterministic/optimized")" \
@@ -265,11 +288,11 @@ quality_failures=0
 for repetition in $(seq 1 "$parallel_repetitions"); do
   pair="$run_root/parallel/rep-$repetition"
   if (( repetition % 2 == 1 )); then
-    run_case "$pair/control" false 4
-    run_case "$pair/optimized" true 4
+    run_case "$pair/control" false 4 load
+    run_case "$pair/optimized" true 4 load
   else
-    run_case "$pair/optimized" true 4
-    run_case "$pair/control" false 4
+    run_case "$pair/optimized" true 4 load
+    run_case "$pair/control" false 4 load
   fi
   if ! compare_recall "$pair/control" "$pair/optimized" "$pair/paired-recall.json"; then
     quality_failures=$((quality_failures + 1))

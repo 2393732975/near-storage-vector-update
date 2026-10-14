@@ -14,6 +14,8 @@ run_root=${RUN_ROOT:-"$repo_root/results/phase1-ab-$(date -u +%Y%m%dT%H%M%SZ)"}
 repetitions=${REPETITIONS:-3}
 window_seconds=${WINDOW_SECONDS:-300}
 fixed_num_updates=${FIXED_NUM_UPDATES:-}
+hnsw_index_cache=${HNSW_INDEX_CACHE:-}
+hnsw_index_cache_mode=${HNSW_INDEX_CACHE_MODE:-disabled}
 parallelism=${UPDATE_PARALLELISM:-4}
 frontier_window=${FRONTIER_WINDOW:-1}
 frontier_adaptive=${FRONTIER_ADAPTIVE:-false}
@@ -58,6 +60,17 @@ if [[ -n "$fixed_num_updates" ]]; then
   }
 else
   (( window_seconds > 0 )) || { echo "WINDOW_SECONDS must be positive." >&2; exit 2; }
+fi
+if [[ -n "$hnsw_index_cache" ]]; then
+  [[ "$hnsw_index_cache_mode" == build || "$hnsw_index_cache_mode" == load ]] || {
+    echo "HNSW_INDEX_CACHE_MODE must be build or load when HNSW_INDEX_CACHE is set." >&2
+    exit 2
+  }
+else
+  [[ "$hnsw_index_cache_mode" == disabled ]] || {
+    echo "HNSW_INDEX_CACHE_MODE requires HNSW_INDEX_CACHE." >&2
+    exit 2
+  }
 fi
 [[ "$parallelism" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATE_PARALLELISM must be positive." >&2; exit 2; }
 [[ "$frontier_window" =~ ^[1-9][0-9]*$ ]] || { echo "FRONTIER_WINDOW must be positive." >&2; exit 2; }
@@ -165,6 +178,14 @@ if [[ "$distance_microbatch" == true ]]; then
     --distance-microbatch-max-candidates "$distance_microbatch_max_candidates"
     --distance-microbatch-max-subrequests "$distance_microbatch_max_subrequests"
     --distance-executor-threads "$distance_executor_threads"
+  )
+fi
+
+index_cache_args=()
+if [[ -n "$hnsw_index_cache" ]]; then
+  index_cache_args=(
+    --index-cache "$hnsw_index_cache"
+    --index-cache-mode "$hnsw_index_cache_mode"
   )
 fi
 
@@ -344,6 +365,7 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "window_seconds=$window_seconds"
   echo "fixed_num_updates=${fixed_num_updates:-disabled}"
   echo "execution_limit=$([[ -n "$fixed_num_updates" ]] && echo fixed_updates || echo time_window)"
+  echo "hnsw_index_cache_mode=$hnsw_index_cache_mode"
   echo "update_parallelism=$parallelism"
   echo "frontier_window=$frontier_window"
   echo "frontier_adaptive=$frontier_adaptive"
@@ -393,7 +415,7 @@ for repetition in $(seq 1 "$repetitions"); do
       "$importer" --keyring "$CEPH_KEYRING" --input "$input" --input-format "$format" \
         --dim "$dim" --vector-kind "$kind" --metric "$metric" --num-vectors "$count" \
         --points-per-object "$ppo" --threads "$threads" --metrics-out "$output/import.json" \
-        --progress-out "$output/import.progress.json"
+        --progress-out "$output/import.progress.json" "${index_cache_args[@]}"
 
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] update rep=$repetition mode=$mode dataset=$dataset"
       "$coordinator" --mode update --keyring "$CEPH_KEYRING" --input "$input" \

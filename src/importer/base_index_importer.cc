@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,6 +36,8 @@ struct Config {
   std::string meta_oid = "hnsw.global.meta";
   std::string metrics_out;
   std::string progress_out;
+  std::string index_cache;
+  std::string index_cache_mode = "disabled";
   uint64_t num_vectors = 1000000;
   uint32_t dim = 128;
   uint32_t owners = 5;
@@ -54,6 +57,7 @@ struct Metrics {
   double load_seconds = 0.0;
   double convert_seconds = 0.0;
   double build_seconds = 0.0;
+  bool index_cache_loaded = false;
   double id_mapping_seconds = 0.0;
   uint64_t permuted_internal_ids = 0;
   double vector_persist_seconds = 0.0;
@@ -262,6 +266,9 @@ void WriteMetrics(const Config& cfg, const Metrics& metrics) {
   out << "  \"load_seconds\": " << metrics.load_seconds << ",\n";
   out << "  \"convert_seconds\": " << metrics.convert_seconds << ",\n";
   out << "  \"build_seconds\": " << metrics.build_seconds << ",\n";
+  out << "  \"index_cache_mode\": \"" << cfg.index_cache_mode << "\",\n";
+  out << "  \"index_cache_loaded\": "
+      << (metrics.index_cache_loaded ? "true" : "false") << ",\n";
   out << "  \"id_mapping_seconds\": " << metrics.id_mapping_seconds << ",\n";
   out << "  \"permuted_internal_ids\": " << metrics.permuted_internal_ids << ",\n";
   out << "  \"vector_persist_seconds\": " << metrics.vector_persist_seconds << ",\n";
@@ -309,6 +316,10 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.metrics_out = next("--metrics-out");
     } else if (arg == "--progress-out") {
       cfg.progress_out = next("--progress-out");
+    } else if (arg == "--index-cache") {
+      cfg.index_cache = next("--index-cache");
+    } else if (arg == "--index-cache-mode") {
+      cfg.index_cache_mode = next("--index-cache-mode");
     } else if (arg == "--num-vectors") {
       cfg.num_vectors = std::stoull(next("--num-vectors"));
     } else if (arg == "--dim") {
@@ -333,6 +344,14 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.metric = parse_metric(next("--metric"));
     }
   }
+  if (cfg.index_cache.empty() != (cfg.index_cache_mode == "disabled")) {
+    throw std::runtime_error(
+        "--index-cache and --index-cache-mode=build|load must be provided together");
+  }
+  if (cfg.index_cache_mode != "disabled" &&
+      cfg.index_cache_mode != "build" && cfg.index_cache_mode != "load") {
+    throw std::runtime_error("--index-cache-mode must be disabled, build, or load");
+  }
   return cfg;
 }
 
@@ -352,28 +371,68 @@ int main(int argc, const char** argv) {
     metrics.load_seconds = NowSec() - t_load0;
     WriteProgress(cfg, "load_vectors_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);
 
-    std::cerr << "stage=convert_to_float" << std::endl;
-    const double t_convert0 = NowSec();
-    auto float_vectors = MakeFloatVectorsFromKind(raw_vectors, cfg.dim, cfg.vector_kind);
-    metrics.convert_seconds = NowSec() - t_convert0;
-    WriteProgress(cfg, "convert_to_float_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);
-
-    std::cerr << "stage=build_hnsw threads=" << cfg.threads << std::endl;
-    const double t_build0 = NowSec();
     hnswlib::L2Space l2space(cfg.dim);
     hnswlib::InnerProductSpace ipspace(cfg.dim);
     hnswlib::SpaceInterface<float>* space =
         cfg.metric == ghnsw::kMetricIP
             ? static_cast<hnswlib::SpaceInterface<float>*>(&ipspace)
             : static_cast<hnswlib::SpaceInterface<float>*>(&l2space);
-    hnswlib::HierarchicalNSW<float> index(
-        space, cfg.num_vectors, cfg.M, cfg.ef, 100, false);
+    std::unique_ptr<hnswlib::HierarchicalNSW<float>> index_ptr;
+    const double t_build0 = NowSec();
+    if (cfg.index_cache_mode == "load") {
+      std::cerr << "stage=load_hnsw_cache path=" << cfg.index_cache << std::endl;
+      index_ptr = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+          space, cfg.index_cache, false, cfg.num_vectors, false);
+      metrics.index_cache_loaded = true;
+    } else {
+      std::cerr << "stage=convert_to_float" << std::endl;
+      const double t_convert0 = NowSec();
+      auto float_vectors =
+          MakeFloatVectorsFromKind(raw_vectors, cfg.dim, cfg.vector_kind);
+      metrics.convert_seconds = NowSec() - t_convert0;
+      WriteProgress(
+          cfg,
+          "convert_to_float_done",
+          cfg.num_vectors,
+          cfg.num_vectors,
+          NowSec() - t0);
+
+      if (cfg.index_cache_mode == "build") {
+        std::ifstream existing(cfg.index_cache, std::ios::binary);
+        if (existing.good()) {
+          throw std::runtime_error("refusing to overwrite HNSW index cache");
+        }
+      }
+      std::cerr << "stage=build_hnsw threads=" << cfg.threads << std::endl;
+      index_ptr = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+          space, cfg.num_vectors, cfg.M, cfg.ef, 100, false);
 #pragma omp parallel for schedule(dynamic, 256)
-    for (uint64_t i = 0; i < cfg.num_vectors; ++i) {
-      index.addPoint(float_vectors.data() + static_cast<size_t>(i) * cfg.dim, i);
+      for (uint64_t i = 0; i < cfg.num_vectors; ++i) {
+        index_ptr->addPoint(
+            float_vectors.data() + static_cast<size_t>(i) * cfg.dim, i);
+      }
+      if (cfg.index_cache_mode == "build") {
+        index_ptr->saveIndex(cfg.index_cache);
+      }
     }
     metrics.build_seconds = NowSec() - t_build0;
-    WriteProgress(cfg, "build_hnsw_done", cfg.num_vectors, cfg.num_vectors, NowSec() - t0);
+    auto& index = *index_ptr;
+    if (index.cur_element_count != cfg.num_vectors) {
+      throw std::runtime_error(
+          "HNSW index cache element count does not match --num-vectors");
+    }
+    if (index.M_ != cfg.M) {
+      throw std::runtime_error("HNSW index cache M does not match --M");
+    }
+    if (index.data_size_ != static_cast<size_t>(cfg.dim) * sizeof(float)) {
+      throw std::runtime_error("HNSW index cache dimension does not match --dim");
+    }
+    WriteProgress(
+        cfg,
+        metrics.index_cache_loaded ? "load_hnsw_cache_done" : "build_hnsw_done",
+        cfg.num_vectors,
+        cfg.num_vectors,
+        NowSec() - t0);
 
     std::cerr << "stage=map_internal_ids" << std::endl;
     const double t_mapping0 = NowSec();
