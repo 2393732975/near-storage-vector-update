@@ -487,6 +487,31 @@ env \
 `HNSW_INDEX_CACHE=/path/index.bin` 必须与 `HNSW_INDEX_CACHE_MODE=build|load`
 成对使用；`build` 拒绝覆盖已有文件，`load` 会校验节点数、维度和 M。
 
+### 阶段 5A 四数据集正式 A/B
+
+固定轨迹门禁通过后，使用专用 runner 比较 OSD-only M2 控制组与 Stage 5A
+优化组。每个数据集、每个重复单独构建一份 HNSW cache，同一 A/B 对复用该 cache，
+奇数轮 control→optimized、偶数轮 optimized→control。正式配置为四数据集、三次
+重复、300 s、更新并发度 4；优化组固定 250 μs 和 5 个执行器线程。
+
+```bash
+run_root="$PWD/results/stage5a-full-ab-$(date -u +%Y%m%dT%H%M%SZ)"
+env \
+  CEPH_KEYRING=/path/to/untracked.keyring \
+  DATASET_ROOT=/path/to/datasets \
+  DATASETS="gist1m text2image10m deep100m sift100m" \
+  REPETITIONS=3 \
+  WINDOW_SECONDS=300 \
+  UPDATE_PARALLELISM=4 \
+  RUN_ROOT="$run_root" \
+  scripts/run-stage5a-full-ab.sh --confirm-reset
+```
+
+顶层 `cache-manifest.txt` 记录每对基础图的 SHA-256 和大小；cache 在正式报告落盘前
+保留。`summary.md` 和 `summary.json` 在全部 24 个 case 完成后生成。每个数据集
+只有在三轮平均延迟至少改善 5%、P99 不回退超过 5%、所有更新零失败且三轮共同
+前缀 Recall 均通过时，正式门禁才通过。
+
 ## 9. 进度、输出与汇总
 
 启动前先确认没有重复 runner：
