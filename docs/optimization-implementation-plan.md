@@ -8,8 +8,10 @@
 [阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)
 记录当前 M2 实现状态；PPT 背景数据搬运结论由
 [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)
-补充。阶段 5A 的最新重复结果见
-[只读执行器可行性与重复验证报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)。
+补充。阶段 5A 的可行性、并发消融与最终固定轨迹门禁分别见
+[只读执行器可行性与重复验证报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)、
+[并发度消融报告](reports/phase5a-concurrency-ablation-report-2026-10-13.md)和
+[固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)。
 旧的混合 compute/CLS 结果只用于历史追溯，不参与目标设定。
 
 本方案固定两个基线角色：
@@ -67,13 +69,14 @@
 单次更新的只读聚合可以先行；跨 update 的修改型微批必须在恢复协议通过后启用。
 所有性能结论必须同时满足零失败、图一致性检查和配对 Recall 门槛。
 
-阶段 5A 三轮重复和并发度消融进一步确认：在更新并发度 4、执行器线程 5、等待
-250 μs 时，只读异步执行的三轮平均延迟降低 20.67%、P99 降低 16.93%、吞吐
-提高 25.89%。并发度 1 时 `subrequests/RPC=1.000` 仍获得 46.84% 延迟收益，证明
-核心机制是独立对象 I/O 等待重叠，而非跨 update 合批；并发度 8 虽把
-`subrequests/RPC` 提高到 1.459，却因饱和使延迟回退 3.05%。近期优先级调整为
-“先补齐可复现更新轨迹质量门禁，再以 5 线程、250 μs、并发度 4 做四数据集正式
-A/B”；扩大 batch 容量或继续增加等待窗口不作为下一步。
+阶段 5A 三轮重复和并发度消融确认：并发度 1 即使没有跨 update 合并仍能获得
+46.84% 延迟收益，核心机制是独立对象 I/O 等待重叠；并发度 8 虽提高合批率，却因
+执行器饱和而回退。随后使用同一份冻结基础图完成固定轨迹门禁：串行 200 次更新的
+目标、插入 ID、level、候选哈希和 Recall 完全一致，0 mismatch；并发度 4 三轮
+均值中，5 线程、250 μs 将平均延迟降低 20.61%、P99 降低 15.97%、吞吐提高
+25.55%，三轮配对 Recall 全部通过。近期下一步已经收敛为“四数据集、三次重复、
+同基础图配对的 OSD-only 正式 A/B”；扩大 batch 容量或继续增加等待窗口不作为
+下一步。
 
 ## 2. 目标架构与 Ceph 边界
 
@@ -491,6 +494,25 @@ Stage 5A 的有效机制是对象级异步并发，微批只是随负载增加�
 通过。阶段 6 的 per-target inflight/queue 控制提前成为后续性能重点，但不在
 Stage 5A 报告中提前宣称实现。
 
+### 8.7 阶段 5A 固定轨迹门禁结论（2026-10-15）
+
+提交 `4f02a30` 增加 importer HNSW cache 的 `build/load` 模式，使控制组与优化组
+每次从完全相同的节点 level 和邻接图开始。GIST1M 串行门禁固定执行 200 个更新，
+两组的目标 label、插入 global ID、节点 level、候选集合哈希和 200 条 Recall
+样本全部相同，`exact_mismatch_count=0`，Recall@10 均为 0.418。由此确认
+`DistanceReadExecutor` 和等待窗口不改变串行搜索/插入语义。
+
+并行度 4 的三轮固定 200-update 配对实验也全部通过质量门禁。三轮平均延迟从
+454.364 降至 360.727 ms（-20.61%），P99 从 755.914 降至 635.214 ms
+（-15.97%），吞吐从 8.732 提高到 10.963 update/s（+25.55%）；Recall 差值为
+-0.050/0.000/+0.350 pp。8/8 轮零失败且 checker 全部通过。
+
+固定轨迹质量门禁现已关闭。Stage 5A 候选参数冻结为 250 μs、5 个执行器线程、
+正式并行度 4；默认开关仍关闭，下一步只运行四数据集三次正式 A/B。正式 runner
+必须在每个 dataset/repetition 内让控制组和优化组复用同一 HNSW cache，并交替
+运行顺序。完整证据见
+[固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)。
+
 完整阶段 5 的退出条件（不是 5A 只读 feasibility gate）：全部 CLS calls/update
 相对 M2 的 501–747 降低至少 60%；patch calls/update 从约 14–17 降至 5 以下，
 patch 阶段占完整更新低于 10%；只读异步使
@@ -576,7 +598,7 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
 | M3 已关闭（负结论） | 自适应 level-0 frontier、按对象 batch distance | 同步扩窗门禁失败，默认关闭 |
 | M4 未开始 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
-| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 三轮重复和并发度消融完成；待固定轨迹质量门禁与四数据集 A/B |
+| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 固定轨迹门禁已通过；待四数据集三次正式 A/B |
 | M5B 被 M4 阻塞 | 幂等邻接写微批 | M4 通过后验证 calls/patch/P99 |
 | M6 拥塞控制 | per-target AIMD 与 deadline flush | queue/P99 达标 |
 | M7 图感知布局 | locality group、bounded object layout | distance object fan-out 降低 ≥30% |
@@ -604,10 +626,12 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 7. `7640e80 feat(cls): add multi-query distance batches`（已完成）
 8. `da6ec8f feat(executor): batch asynchronous distance reads`（已完成；三轮重复通过，进入并行度消融）
 9. `d17fbab feat(runner): automate Stage 5A concurrency ablation`（已完成；5 线程候选，排除并发度 8）
-10. `feat(cls): batch idempotent edge patches`
-11. `feat(scheduler): adapt per-target concurrency`
-12. `feat(layout): place nodes in bounded locality groups`
-13. `test(experiments): add c0-b5 ablation suite`
+10. `8b2cbaa feat(runner): add fixed-trace quality gate`（已完成）
+11. `4f02a30 feat(importer): reuse frozen HNSW index cache`（已完成；固定轨迹通过）
+12. `feat(cls): batch idempotent edge patches`
+13. `feat(scheduler): adapt per-target concurrency`
+14. `feat(layout): place nodes in bounded locality groups`
+15. `test(experiments): add c0-b5 ablation suite`
 
 每个阶段先运行单元测试、小数据集正确性、超时/崩溃注入，再运行四数据集正式实验。
 性能提交和正确性提交不混合，实验报告必须记录完整 commit、二进制哈希和原始结果
