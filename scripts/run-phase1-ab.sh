@@ -28,6 +28,7 @@ distance_microbatch_max_bytes=${DISTANCE_MICROBATCH_MAX_BYTES:-262144}
 distance_microbatch_max_candidates=${DISTANCE_MICROBATCH_MAX_CANDIDATES:-256}
 distance_microbatch_max_subrequests=${DISTANCE_MICROBATCH_MAX_SUBREQUESTS:-32}
 distance_executor_threads=${DISTANCE_EXECUTOR_THREADS:-5}
+distance_target_max_inflight=${DISTANCE_TARGET_MAX_INFLIGHT:-0}
 checker_batch_size=${CHECKER_BATCH_SIZE:-8192}
 semantic_samples=${SEMANTIC_SAMPLES:-256}
 semantic_min_edge_win_rate=${SEMANTIC_MIN_EDGE_WIN_RATE:-0.60}
@@ -106,6 +107,14 @@ fi
   echo "DISTANCE_EXECUTOR_THREADS must be positive." >&2
   exit 2
 }
+[[ "$distance_target_max_inflight" =~ ^[0-9]+$ ]] || {
+  echo "DISTANCE_TARGET_MAX_INFLIGHT must be non-negative." >&2
+  exit 2
+}
+if (( distance_target_max_inflight > 0 )) && [[ "$distance_microbatch" != true ]]; then
+  echo "DISTANCE_TARGET_MAX_INFLIGHT requires DISTANCE_MICROBATCH=true." >&2
+  exit 2
+fi
 [[ "$checker_batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "CHECKER_BATCH_SIZE must be positive." >&2; exit 2; }
 [[ "$semantic_samples" =~ ^[1-9][0-9]*$ ]] || { echo "SEMANTIC_SAMPLES must be positive." >&2; exit 2; }
 python3 - "$semantic_min_edge_win_rate" <<'PY'
@@ -179,6 +188,11 @@ if [[ "$distance_microbatch" == true ]]; then
     --distance-microbatch-max-subrequests "$distance_microbatch_max_subrequests"
     --distance-executor-threads "$distance_executor_threads"
   )
+  if (( distance_target_max_inflight > 0 )); then
+    distance_microbatch_args+=(
+      --distance-target-max-inflight "$distance_target_max_inflight"
+    )
+  fi
 fi
 
 index_cache_args=()
@@ -261,7 +275,7 @@ record_placement() {
 validate_run() {
   local mode=$1 update_json=$2 check_json=$3
   python3 - "$mode" "$distance_microbatch" "$update_json" "$check_json" \
-    "$fixed_num_updates" <<'PY'
+    "$fixed_num_updates" "$distance_target_max_inflight" <<'PY'
 import json
 import sys
 
@@ -270,6 +284,7 @@ expect_microbatch = sys.argv[2] == "true"
 update = json.load(open(sys.argv[3], encoding="utf-8"))
 check = json.load(open(sys.argv[4], encoding="utf-8"))
 fixed_num_updates = int(sys.argv[5]) if sys.argv[5] else None
+target_max_inflight = int(sys.argv[6])
 quality = update.get("quality", {})
 observability = update.get("observability", {})
 summary = {
@@ -310,6 +325,19 @@ if expect_microbatch:
         raise SystemExit("distance microbatch made no multi-query RPCs")
     if not observability.get("distance_multi_query_subrequests", 0):
         raise SystemExit("distance microbatch processed no logical subrequests")
+    if not observability.get("distance_executor_queue_samples", 0):
+        raise SystemExit("distance executor recorded no queue samples")
+    if not observability.get("distance_executor_rpc_samples", 0):
+        raise SystemExit("distance executor recorded no RPC samples")
+if update.get("distance_target_max_inflight") != target_max_inflight:
+    raise SystemExit("distance target inflight limit mismatch")
+if target_max_inflight:
+    observed = observability.get("max_distance_target_inflight", 0)
+    if observed < 1 or observed > target_max_inflight:
+        raise SystemExit(
+            "distance target inflight limit was violated: "
+            f"limit={target_max_inflight}, observed={observed}"
+        )
 if update["failed_updates"] != 0 or check["status"] != "pass":
     raise SystemExit(1)
 if fixed_num_updates is not None:
@@ -378,6 +406,7 @@ exec > >(tee -a "$run_root/suite.log") 2>&1
   echo "distance_microbatch_max_candidates=$distance_microbatch_max_candidates"
   echo "distance_microbatch_max_subrequests=$distance_microbatch_max_subrequests"
   echo "distance_executor_threads=$distance_executor_threads"
+  echo "distance_target_max_inflight=$distance_target_max_inflight"
   echo "checker_batch_size=$checker_batch_size"
   echo "semantic_samples=$semantic_samples"
   echo "semantic_min_edge_win_rate=$semantic_min_edge_win_rate"

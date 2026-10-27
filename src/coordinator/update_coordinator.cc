@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -112,6 +113,9 @@ struct Config {
   uint32_t distance_microbatch_max_candidates = 256;
   uint32_t distance_microbatch_max_subrequests = 32;
   uint32_t distance_executor_threads = 5;
+  // Zero preserves the Stage 5A behavior. A positive value limits concurrent
+  // physical distance RPCs to the same owner/chunk target.
+  uint32_t distance_target_max_inflight = 0;
   uint32_t osd_op_timeout_seconds = 45;
   uint32_t osd_op_retry_limit = 3;
   uint32_t recall_k = 10;
@@ -132,6 +136,21 @@ struct RecallSample {
   uint64_t inserted_global_id = 0;
   uint32_t inserted_level = 0;
   uint64_t candidate_hash = 0;
+};
+
+struct DistanceTargetMetrics {
+  uint64_t logical_subrequests = 0;
+  uint64_t rpc_calls = 0;
+  uint64_t limited_subrequests = 0;
+  uint64_t peak_inflight = 0;
+  uint64_t queue_samples = 0;
+  uint64_t rpc_samples = 0;
+  uint64_t cls_service_samples = 0;
+  uint64_t roundtrip_queue_samples = 0;
+  std::map<uint64_t, uint64_t> queue_us_histogram;
+  std::map<uint64_t, uint64_t> rpc_us_histogram;
+  std::map<uint64_t, uint64_t> cls_service_us_histogram;
+  std::map<uint64_t, uint64_t> roundtrip_queue_us_histogram;
 };
 
 struct Metrics {
@@ -196,6 +215,18 @@ struct Metrics {
   uint64_t max_distance_subrequests_per_rpc = 0;
   double distance_microbatch_queue_seconds = 0.0;
   std::map<uint64_t, uint64_t> distance_subrequests_per_rpc_histogram;
+  uint64_t distance_executor_queue_samples = 0;
+  uint64_t distance_executor_rpc_samples = 0;
+  uint64_t distance_executor_cls_service_samples = 0;
+  uint64_t distance_executor_roundtrip_queue_samples = 0;
+  uint64_t distance_target_limited_subrequests = 0;
+  uint64_t max_distance_target_inflight = 0;
+  uint64_t max_distance_executor_inflight = 0;
+  std::map<uint64_t, uint64_t> distance_executor_queue_us_histogram;
+  std::map<uint64_t, uint64_t> distance_executor_rpc_us_histogram;
+  std::map<uint64_t, uint64_t> distance_executor_cls_service_us_histogram;
+  std::map<uint64_t, uint64_t> distance_executor_roundtrip_queue_us_histogram;
+  std::map<std::string, DistanceTargetMetrics> distance_target_metrics;
   uint64_t update_attempts_observed = 0;
   uint64_t unique_data_objects_sum = 0;
   uint64_t unique_data_pgs_sum = 0;
@@ -427,6 +458,49 @@ double percentile_ms(std::vector<double> values, double p) {
   return values[lo] * (1.0 - frac) + values[hi] * frac;
 }
 
+uint64_t latency_bucket_us(double seconds) {
+  constexpr uint64_t kResolutionUs = 10;
+  const double raw_us = std::ceil(std::max(0.0, seconds) * 1000000.0);
+  const uint64_t us = raw_us >= static_cast<double>(
+                                     std::numeric_limits<uint64_t>::max())
+                          ? std::numeric_limits<uint64_t>::max()
+                          : static_cast<uint64_t>(raw_us);
+  if (us == 0) {
+    return 0;
+  }
+  if (us > std::numeric_limits<uint64_t>::max() - (kResolutionUs - 1)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return ((us + kResolutionUs - 1) / kResolutionUs) * kResolutionUs;
+}
+
+void record_latency_sample(
+    double seconds,
+    uint64_t* samples,
+    std::map<uint64_t, uint64_t>* histogram) {
+  (*samples)++;
+  (*histogram)[latency_bucket_us(seconds)]++;
+}
+
+double histogram_percentile_ms(
+    const std::map<uint64_t, uint64_t>& histogram,
+    uint64_t samples,
+    double p) {
+  if (samples == 0 || histogram.empty()) {
+    return 0.0;
+  }
+  const uint64_t rank = std::max<uint64_t>(
+      1, static_cast<uint64_t>(std::ceil(p * static_cast<double>(samples))));
+  uint64_t cumulative = 0;
+  for (const auto& [upper_us, count] : histogram) {
+    cumulative += count;
+    if (cumulative >= rank) {
+      return static_cast<double>(upper_us) / 1000.0;
+    }
+  }
+  return static_cast<double>(histogram.rbegin()->first) / 1000.0;
+}
+
 double nonnegative(double v) {
   return v > 0.0 ? v : 0.0;
 }
@@ -555,6 +629,60 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
       src.distance_microbatch_queue_seconds;
   for (const auto& [size, count] : src.distance_subrequests_per_rpc_histogram) {
     dst->distance_subrequests_per_rpc_histogram[size] += count;
+  }
+  dst->distance_executor_queue_samples += src.distance_executor_queue_samples;
+  dst->distance_executor_rpc_samples += src.distance_executor_rpc_samples;
+  dst->distance_executor_cls_service_samples +=
+      src.distance_executor_cls_service_samples;
+  dst->distance_executor_roundtrip_queue_samples +=
+      src.distance_executor_roundtrip_queue_samples;
+  dst->distance_target_limited_subrequests +=
+      src.distance_target_limited_subrequests;
+  dst->max_distance_target_inflight = std::max(
+      dst->max_distance_target_inflight, src.max_distance_target_inflight);
+  dst->max_distance_executor_inflight = std::max(
+      dst->max_distance_executor_inflight,
+      src.max_distance_executor_inflight);
+  for (const auto& [upper_us, count] :
+       src.distance_executor_queue_us_histogram) {
+    dst->distance_executor_queue_us_histogram[upper_us] += count;
+  }
+  for (const auto& [upper_us, count] :
+       src.distance_executor_rpc_us_histogram) {
+    dst->distance_executor_rpc_us_histogram[upper_us] += count;
+  }
+  for (const auto& [upper_us, count] :
+       src.distance_executor_cls_service_us_histogram) {
+    dst->distance_executor_cls_service_us_histogram[upper_us] += count;
+  }
+  for (const auto& [upper_us, count] :
+       src.distance_executor_roundtrip_queue_us_histogram) {
+    dst->distance_executor_roundtrip_queue_us_histogram[upper_us] += count;
+  }
+  for (const auto& [target, source] : src.distance_target_metrics) {
+    auto& target_metrics = dst->distance_target_metrics[target];
+    target_metrics.logical_subrequests += source.logical_subrequests;
+    target_metrics.rpc_calls += source.rpc_calls;
+    target_metrics.limited_subrequests += source.limited_subrequests;
+    target_metrics.peak_inflight = std::max(
+        target_metrics.peak_inflight, source.peak_inflight);
+    target_metrics.queue_samples += source.queue_samples;
+    target_metrics.rpc_samples += source.rpc_samples;
+    target_metrics.cls_service_samples += source.cls_service_samples;
+    target_metrics.roundtrip_queue_samples += source.roundtrip_queue_samples;
+    for (const auto& [upper_us, count] : source.queue_us_histogram) {
+      target_metrics.queue_us_histogram[upper_us] += count;
+    }
+    for (const auto& [upper_us, count] : source.rpc_us_histogram) {
+      target_metrics.rpc_us_histogram[upper_us] += count;
+    }
+    for (const auto& [upper_us, count] : source.cls_service_us_histogram) {
+      target_metrics.cls_service_us_histogram[upper_us] += count;
+    }
+    for (const auto& [upper_us, count] :
+         source.roundtrip_queue_us_histogram) {
+      target_metrics.roundtrip_queue_us_histogram[upper_us] += count;
+    }
   }
   dst->update_attempts_observed += src.update_attempts_observed;
   dst->unique_data_objects_sum += src.unique_data_objects_sum;
@@ -2484,7 +2612,14 @@ class DistanceReadExecutor {
       if (stopping_) {
         throw std::runtime_error("distance read executor is stopping");
       }
-      queues_[{owner, chunk}].push_back(std::move(pending));
+      const Target target{owner, chunk};
+      const auto inflight = target_inflight_.find(target);
+      if (cfg_.distance_target_max_inflight > 0 &&
+          inflight != target_inflight_.end() &&
+          inflight->second >= cfg_.distance_target_max_inflight) {
+        pending->target_limited = true;
+      }
+      queues_[target].push_back(std::move(pending));
     }
     queue_cv_.notify_one();
     return future;
@@ -2518,6 +2653,7 @@ class DistanceReadExecutor {
   struct Pending {
     DistanceMultiQuerySubrequest subrequest;
     Clock::time_point enqueued;
+    bool target_limited = false;
     std::promise<Result> promise;
   };
 
@@ -2537,11 +2673,30 @@ class DistanceReadExecutor {
     return false;
   }
 
-  std::pair<Target, Clock::time_point> OldestTargetLocked() const {
+  bool IsDispatchableLocked(const Target& target) const {
+    if (cfg_.distance_target_max_inflight == 0) {
+      return true;
+    }
+    const auto found = target_inflight_.find(target);
+    return found == target_inflight_.end() ||
+        found->second < cfg_.distance_target_max_inflight;
+  }
+
+  bool HasDispatchableRequestsLocked() const {
+    for (const auto& [target, queue] : queues_) {
+      if (!queue.empty() && IsDispatchableLocked(target)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::pair<Target, Clock::time_point> OldestDispatchableTargetLocked() const {
     Target target{};
     Clock::time_point oldest = Clock::time_point::max();
     for (const auto& [candidate_target, queue] : queues_) {
-      if (!queue.empty() && queue.front()->enqueued < oldest) {
+      if (!queue.empty() && IsDispatchableLocked(candidate_target) &&
+          queue.front()->enqueued < oldest) {
         target = candidate_target;
         oldest = queue.front()->enqueued;
       }
@@ -2580,6 +2735,43 @@ class DistanceReadExecutor {
     return batch;
   }
 
+  static std::string TargetName(const Target& target) {
+    return std::to_string(target.first) + ":" + std::to_string(target.second);
+  }
+
+  std::pair<uint64_t, uint64_t> BeginTargetLocked(const Target& target) {
+    uint32_t& target_inflight = target_inflight_[target];
+    target_inflight++;
+    total_inflight_++;
+    if (cfg_.distance_target_max_inflight > 0 &&
+        target_inflight >= cfg_.distance_target_max_inflight) {
+      const auto found = queues_.find(target);
+      if (found != queues_.end()) {
+        for (const auto& pending : found->second) {
+          pending->target_limited = true;
+        }
+      }
+    }
+    return {target_inflight, total_inflight_};
+  }
+
+  void FinishTarget(const Target& target) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      auto found = target_inflight_.find(target);
+      if (found == target_inflight_.end() || found->second == 0 ||
+          total_inflight_ == 0) {
+        throw std::logic_error("distance target inflight accounting underflow");
+      }
+      found->second--;
+      total_inflight_--;
+      if (found->second == 0) {
+        target_inflight_.erase(found);
+      }
+    }
+    queue_cv_.notify_all();
+  }
+
   void MergePhysicalMetrics(const Metrics& local) {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     merge_update_metrics(&metrics_, local);
@@ -2588,14 +2780,38 @@ class DistanceReadExecutor {
   void ExecuteBatch(
       CephFacade& facade,
       const Target& target,
-      const std::vector<PendingPtr>& batch) {
+      const std::vector<PendingPtr>& batch,
+      uint64_t target_inflight,
+      uint64_t executor_inflight) {
     Metrics local;
+    const std::string target_name = TargetName(target);
+    auto& target_metrics = local.distance_target_metrics[target_name];
+    target_metrics.logical_subrequests += batch.size();
+    target_metrics.rpc_calls++;
+    target_metrics.peak_inflight = std::max(
+        target_metrics.peak_inflight, target_inflight);
+    local.max_distance_target_inflight = std::max(
+        local.max_distance_target_inflight, target_inflight);
+    local.max_distance_executor_inflight = std::max(
+        local.max_distance_executor_inflight, executor_inflight);
     const auto dispatch_time = Clock::now();
     for (const auto& pending : batch) {
-      local.distance_microbatch_queue_seconds +=
+      const double queue_seconds =
           std::chrono::duration_cast<std::chrono::duration<double>>(
-              dispatch_time - pending->enqueued)
-              .count();
+              dispatch_time - pending->enqueued).count();
+      local.distance_microbatch_queue_seconds += queue_seconds;
+      record_latency_sample(
+          queue_seconds,
+          &local.distance_executor_queue_samples,
+          &local.distance_executor_queue_us_histogram);
+      record_latency_sample(
+          queue_seconds,
+          &target_metrics.queue_samples,
+          &target_metrics.queue_us_histogram);
+      if (pending->target_limited) {
+        local.distance_target_limited_subrequests++;
+        target_metrics.limited_subrequests++;
+      }
     }
     std::vector<DistanceMultiQuerySubrequest> subrequests;
     subrequests.reserve(batch.size());
@@ -2603,9 +2819,14 @@ class DistanceReadExecutor {
       subrequests.push_back(pending->subrequest);
     }
 
+    const auto rpc_start = Clock::now();
+    double cls_service_seconds = 0.0;
+    bool have_cls_service = false;
     try {
       const auto reply = facade.DistanceMultiQuery(
           target.first, target.second, subrequests, &local);
+      cls_service_seconds = reply.cls_total_seconds;
+      have_cls_service = true;
       std::unordered_map<uint64_t, const ghnsw::DistanceMultiQuerySubreply*>
           replies;
       for (const auto& subreply : reply.subreplies) {
@@ -2642,6 +2863,37 @@ class DistanceReadExecutor {
         }
       }
     }
+    const double rpc_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            Clock::now() - rpc_start).count();
+    record_latency_sample(
+        rpc_seconds,
+        &local.distance_executor_rpc_samples,
+        &local.distance_executor_rpc_us_histogram);
+    record_latency_sample(
+        rpc_seconds,
+        &target_metrics.rpc_samples,
+        &target_metrics.rpc_us_histogram);
+    if (have_cls_service) {
+      const double roundtrip_queue_seconds =
+          nonnegative(rpc_seconds - cls_service_seconds);
+      record_latency_sample(
+          cls_service_seconds,
+          &local.distance_executor_cls_service_samples,
+          &local.distance_executor_cls_service_us_histogram);
+      record_latency_sample(
+          roundtrip_queue_seconds,
+          &local.distance_executor_roundtrip_queue_samples,
+          &local.distance_executor_roundtrip_queue_us_histogram);
+      record_latency_sample(
+          cls_service_seconds,
+          &target_metrics.cls_service_samples,
+          &target_metrics.cls_service_us_histogram);
+      record_latency_sample(
+          roundtrip_queue_seconds,
+          &target_metrics.roundtrip_queue_samples,
+          &target_metrics.roundtrip_queue_us_histogram);
+    }
     MergePhysicalMetrics(local);
   }
 
@@ -2651,31 +2903,45 @@ class DistanceReadExecutor {
     while (true) {
       Target target{};
       std::vector<PendingPtr> batch;
+      uint64_t target_inflight = 0;
+      uint64_t executor_inflight = 0;
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        while (!HasQueuedRequestsLocked()) {
-          if (stopping_) {
-            return;
-          }
-          queue_cv_.wait(lock);
-        }
         while (true) {
-          const auto oldest = OldestTargetLocked();
+          if (!HasQueuedRequestsLocked()) {
+            if (stopping_) {
+              return;
+            }
+            queue_cv_.wait(lock);
+            continue;
+          }
+          if (!HasDispatchableRequestsLocked()) {
+            queue_cv_.wait(lock);
+            continue;
+          }
+          const auto oldest = OldestDispatchableTargetLocked();
           const auto ready_at = oldest.second + wait_duration;
           const auto now = Clock::now();
           if (now >= ready_at || stopping_) {
             target = oldest.first;
             batch = PopBatchLocked(target);
+            if (!batch.empty()) {
+              std::tie(target_inflight, executor_inflight) =
+                  BeginTargetLocked(target);
+            }
             break;
           }
           queue_cv_.wait_until(lock, ready_at);
-          if (!HasQueuedRequestsLocked()) {
-            break;
-          }
         }
       }
       if (!batch.empty()) {
-        ExecuteBatch(facade, target, batch);
+        ExecuteBatch(
+            facade,
+            target,
+            batch,
+            target_inflight,
+            executor_inflight);
+        FinishTarget(target);
       }
     }
   }
@@ -2686,6 +2952,8 @@ class DistanceReadExecutor {
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::map<Target, std::deque<PendingPtr>> queues_;
+  std::map<Target, uint32_t> target_inflight_;
+  uint64_t total_inflight_ = 0;
   bool stopping_ = false;
   std::atomic<uint64_t> next_subrequest_id_{1};
   std::vector<std::unique_ptr<CephFacade>> facades_;
@@ -4047,6 +4315,8 @@ class Coordinator {
         << cfg_.distance_microbatch_max_subrequests << ",\n";
     out << "  \"distance_executor_threads\": "
         << cfg_.distance_executor_threads << ",\n";
+    out << "  \"distance_target_max_inflight\": "
+        << cfg_.distance_target_max_inflight << ",\n";
     out << "  \"vectors_processed\": " << metrics_.vectors_processed << ",\n";
     out << "  \"load_seconds\": " << metrics_.load_seconds << ",\n";
     out << "  \"graph_seconds\": " << metrics_.graph_seconds << ",\n";
@@ -4325,6 +4595,182 @@ class Coordinator {
                       static_cast<double>(metrics_.distance_multi_query_subrequests)
                 : 0.0)
         << ",\n";
+    out << "    \"distance_executor_queue_samples\": "
+        << metrics_.distance_executor_queue_samples << ",\n";
+    out << "    \"distance_executor_queue_p50_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_queue_us_histogram,
+               metrics_.distance_executor_queue_samples,
+               0.50)
+        << ",\n";
+    out << "    \"distance_executor_queue_p95_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_queue_us_histogram,
+               metrics_.distance_executor_queue_samples,
+               0.95)
+        << ",\n";
+    out << "    \"distance_executor_queue_p99_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_queue_us_histogram,
+               metrics_.distance_executor_queue_samples,
+               0.99)
+        << ",\n";
+    out << "    \"distance_executor_rpc_samples\": "
+        << metrics_.distance_executor_rpc_samples << ",\n";
+    out << "    \"distance_executor_rpc_p50_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_rpc_us_histogram,
+               metrics_.distance_executor_rpc_samples,
+               0.50)
+        << ",\n";
+    out << "    \"distance_executor_rpc_p95_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_rpc_us_histogram,
+               metrics_.distance_executor_rpc_samples,
+               0.95)
+        << ",\n";
+    out << "    \"distance_executor_rpc_p99_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_rpc_us_histogram,
+               metrics_.distance_executor_rpc_samples,
+               0.99)
+        << ",\n";
+    out << "    \"distance_executor_cls_service_samples\": "
+        << metrics_.distance_executor_cls_service_samples << ",\n";
+    out << "    \"distance_executor_roundtrip_queue_samples\": "
+        << metrics_.distance_executor_roundtrip_queue_samples << ",\n";
+    out << "    \"distance_executor_cls_service_p50_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_cls_service_us_histogram,
+               metrics_.distance_executor_cls_service_samples,
+               0.50)
+        << ",\n";
+    out << "    \"distance_executor_cls_service_p95_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_cls_service_us_histogram,
+               metrics_.distance_executor_cls_service_samples,
+               0.95)
+        << ",\n";
+    out << "    \"distance_executor_cls_service_p99_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_cls_service_us_histogram,
+               metrics_.distance_executor_cls_service_samples,
+               0.99)
+        << ",\n";
+    out << "    \"distance_executor_roundtrip_queue_p50_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_roundtrip_queue_us_histogram,
+               metrics_.distance_executor_roundtrip_queue_samples,
+               0.50)
+        << ",\n";
+    out << "    \"distance_executor_roundtrip_queue_p95_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_roundtrip_queue_us_histogram,
+               metrics_.distance_executor_roundtrip_queue_samples,
+               0.95)
+        << ",\n";
+    out << "    \"distance_executor_roundtrip_queue_p99_ms\": "
+        << histogram_percentile_ms(
+               metrics_.distance_executor_roundtrip_queue_us_histogram,
+               metrics_.distance_executor_roundtrip_queue_samples,
+               0.99)
+        << ",\n";
+    out << "    \"distance_target_limited_subrequests\": "
+        << metrics_.distance_target_limited_subrequests << ",\n";
+    out << "    \"distance_target_limited_fraction\": "
+        << (metrics_.distance_multi_query_subrequests > 0
+                ? static_cast<double>(
+                      metrics_.distance_target_limited_subrequests) /
+                      static_cast<double>(
+                          metrics_.distance_multi_query_subrequests)
+                : 0.0)
+        << ",\n";
+    out << "    \"max_distance_target_inflight\": "
+        << metrics_.max_distance_target_inflight << ",\n";
+    out << "    \"max_distance_executor_inflight\": "
+        << metrics_.max_distance_executor_inflight << ",\n";
+    out << "    \"distance_target_observability\": {";
+    bool first_distance_target = true;
+    for (const auto& [target, target_metrics] :
+         metrics_.distance_target_metrics) {
+      if (!first_distance_target) {
+        out << ",";
+      }
+      first_distance_target = false;
+      out << "\n      \"" << target << "\": {"
+          << "\"current_inflight\": 0, "
+          << "\"peak_inflight\": " << target_metrics.peak_inflight << ", "
+          << "\"logical_subrequests\": "
+          << target_metrics.logical_subrequests << ", "
+          << "\"rpc_calls\": " << target_metrics.rpc_calls << ", "
+          << "\"limited_subrequests\": "
+          << target_metrics.limited_subrequests << ", "
+          << "\"queue_p50_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.queue_us_histogram,
+                 target_metrics.queue_samples,
+                 0.50)
+          << ", \"queue_p95_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.queue_us_histogram,
+                 target_metrics.queue_samples,
+                 0.95)
+          << ", \"queue_p99_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.queue_us_histogram,
+                 target_metrics.queue_samples,
+                 0.99)
+          << ", \"rpc_p50_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.rpc_us_histogram,
+                 target_metrics.rpc_samples,
+                 0.50)
+          << ", \"rpc_p95_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.rpc_us_histogram,
+                 target_metrics.rpc_samples,
+                 0.95)
+          << ", \"rpc_p99_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.rpc_us_histogram,
+                 target_metrics.rpc_samples,
+                 0.99)
+          << ", \"cls_service_p50_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.cls_service_us_histogram,
+                 target_metrics.cls_service_samples,
+                 0.50)
+          << ", \"cls_service_p95_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.cls_service_us_histogram,
+                 target_metrics.cls_service_samples,
+                 0.95)
+          << ", \"cls_service_p99_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.cls_service_us_histogram,
+                 target_metrics.cls_service_samples,
+                 0.99)
+          << ", \"roundtrip_queue_p50_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.roundtrip_queue_us_histogram,
+                 target_metrics.roundtrip_queue_samples,
+                 0.50)
+          << ", \"roundtrip_queue_p95_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.roundtrip_queue_us_histogram,
+                 target_metrics.roundtrip_queue_samples,
+                 0.95)
+          << ", \"roundtrip_queue_p99_ms\": "
+          << histogram_percentile_ms(
+                 target_metrics.roundtrip_queue_us_histogram,
+                 target_metrics.roundtrip_queue_samples,
+                 0.99)
+          << "}";
+    }
+    if (!first_distance_target) {
+      out << "\n    ";
+    }
+    out << "},\n";
     out << "    \"distance_subrequests_per_rpc_histogram\": {";
     bool first_distance_subrequests = true;
     for (const auto& [subrequests, count] :
@@ -4518,6 +4964,8 @@ class Coordinator {
         << cfg_.distance_microbatch_max_subrequests << ",\n";
     out << "  \"distance_executor_threads\": "
         << cfg_.distance_executor_threads << ",\n";
+    out << "  \"distance_target_max_inflight\": "
+        << cfg_.distance_target_max_inflight << ",\n";
     out << "  \"remote_adj_calls\": " << metrics_.remote_adj_calls << ",\n";
     out << "  \"remote_distance_calls\": " << metrics_.remote_distance_calls << ",\n";
     out << "  \"remote_noop_calls\": " << metrics_.remote_noop_calls << ",\n";
@@ -4700,6 +5148,13 @@ Config ParseArgs(int argc, const char** argv) {
       if (cfg.distance_executor_threads == 0) {
         throw std::runtime_error("--distance-executor-threads must be >= 1");
       }
+    } else if (arg == "--distance-target-max-inflight") {
+      cfg.distance_target_max_inflight = static_cast<uint32_t>(
+          std::stoul(next("--distance-target-max-inflight")));
+      if (cfg.distance_target_max_inflight == 0) {
+        throw std::runtime_error(
+            "--distance-target-max-inflight must be >= 1");
+      }
     } else if (arg == "--osd-op-timeout-seconds") {
       cfg.osd_op_timeout_seconds =
           static_cast<uint32_t>(std::stoul(next("--osd-op-timeout-seconds")));
@@ -4721,6 +5176,10 @@ Config ParseArgs(int argc, const char** argv) {
   }
   if (cfg.distance_microbatch && cfg.mode != "update") {
     throw std::runtime_error("--distance-microbatch requires --mode update");
+  }
+  if (cfg.distance_target_max_inflight > 0 && !cfg.distance_microbatch) {
+    throw std::runtime_error(
+        "--distance-target-max-inflight requires --distance-microbatch");
   }
   return cfg;
 }
