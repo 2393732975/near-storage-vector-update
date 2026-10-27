@@ -557,6 +557,20 @@ patch 阶段占完整更新低于 10%；只读异步使
 P99 不回退、平均延迟不丢失已有 5% 收益、零失败且配对 Recall 通过。不得用全局
 线程池缩小或延长 timeout 伪装成拥塞控制收益。
 
+### 9.1 固定上限实现与首个门禁（2026-10-27）
+
+提交 `cb156fd` 已在只读 `DistanceReadExecutor` 中实现可选的 owner/chunk target
+级固定 inflight 上限；默认 `0` 保持阶段 5A 行为。调度器只在目标仍有槽位时取批，
+完成 RPC 后释放槽位，不改变搜索依赖、邻接写、label CAS 或元数据协议。新增全局
+及逐 target 的 executor queue、RPC、CLS service、推导 roundtrip/queue
+P50/P95/P99、峰值 inflight 和受限子请求计数。
+
+GIST1M 30 s、并发度 4、5 个 executor、250 μs、上限 1 的真实 Ceph 门禁完成
+300 次更新且零失败，checker 通过；134,290 个逻辑子请求中 8,122 个受限，65/65
+个 target 均实际触发限流，观测峰值严格为 1。该结果只证明控制和观测有效，不是
+性能结论。下一步由 `run-stage6-inflight-scan.sh` 使用每轮冻结的 Deep100M cache，
+对 unlimited/1/2/4 做三轮轮换顺序消融；扫描通过前不实现 AIMD。
+
 OSD 映射不可得或 CRUSH 变化时，以 target object 为控制粒度，不使用陈旧 OSD ID
 强制路由。只读副本执行作为独立消融，优先使用 Ceph 原生 replica-read 能力；
 修改请求不进行“多副本客户端并行下发”。

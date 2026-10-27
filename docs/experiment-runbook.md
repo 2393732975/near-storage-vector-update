@@ -430,6 +430,7 @@ scripts/run-phase0-validation.sh --confirm-reset
 | `DISTANCE_MICROBATCH_MAX_CANDIDATES` | 256 | 256 | 256 | 所有子请求候选总数上限 |
 | `DISTANCE_MICROBATCH_MAX_SUBREQUESTS` | 32 | 32 | 32 | 单个物理 RPC 的 query 子请求上限 |
 | `DISTANCE_EXECUTOR_THREADS` | 5 | 5 | 5 | 初始与实验 OSD 数一致；正式扫描需记录 |
+| `DISTANCE_TARGET_MAX_INFLIGHT` | 0 | 0 | 0 | 0 表示不限制；阶段 6 仅在 OSD microbatch 路径扫描 1/2/4 |
 | `RUN_ROOT` | 自动时间戳 | 自动时间戳 | 自动时间戳 | 始终使用新目录 |
 | `ROUNDS` / `REPETITIONS` | 不适用 | 3 | 3 | 阶段 1 必须是独立重新导入 |
 | `CHECKER_BATCH_SIZE` | 不适用 | 8192 | 8192 | 内存不足时降低 |
@@ -511,6 +512,31 @@ env \
 保留。`summary.md` 和 `summary.json` 在全部 24 个 case 完成后生成。每个数据集
 只有在三轮平均延迟至少改善 5%、P99 不回退超过 5%、所有更新零失败且三轮共同
 前缀 Recall 均通过时，正式门禁才通过。
+
+### 阶段 6 Deep100M per-target inflight 扫描
+
+阶段 6 首轮只改变只读距离调度，不修改 HNSW frontier、写路径、超时或线程数。
+专用 runner 固定 250 μs、5 个 executor、更新并发度 4，对
+`unlimited/1/2/4` 做三次 Deep100M 轮换顺序实验；每个 repetition 内四个配置
+加载同一份 HNSW cache。`0` 表示阶段 5A 的无限制控制组。
+
+```bash
+run_root="$PWD/results/stage6-inflight-scan-$(date -u +%Y%m%dT%H%M%SZ)"
+env \
+  CEPH_KEYRING=/path/to/untracked.keyring \
+  DATASET_ROOT=/path/to/datasets \
+  REPETITIONS=3 \
+  WINDOW_SECONDS=300 \
+  UPDATE_PARALLELISM=4 \
+  TARGET_INFLIGHT_CAPS="0 1 2 4" \
+  RUN_ROOT="$run_root" \
+  scripts/run-stage6-inflight-scan.sh --confirm-reset
+```
+
+每个 `update.json` 记录全局和逐 owner/chunk target 的 executor queue、RPC、CLS
+service、推导 roundtrip/queue P50/P95/P99，以及峰值 inflight 和受限请求比例。
+固定上限候选必须零失败、零 RADOS retry、配对 Recall 通过、三轮 P99 不高于当轮
+uncapped 均值，并保持相对历史 M2 至少 5% 的平均延迟收益；否则不得进入 AIMD。
 
 ## 9. 进度、输出与汇总
 
