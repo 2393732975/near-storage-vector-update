@@ -11,7 +11,9 @@
 补充。阶段 5A 的可行性、并发消融与最终固定轨迹门禁分别见
 [只读执行器可行性与重复验证报告](reports/phase5a-read-executor-feasibility-report-2026-10-12.md)、
 [并发度消融报告](reports/phase5a-concurrency-ablation-report-2026-10-13.md)和
-[固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)。
+[固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)；
+最终四数据集结果见
+[阶段 5A 四数据集正式 A/B 报告](reports/phase5a-four-dataset-formal-ab-report-2026-10-27.md)。
 旧的混合 compute/CLS 结果只用于历史追溯，不参与目标设定。
 
 本方案固定两个基线角色：
@@ -75,8 +77,11 @@
 目标、插入 ID、level、候选哈希和 Recall 完全一致，0 mismatch；并发度 4 三轮
 均值中，5 线程、250 μs 将平均延迟降低 20.61%、P99 降低 15.97%、吞吐提高
 25.55%，三轮配对 Recall 全部通过。近期下一步已经收敛为“四数据集、三次重复、
-同基础图配对的 OSD-only 正式 A/B”；扩大 batch 容量或继续增加等待窗口不作为
-下一步。
+同基础图配对的 OSD-only 正式 A/B”。该实验随后完成：GIST1M、Text2Image10M
+和 SIFT100M 的平均延迟降低 15.53%–24.07%，P99 同步改善；Deep100M 平均延迟
+降低 6.25%，但 P99 增加 23.58%，因此总门禁失败。扩大 batch 容量或继续增加
+等待窗口不作为下一步；优先进入阶段 6，为高对象扇出的异步读取增加 per-target
+inflight/queue 观测和限流。
 
 ## 2. 目标架构与 Ceph 边界
 
@@ -507,11 +512,31 @@ Stage 5A 报告中提前宣称实现。
 （-15.97%），吞吐从 8.732 提高到 10.963 update/s（+25.55%）；Recall 差值为
 -0.050/0.000/+0.350 pp。8/8 轮零失败且 checker 全部通过。
 
-固定轨迹质量门禁现已关闭。Stage 5A 候选参数冻结为 250 μs、5 个执行器线程、
-正式并行度 4；默认开关仍关闭，下一步只运行四数据集三次正式 A/B。正式 runner
-必须在每个 dataset/repetition 内让控制组和优化组复用同一 HNSW cache，并交替
-运行顺序。完整证据见
+固定轨迹质量门禁关闭后，Stage 5A 候选参数冻结为 250 μs、5 个执行器线程、
+正式并行度 4；默认开关保持关闭，并进入四数据集三次正式 A/B。正式 runner 在
+每个 dataset/repetition 内让控制组和优化组复用同一 HNSW cache，并交替运行
+顺序。完整证据见
 [固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)。
+
+### 8.8 阶段 5A 四数据集正式门禁结论（2026-10-27）
+
+提交 `51766ff` 上完成四个数据集、两种 OSD 配置、三次重复，共 24 个 case 和
+66,413 次成功更新。每个 dataset/repetition 的控制组和优化组复用同一份 HNSW
+cache，运行顺序交替。24/24 次 checker 通过、更新失败和 RADOS retry 均为 0，
+12/12 组配对 Recall 全部通过，质量差值为 -0.331 至 +0.118 pp。
+
+GIST1M、Text2Image10M 和 SIFT100M 的平均延迟分别降低 24.07%、15.53% 和
+18.88%，P99 分别降低 21.15%、14.96% 和 31.63%。Deep100M 平均延迟降低
+6.25%，但 P99 增加 23.58%；其中第三轮平均延迟仍降低 7.26%，P99 却增加
+61.92%。按预设门槛，Stage 5A 总体为性能失败，默认开关继续关闭。
+
+Deep100M 约触达 363 个距离对象，`subrequests/RPC=1.018`，CLS calls/update
+只减少 1.74%；优化后 payload 和邻接 patch 分别增加约 12.58% 和 20.25%。同时
+三轮零失败、零重试，平均 executor queue 没有在异常轮升高。现有全局平均指标
+无法解释个别慢 update，不能通过增加线程或等待窗口继续盲调。下一步提前进入
+阶段 6 的只读范围：先观测 per-target queue/inflight 尾部并设置有界并发，再用
+冻结 cache 对 Deep100M 做三轮复测。完整证据见
+[四数据集正式 A/B 报告](reports/phase5a-four-dataset-formal-ab-report-2026-10-27.md)。
 
 完整阶段 5 的退出条件（不是 5A 只读 feasibility gate）：全部 CLS calls/update
 相对 M2 的 501–747 降低至少 60%；patch calls/update 从约 14–17 降至 5 以下，
@@ -524,6 +549,13 @@ patch 阶段占完整更新低于 10%；只读异步使
 每目标维护 RTT、CLS service、推导 queue、inflight、cwnd、batch limit 和 timeout
 计数。第一版采用 AIMD：低 queue 时缓慢增加 cwnd；queue P95、超时或 slow-op
 增加时窗口减半；接近 deadline 的批次立即刷新。
+
+阶段 5A 的 Deep100M 结果把第一步进一步限定为只读距离路径：先补充每个 target
+的 inflight 当前值/峰值、queue/RTT P50/P95/P99、deadline flush 和限流次数，
+再实现固定上限消融，最后才启用 AIMD。第一轮扫描保持 250 μs、5 个 executor
+线程和更新并发度 4，只改变 per-target inflight 上限；门禁要求 Deep100M 三轮
+P99 不回退、平均延迟不丢失已有 5% 收益、零失败且配对 Recall 通过。不得用全局
+线程池缩小或延长 timeout 伪装成拥塞控制收益。
 
 OSD 映射不可得或 CRUSH 变化时，以 target object 为控制粒度，不使用陈旧 OSD ID
 强制路由。只读副本执行作为独立消融，优先使用 Ceph 原生 replica-read 能力；
@@ -598,9 +630,9 @@ payload bytes、OMAP key 数和更新率设置硬上限，避免大型 OMAP 对�
 | M2 已完成 | PlacementResolver、schema v1、幂等重放、distance-only fan-out | 12/12 轮通过，平均延迟/吞吐变化 < 5% |
 | M3 已关闭（负结论） | 自适应 level-0 frontier、按对象 batch distance | 同步扩窗门禁失败，默认关闭 |
 | M4 未开始 | intent/saga、恢复器、元数据拆分 | crash injection 通过 |
-| M5A 进行中 | 只读异步 RemoteExecutor、multi-query 微批 | 固定轨迹门禁已通过；待四数据集三次正式 A/B |
+| M5A 性能门禁失败 | 只读异步 RemoteExecutor、multi-query 微批 | 正确性通过；3/4 数据集性能通过，Deep100M P99 +23.58%，默认关闭 |
 | M5B 被 M4 阻塞 | 幂等邻接写微批 | M4 通过后验证 calls/patch/P99 |
-| M6 拥塞控制 | per-target AIMD 与 deadline flush | queue/P99 达标 |
+| M6 下一步 | per-target 观测、固定 inflight 上限、AIMD 与 deadline flush | 先使 Deep100M 三轮 P99 不回退，再复跑四数据集 |
 | M7 图感知布局 | locality group、bounded object layout | distance object fan-out 降低 ≥30% |
 | M8 集成评估 | B0–B5 消融、统计报告和图表 | 综合目标验证 |
 
