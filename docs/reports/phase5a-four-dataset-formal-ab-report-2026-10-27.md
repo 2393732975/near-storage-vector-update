@@ -138,6 +138,16 @@ M2 路径，没有绕过阶段 4 的 intent/saga 门禁。
    P99 不回退后，再重跑四数据集正式门禁。
 4. 修改型 edge patch 微批仍被阶段 4 阻塞；本结果不能视为完整阶段 5 完成。
 
-本报告初次落盘时，六个 `nsvu_*` 实验池和 HNSW cache 仍保留。报告提交后使用
-FSID 保护的白名单脚本清理实验池，并只删除可由 manifest 重建的 cache；原始
-JSON、日志、checker、paired-quality、`cache-manifest.txt` 和 summary 将保留。
+报告和原始工件落盘并完成 Git 提交后，已使用 FSID 保护的白名单脚本删除
+`nsvu_meta` 和 `nsvu_owner_0`–`4`。最终只保留 `.mgr`、`rbd`，5/5 OSD
+`up/in`、33/33 PG `active+clean`，无 `nsvu_*` 残留。
+
+删除 cache 前逐一验证 12 个 `.hnsw` 文件均与 `cache-manifest.txt` 的路径和字节数
+一致，随后删除共 358,214,956,308 bytes（333.614 GiB）的可再生成 cache；该操作
+不可直接恢复，但可以依据 manifest 和数据集重新构建。结果目录由约 334 GiB 降至
+52 MiB，24 个 update JSON、24 个 checker、12 个 paired-quality、日志、summary
+和 cache manifest 全部保留。
+
+集群仍报告 5 个 OSD 的既有 BlueStore slow-op 指示和 `devicehealth` 模块磁盘 I/O
+错误；这不是池删除失败。本次未屏蔽告警，也未为清除计数而强制压缩或重启 OSD，
+BlueStore 物理空间由后台异步回收。
