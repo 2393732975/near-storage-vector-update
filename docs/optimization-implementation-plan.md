@@ -571,6 +571,21 @@ GIST1M 30 s、并发度 4、5 个 executor、250 μs、上限 1 的真实 Ceph �
 性能结论。下一步由 `run-stage6-inflight-scan.sh` 使用每轮冻结的 Deep100M cache，
 对 unlimited/1/2/4 做三轮轮换顺序消融；扫描通过前不实现 AIMD。
 
+### 9.2 Deep100M 固定上限扫描结论（2026-11-12）
+
+三轮四配置共 12 个 case 已完成，全部零失败、零 retry，checker 和 9 组配对
+Recall 全部通过。`cap=1` 三轮平均延迟为 463.271 ms，P99 为 915.163 ms，
+相对 uncapped 分别改善 3.38% 和 51.60%，并保留相对历史 M2 至少 5% 的平均延迟
+收益，因此通过固定上限门禁并作为候选值；默认值仍保持 0。
+
+该结论不等于阶段 6 完成。收益主要来自第二轮 uncapped 的 4085.520 ms 异常
+P99，第一、三轮的 `cap=1` 反而回退；executor queue P95 和推导
+roundtrip/queue P95 相对 uncapped 只下降 0.71% 和 3.23%，没有达到 20% 退出
+门槛。`cap=2` 只限制 6 个子请求，`cap=4` 从未触发，二者差异视为运行波动。
+在复用冻结 cache 增加 uncapped/cap=1 交替重复并补充逐 update 尾部关联前，暂缓
+AIMD。完整证据见
+[阶段 6 固定上限扫描报告](reports/phase6-deep100m-inflight-scan-report-2026-11-12.md)。
+
 OSD 映射不可得或 CRUSH 变化时，以 target object 为控制粒度，不使用陈旧 OSD ID
 强制路由。只读副本执行作为独立消融，优先使用 Ceph 原生 replica-read 能力；
 修改请求不进行“多副本客户端并行下发”。

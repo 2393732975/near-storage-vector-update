@@ -18,6 +18,7 @@
 - [阶段 5A 并发度消融报告](reports/phase5a-concurrency-ablation-report-2026-10-13.md)：执行器线程与更新并发度扫描、异步/合批收益拆分、饱和点和质量门禁限制。
 - [阶段 5A 固定轨迹质量与性能门禁报告](reports/phase5a-fixed-trace-validation-report-2026-10-15.md)：冻结同一基础图后的串行精确轨迹、并行三轮质量复核与正式参数决策。
 - [阶段 5A 四数据集正式 A/B 报告](reports/phase5a-four-dataset-formal-ab-report-2026-10-27.md)：同基础图配对的 24-case 正式结果、Deep100M P99 失败分析与阶段 6 决策。
+- [阶段 6 Deep100M Per-Target Inflight 扫描报告](reports/phase6-deep100m-inflight-scan-report-2026-11-12.md)：固定上限三轮消融、逐 target 尾部观测、稳健性限制与 AIMD 暂缓结论。
 - [Compute-node 背景实验报告](reports/compute-background-report-2026-09-23.md)：PPT 背景数据移动实验的零失败复现结果。
 
 ## 参考材料
