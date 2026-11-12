@@ -146,8 +146,9 @@ P99 异常。这说明少量受限请求可能影响 update 级关键路径，�
 4. 若额外重复仍显示 cap=1 只改善偶发异常而稳定轮回退，则不实施 AIMD，转向
    阶段 7 的对象布局或先降低 RPC/对象扇出。
 
-截至报告生成时，三个 cache 和原始工件仍保留，结果目录约 132 GiB；六个
-`nsvu_*` 实验池也尚未清理。集群为 5/5 OSD `up/in`、39/39 PG
-`active+clean`，健康告警包含 630 个 large OMAP objects、实验池单副本和既有
-`devicehealth` I/O 错误。应在报告提交后先执行白名单清理，再校验 cache manifest
-并按用户授权删除可再生成 cache。
+报告提交后已使用 FSID 保护的白名单脚本删除 `nsvu_meta` 和
+`nsvu_owner_0`–`4`。最终只保留 `.mgr`、`rbd`，5/5 OSD `up/in`、33/33 PG
+`active+clean`，无 `nsvu_*` 残留；large OMAP 和实验池单副本告警随池删除消失。
+集群仍报告既有 BlueStore slow-op 和 `devicehealth` I/O 错误，未屏蔽告警，也未
+强制压缩或重启 OSD。三个 cache 和原始结果仍完整保留，cache 约 132 GiB；删除前
+仍需校验 `cache-manifest.txt` 并获得单独授权。
