@@ -7,6 +7,7 @@
 
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
+- [项目问题评估与后续验证报告](reports/project-issues-assessment-2026-11-12.md)：九类现存问题的事实证据、原因与影响、能力边界，以及处理顺序和建议验收方法。
 - [阶段 0 正确性与观测基线](correctness-observability-baseline.md)：更新协议、离线检查器和正式验收流程。
 - [阶段耗时与数据移动打点](stage-profiling.md)：compute/OSD 路径、指标边界、统计口径和运行入口。
 - [阶段 0 集群验收报告](reports/phase0-validation-report-2026-09-22.md)：当前零失败、通过一致性检查的正式结果。
