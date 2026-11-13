@@ -5,6 +5,7 @@
 
 ## 当前文档
 
+- [源码阅读指南](source-reading-guide.md)：从 ID 与对象布局、基础图导入、在线更新调用链到 CLS、只读执行器、检查器和实验门禁，附源码定位、流程图、阅读顺序与验证练习。
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
 - [项目问题评估与后续验证报告](reports/project-issues-assessment-2026-11-12.md)：九类现存问题的事实证据、原因与影响、能力边界，以及处理顺序和建议验收方法。

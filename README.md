@@ -93,6 +93,7 @@ MODES=osd DATASETS="gist1m text2image10m deep100m sift100m" \
 每次实验至少记录：Git commit、CLS 二进制哈希、Ceph 版本、数据集参数、并发度、pool size/PG 数量以及实际 `ceph pg map` 落点。当前 `size=1` 的池仅用于隔离研究开销，不具备生产级数据冗余。
 
 文档入口见 [docs/README.md](docs/README.md)。核心内容包括
+[源码阅读指南](docs/source-reading-guide.md)、
 [优化实施方案](docs/optimization-implementation-plan.md)、
 [阶段 0 正确性与观测基线](docs/correctness-observability-baseline.md)、
 [阶段耗时与数据移动打点](docs/stage-profiling.md)和
