@@ -13,7 +13,7 @@
 - [阶段耗时与数据移动打点](stage-profiling.md)：compute/OSD 路径、指标边界、统计口径和运行入口。
 - [阶段 0 集群验收报告](reports/phase0-validation-report-2026-09-22.md)：当前零失败、通过一致性检查的正式结果。
 - [阶段 1 Strict Raw-RADOS/OSD A/B 报告](reports/phase1-strict-raw-vs-osd-report-2026-09-30.md)：纯原生 RADOS compute 与 OSD/CLS 的三次独立重复、阶段耗时和瓶颈结论。
-- [OSD-side CLS baseline 实验流程与数据图解](reports/osd-cls-baseline-visual-summary-2026-11-16.md)：基于阶段 1 原始工件重算，配六张可复用图解释实验流程、性能收益、阶段瓶颈、请求粒度和逐轮 P99，并明确历史控制条件与统计口径。
+- [OSD/CLS 基线（阶段 0–2）与后续优化图解](reports/osd-cls-baseline-visual-summary-2026-11-16.md)：以阶段 2 M2 为主 OSD 基线，明确阶段 1 数据出处，配六张新图展示阶段 3、5A、6 的措施、同期对照、实际收益与回退；区分历史基线值和后续重跑控制组。
 - [阶段 2 协议与路由抽象验收报告](reports/phase2-protocol-routing-validation-2026-09-30.md)：schema v1 滚动部署、GIST1M smoke、指标闭合与幂等重放验证。
 - [阶段 2 OSD 全量回归报告](reports/phase2-osd-full-regression-report-2026-10-10.md)：四数据集三轮 OSD-only 复测、与阶段 1 OSD 的性能对比及具体代码改动。
 - [阶段 3 Frontier 聚合可行性报告](reports/phase3-frontier-feasibility-report-2026-10-10.md)：固定窗口与自适应窗口的 GIST1M 验证、失败根因和停止结论。
