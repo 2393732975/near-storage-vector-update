@@ -101,34 +101,31 @@ def save(fig, output, name, caption, source):
 def baseline_overview(phase1, phase2, output):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6.6))
     fig.subplots_adjust(left=0.14, right=0.96, top=0.78, bottom=0.20, wspace=0.36)
-    fig.suptitle("基线范围止于阶段 2：主 OSD 基线取 M2", fontsize=18, y=0.98)
-    variants = [("阶段 1 C0：原生 RADOS", "#A0AAB5", -0.25,
+    fig.suptitle("Compute 路线与阶段 2 OSD baseline 对比", fontsize=18, y=0.98)
+    variants = [("Compute：严格原生 RADOS（C0）", "#A0AAB5", -0.18,
                  lambda d: phase1[d, "compute"]),
-                ("阶段 1 B0：原始 OSD", "#76B1B2", 0,
-                 lambda d: phase1[d, "osd"]),
-                ("阶段 2 M2：主 OSD 基线", "#187B80", 0.25, lambda d: phase2[d])]
+                ("OSD baseline：阶段 2 M2", "#187B80", 0.18, lambda d: phase2[d])]
     for ax, key, xlabel in zip(axes, ["avg_update_latency_ms", "throughput_updates_per_sec"],
                                ["平均更新延迟（ms，越低越好）", "吞吐（update/s，越高越好）"]):
-        maximum = 0
+        maximum = max(value + ci for _, _, _, getter in variants
+                      for value, ci in [base.mean_ci(getter(d), key) for d in DATASETS])
         for label, color, shift, getter in variants:
             values = [base.mean_ci(getter(d), key) for d in DATASETS]
             means, cis = zip(*values)
-            maximum = max(maximum, max(v + ci for v, ci in values))
-            ax.barh([i + shift for i in range(4)], means, 0.21, xerr=cis,
+            ax.barh([i + shift for i in range(4)], means, 0.29, xerr=cis,
                     color=color, label=label, capsize=2, error_kw={"elinewidth": 0.9})
-        for i, dataset in enumerate(DATASETS):
-            value = mean(phase2[dataset], key)
-            ax.text(maximum * 1.035, i + 0.25, f"{value:.3f}", va="center", fontsize=10)
+            for i, value in enumerate(means):
+                ax.text(maximum * 1.035, i + shift, f"{value:.3f}", va="center", fontsize=10)
         ax.set_xlim(0, maximum * 1.24)
         ax.set_yticks(range(4), LABELS)
         ax.invert_yaxis()
         base.decorate(ax, xlabel)
     fig.legend(*axes[0].get_legend_handles_labels(), loc="upper center",
-               bbox_to_anchor=(0.53, 0.91), ncol=3, frameon=False, fontsize=10)
+               bbox_to_anchor=(0.53, 0.91), ncol=2, frameon=False, fontsize=10)
     save(fig, output, "01-baselines-through-phase2",
-         "三轮 case 算术均值 ± 95% Student-t CI。阶段 1 / 2 是不同批次；本图描述基线建立，不计算后续优化收益。\n"
-         "阶段 0 为连续运行正确性验收，不把其轮次合并进性能均值。右侧数字对应阶段 2 M2。",
-         "阶段 1 b74a897；阶段 2 2978d78；各 3 次独立重导入。")
+         "柱长与右侧数字为三轮 case 算术均值；误差线为均值的 95% Student-t CI。每个数据集仅比较两条路线。\n"
+         "Compute 使用阶段 1 严格 C0，OSD 使用阶段 2 M2；两组来自不同批次，不作为同期配对优化收益。",
+         "Compute：b74a897；OSD baseline：2978d78；各 3 次独立重导入。")
 
 
 def phase2_profile(phase2, output):

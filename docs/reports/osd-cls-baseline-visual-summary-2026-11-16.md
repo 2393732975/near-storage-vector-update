@@ -91,13 +91,20 @@ hnswlib 构建 base 图、转换编号并导入 → 在线替换 → 保存指�
 | Deep100M | 100,000,000 | 96 / F32 | L2 | 64 | 160,000 |
 | SIFT100M | 100,000,000 | 128 / U8 | L2 | 64 | 250,000 |
 
-### 3.2 基线建立过程与主基线数值
+### 3.2 Compute 路线与阶段 2 OSD baseline 对比
 
-![图 1：阶段 1 与阶段 2 的基线身份及性能](../figures/osd-baseline-optimizations/01-baselines-through-phase2.png)
+![图 1：Compute 路线与阶段 2 OSD baseline 的延迟和吞吐](../figures/osd-baseline-optimizations/01-baselines-through-phase2.png)
 
-阶段 1 的 C0/B0 严格对照显示，OSD 相对 compute 的三轮平均延迟降低
-12.67%–22.32%、吞吐提高 14.33%–29.39%。这是**基线建立中的执行路径对照结果**，
-不计作阶段 3 以后某项优化的收益。
+图中每个数据集只有两组：**compute 路线使用阶段 1 的严格原生 RADOS C0，OSD
+baseline 使用阶段 2 的 M2**。两组各有三次独立重导入，但来自不同实验批次；本图用于
+展示两条路线的基线表现，不把其差异当作同期配对优化收益。图中不再展示阶段 1 OSD B0。
+
+| 数据集 | Compute 平均延迟 ms | 阶段 2 OSD 平均延迟 ms | Compute 吞吐 update/s | 阶段 2 OSD 吞吐 update/s |
+| --- | ---: | ---: | ---: | ---: |
+| GIST1M | 441.180 | 350.664 | 9.061 | 11.427 |
+| Text2Image10M | 495.994 | 403.281 | 8.059 | 9.915 |
+| Deep100M | 579.801 | 523.354 | 6.905 | 7.667 |
+| SIFT100M | 661.780 | 504.720 | 6.097 | 7.975 |
 
 阶段 2 经过统一路由、schema v1 和观测整理后，作为本报告主 OSD 基线，数据如下。
 误差为三轮 case 算术均值的 95% Student-t CI 半宽。
@@ -111,10 +118,6 @@ hnswlib 构建 base 图、转换编号并导入 → 在线替换 → 保存指�
 
 12 case 共 **29,992 次成功更新，零失败、零操作重试；12 份 checker 全部 pass，
 0 error、0 warning**。语义局部性胜率为 0.994480–1.000000。
-
-相对阶段 1 B0，阶段 2 平均延迟变化为 GIST +1.53%、Text +4.68%、Deep +3.36%、
-SIFT −2.06%。这满足当时平均延迟/吞吐 5% 回归容差，不能写成所有指标均无回退：
-Text 与 Deep 的 P99 均值分别增加 5.62% 和 38.35%。
 
 阶段 2 自己的逐轮 P99（ms）为：
 
@@ -346,7 +349,7 @@ cap=1 吞吐均值提高 2.31%，但改善并不逐轮成立：
 
 | 图 | 内容 | 矢量文件 |
 | --- | --- | --- |
-| 1 | 阶段1 C0/B0与阶段2主基线 | [SVG](../figures/osd-baseline-optimizations/01-baselines-through-phase2.svg) |
+| 1 | Compute路线与阶段2 OSD baseline的延迟、吞吐 | [SVG](../figures/osd-baseline-optimizations/01-baselines-through-phase2.svg) |
 | 2 | 阶段2完整阶段与距离内部成本 | [SVG](../figures/osd-baseline-optimizations/02-phase2-cost-profile.svg) |
 | 3 | 阶段3 frontier减少请求但延迟回退 | [SVG](../figures/osd-baseline-optimizations/03-frontier-effects.svg) |
 | 4 | 阶段5A四数据集正式收益与Deep P99失败 | [SVG](../figures/osd-baseline-optimizations/04-stage5a-formal-effects.svg) |
