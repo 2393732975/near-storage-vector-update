@@ -23,6 +23,14 @@ if [[ -n "$keyring" ]]; then
   rados_args+=(--keyring "$keyring")
 fi
 
+if [[ -n "${EXPECTED_CEPH_FSID:-}" ]]; then
+  actual_fsid=$("$ceph_cmd" "${ceph_args[@]}" fsid)
+  if [[ "$actual_fsid" != "$EXPECTED_CEPH_FSID" ]]; then
+    echo "Refusing reset: connected FSID does not match EXPECTED_CEPH_FSID" >&2
+    exit 1
+  fi
+fi
+
 ensure_pool_placement() {
   local pool=$1 target_osd=$2 pool_id pgid acting
   pool_id=$("$ceph_cmd" "${ceph_args[@]}" osd lspools | awk -v name="$pool" '$2 == name {print $1}')

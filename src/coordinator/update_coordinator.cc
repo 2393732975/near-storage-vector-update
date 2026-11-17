@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "nsvu/baseline_observation.hpp"
 #include "nsvu/frontier.hpp"
 #include "nsvu/placement.hpp"
 #include "nsvu/protocol.hpp"
@@ -85,6 +86,12 @@ struct Config {
   std::string metrics_out;
   std::string progress_out;
   std::string ground_truth;
+  std::string query_results_out;
+  std::string update_trace_out;
+  std::string rpc_trace_out;
+  uint64_t rpc_trace_sample_every = 64;
+  uint64_t rpc_trace_max_rows = 100000;
+  bool fail_fast = false;
   uint64_t num_vectors = 100000;
   uint64_t num_updates = 100;
   uint64_t update_offset = 100000;
@@ -126,6 +133,8 @@ struct OperationMetrics {
   uint64_t request_bytes = 0;
   uint64_t reply_bytes = 0;
   double roundtrip_seconds = 0.0;
+  double max_roundtrip_seconds = 0.0;
+  std::map<uint64_t, uint64_t> rpc_us_histogram;
 };
 
 struct RecallSample {
@@ -286,7 +295,66 @@ struct Metrics {
   double adjacency_patch_exclusive_seconds = 0.0;
   double accounted_update_seconds = 0.0;
   double other_update_seconds = 0.0;
+  double label_cas_seconds = 0.0;
+  double label_lock_wait_seconds = 0.0;
+  uint64_t current_sequence = UINT64_MAX;
+  uint64_t rpc_trace_rows = 0;
+  uint64_t rpc_trace_dropped = 0;
+  std::string rpc_trace_records;
 };
+
+static const std::array<std::pair<const char*, double Metrics::*>, 14> kTraceStages{{
+    {"lookup_old_seconds", &Metrics::lookup_old_seconds},
+    {"store_vector_seconds", &Metrics::store_vector_seconds},
+    {"graph_search_seconds", &Metrics::graph_search_seconds},
+    {"graph_search_distance_seconds", &Metrics::graph_search_distance_seconds},
+    {"remote_distance_seconds", &Metrics::remote_distance_seconds},
+    {"set_new_adjacency_seconds", &Metrics::set_new_adjacency_seconds},
+    {"patch_prepare_seconds", &Metrics::patch_prepare_seconds},
+    {"patch_prepare_distance_seconds", &Metrics::patch_prepare_distance_seconds},
+    {"adjacency_patch_seconds", &Metrics::adjacency_patch_seconds},
+    {"global_meta_update_seconds", &Metrics::global_meta_update_seconds},
+    {"mark_stale_seconds", &Metrics::mark_stale_seconds},
+    {"meta_read_seconds", &Metrics::meta_read_seconds},
+    {"label_cas_seconds", &Metrics::label_cas_seconds},
+    {"label_lock_wait_seconds", &Metrics::label_lock_wait_seconds}}};
+static const std::array<std::pair<const char*, uint64_t Metrics::*>, 12> kTraceCounts{{
+    {"cls_calls", &Metrics::total_cls_exec_calls},
+    {"raw_calls", &Metrics::total_raw_rados_calls},
+    {"cls_request_bytes", &Metrics::cls_request_bytes},
+    {"cls_reply_bytes", &Metrics::cls_reply_bytes},
+    {"raw_request_bytes", &Metrics::raw_rados_request_bytes},
+    {"raw_reply_bytes", &Metrics::raw_rados_reply_bytes},
+    {"candidates_scored", &Metrics::remote_candidates_scored},
+    {"distance_batches", &Metrics::distance_batches},
+    {"adjacency_calls", &Metrics::remote_adj_calls},
+    {"patch_calls", &Metrics::remote_patch_calls},
+    {"rados_retries", &Metrics::rados_exec_retries},
+    {"label_cas_conflicts", &Metrics::label_cas_conflicts}}};
+struct UpdateTraceSnapshot {
+  std::array<double, 14> stages{};
+  std::array<uint64_t, 12> counts{};
+};
+UpdateTraceSnapshot TakeTraceSnapshot(const Metrics& metrics) {
+  UpdateTraceSnapshot snapshot;
+  for (size_t i = 0; i < kTraceStages.size(); ++i)
+    snapshot.stages[i] = metrics.*kTraceStages[i].second;
+  for (size_t i = 0; i < kTraceCounts.size(); ++i)
+    snapshot.counts[i] = metrics.*kTraceCounts[i].second;
+  return snapshot;
+}
+std::string JsonQuoted(const std::string& value) {
+  std::ostringstream out;
+  out << '"';
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') out << '\\' << c;
+    else if (c < 32) out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                         << static_cast<unsigned int>(c) << std::dec;
+    else out << c;
+  }
+  out << '"';
+  return out.str();
+}
 
 class ProtocolError : public std::runtime_error {
  public:
@@ -711,6 +779,11 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
     aggregate.request_bytes += values.request_bytes;
     aggregate.reply_bytes += values.reply_bytes;
     aggregate.roundtrip_seconds += values.roundtrip_seconds;
+    aggregate.max_roundtrip_seconds = std::max(
+        aggregate.max_roundtrip_seconds, values.max_roundtrip_seconds);
+    for (const auto& [bucket, count] : values.rpc_us_histogram) {
+      aggregate.rpc_us_histogram[bucket] += count;
+    }
   }
   for (const auto& [operation, values] : src.raw_operation_metrics) {
     auto& aggregate = dst->raw_operation_metrics[operation];
@@ -718,10 +791,20 @@ void merge_update_metrics(Metrics* dst, const Metrics& src) {
     aggregate.request_bytes += values.request_bytes;
     aggregate.reply_bytes += values.reply_bytes;
     aggregate.roundtrip_seconds += values.roundtrip_seconds;
+    aggregate.max_roundtrip_seconds = std::max(
+        aggregate.max_roundtrip_seconds, values.max_roundtrip_seconds);
+    for (const auto& [bucket, count] : values.rpc_us_histogram) {
+      aggregate.rpc_us_histogram[bucket] += count;
+    }
   }
   for (const auto& [operation, count] : src.failure_operations) {
     dst->failure_operations[operation] += count;
   }
+  dst->label_cas_seconds += src.label_cas_seconds;
+  dst->label_lock_wait_seconds += src.label_lock_wait_seconds;
+  dst->rpc_trace_rows += src.rpc_trace_rows;
+  dst->rpc_trace_dropped += src.rpc_trace_dropped;
+  dst->rpc_trace_records += src.rpc_trace_records;
   dst->lookup_old_seconds += src.lookup_old_seconds;
   dst->mark_stale_seconds += src.mark_stale_seconds;
   dst->store_vector_seconds += src.store_vector_seconds;
@@ -908,12 +991,23 @@ class CephFacade {
       throw ProtocolError(
           "raw-RADOS compute baseline attempted CLS method: " + std::string(method));
     }
+    if (cfg_.mode == "query") {
+      static const std::set<std::string> read_only{
+          "get_global_meta", "get_node_vector_batch", "get_node_adjacency_batch",
+          "lookup_label_batch", "distance_to_local_batch"};
+      if (!read_only.count(method)) {
+        throw ProtocolError("query mode refuses modifying CLS method");
+      }
+    }
     int r = 0;
     for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
       out->clear();
       const double t0 = now_sec();
       r = ioctx.exec(oid, "hnsw_global", method, in, *out);
-      RecordExec(metrics, method, in, *out, now_sec() - t0);
+      const double rpc_seconds = now_sec() - t0;
+      RecordExec(metrics, method, in, *out, rpc_seconds);
+      RecordRpcTrace(metrics, "cls", method, ioctx.get_id(), oid,
+                     t0, rpc_seconds, in.length(), out->length(), r);
       if (r != -ETIMEDOUT && r != -ETIME) {
         return r;
       }
@@ -966,6 +1060,34 @@ class CephFacade {
     if (metrics) {
       metrics->remote_vector_bytes += bytes;
     }
+  }
+
+  std::unordered_map<uint64_t, VectorRef> ReadVectorRefs(
+      const std::vector<uint64_t>& ids, Metrics* metrics) {
+    std::unordered_map<uint64_t, VectorRef> result;
+    for (const auto& [target, target_ids] : GroupIds(ids)) {
+      std::set<std::string> keys;
+      for (uint64_t id : target_ids) keys.insert(ghnsw::VecKey(id));
+      std::map<std::string, ceph::bufferlist> values;
+      const int r = RawOmapGet(owner_ioctxs_[target.first],
+          ghnsw::OwnerDataOid(target.second), keys, &values, metrics,
+          "query_read_vector_refs");
+      if (r < 0) throw CephOperationError("query_read_vector_refs", r);
+      for (uint64_t id : target_ids) {
+        const auto found = values.find(ghnsw::VecKey(id));
+        if (found == values.end()) continue;
+        VectorRef ref;
+        decode_or_die(found->second, &ref, "query VectorRef");
+        if (ref.global_id != id || ref.dim != cfg_.dim ||
+            ref.vector_kind != cfg_.vector_kind || ref.bytes !=
+                static_cast<uint64_t>(cfg_.dim) *
+                    (cfg_.vector_kind == ghnsw::kVectorKindF32 ? sizeof(float) : sizeof(uint8_t))) {
+          throw ProtocolError("query VectorRef ID/schema mismatch");
+        }
+        result.emplace(id, ref);
+      }
+    }
+    return result;
   }
 
   void StoreVector(
@@ -1473,19 +1595,11 @@ class CephFacade {
     }
     std::set<std::string> keys{ghnsw::ReservationKey(update_id)};
     std::map<std::string, ceph::bufferlist> values;
-    for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
-      values.clear();
-      r = meta_ioctx_.omap_get_vals_by_keys(cfg_.meta_oid, keys, &values);
-      if (r != -ETIMEDOUT && r != -ETIME) {
-        break;
-      }
-      if (attempt == cfg_.osd_op_retry_limit) {
-        break;
-      }
-      if (metrics) {
-        metrics->rados_exec_retries++;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+    const double reservation_read_t0 = now_sec();
+    r = RawOmapGet(meta_ioctx_, cfg_.meta_oid, keys, &values, metrics,
+                   "raw_read_insert_reservation");
+    if (metrics) {
+      metrics->global_meta_update_seconds += now_sec() - reservation_read_t0;
     }
     if (r < 0) {
       throw CephOperationError("read_insert_reservation", r);
@@ -1576,6 +1690,35 @@ class CephFacade {
   }
 
  private:
+  void RecordRpcTrace(Metrics* metrics, const char* access,
+      const std::string& operation, int64_t pool_id, const std::string& oid,
+      double started, double seconds, uint64_t request_bytes,
+      uint64_t reply_bytes, int result) const {
+    if (!metrics || cfg_.rpc_trace_out.empty() ||
+        metrics->current_sequence == UINT64_MAX ||
+        metrics->current_sequence % cfg_.rpc_trace_sample_every != 0) return;
+    static std::atomic<uint64_t> rows{0};
+    const uint64_t row = rows.fetch_add(1, std::memory_order_relaxed);
+    if (row >= cfg_.rpc_trace_max_rows) {
+      metrics->rpc_trace_dropped++;
+      return;
+    }
+    std::ostringstream out;
+    out << std::setprecision(12)
+        << "{\"rpc_sequence\":" << row
+        << ",\"update_sequence\":" << metrics->current_sequence
+        << ",\"access\":" << JsonQuoted(access)
+        << ",\"operation\":" << JsonQuoted(operation)
+        << ",\"pool_id\":" << pool_id << ",\"object\":" << JsonQuoted(oid)
+        << ",\"started_process_seconds\":" << started
+        << ",\"latency_ms\":" << seconds * 1000.0
+        << ",\"request_bytes\":" << request_bytes
+        << ",\"reply_bytes\":" << reply_bytes
+        << ",\"return_code\":" << result << "}\n";
+    metrics->rpc_trace_records += out.str();
+    metrics->rpc_trace_rows++;
+  }
+
   void RecordRaw(
       Metrics* metrics,
       const std::string& operation,
@@ -1593,6 +1736,8 @@ class CephFacade {
     values.request_bytes += request_bytes;
     values.reply_bytes += reply_bytes;
     values.roundtrip_seconds += roundtrip_seconds;
+    values.max_roundtrip_seconds = std::max(values.max_roundtrip_seconds, roundtrip_seconds);
+    values.rpc_us_histogram[ghnsw::RpcLatencyBucketUs(roundtrip_seconds)]++;
   }
 
   int RawOmapGet(
@@ -1615,8 +1760,10 @@ class CephFacade {
       for (const auto& [key, value] : *values) {
         reply_bytes += key.size() + value.length();
       }
-      RecordRaw(
-          metrics, operation, request_bytes, reply_bytes, now_sec() - t0);
+      const double rpc_seconds = now_sec() - t0;
+      RecordRaw(metrics, operation, request_bytes, reply_bytes, rpc_seconds);
+      RecordRpcTrace(metrics, "raw", operation, ioctx.get_id(), oid,
+          t0, rpc_seconds, request_bytes, reply_bytes, r);
       if (r != -ETIMEDOUT && r != -ETIME) {
         return r;
       }
@@ -1637,6 +1784,7 @@ class CephFacade {
       const std::map<std::string, ceph::bufferlist>& values,
       Metrics* metrics,
       const std::string& operation) {
+    if (cfg_.mode == "query") throw ProtocolError("query mode refuses OMAP write");
     uint64_t request_bytes = 0;
     for (const auto& [key, value] : values) {
       request_bytes += key.size() + value.length();
@@ -1645,7 +1793,10 @@ class CephFacade {
     for (uint32_t attempt = 0; attempt <= cfg_.osd_op_retry_limit; ++attempt) {
       const double t0 = now_sec();
       r = ioctx.omap_set(oid, values);
-      RecordRaw(metrics, operation, request_bytes, 0, now_sec() - t0);
+      const double rpc_seconds = now_sec() - t0;
+      RecordRaw(metrics, operation, request_bytes, 0, rpc_seconds);
+      RecordRpcTrace(metrics, "raw", operation, ioctx.get_id(), oid,
+          t0, rpc_seconds, request_bytes, 0, r);
       if (r != -ETIMEDOUT && r != -ETIME) {
         return r;
       }
@@ -2477,6 +2628,8 @@ class CephFacade {
     values.request_bytes += request.length();
     values.reply_bytes += reply.length();
     values.roundtrip_seconds += roundtrip_seconds;
+    values.max_roundtrip_seconds = std::max(values.max_roundtrip_seconds, roundtrip_seconds);
+    values.rpc_us_histogram[ghnsw::RpcLatencyBucketUs(roundtrip_seconds)]++;
   }
 
   std::map<std::pair<uint32_t, uint64_t>, std::vector<uint64_t>> GroupIds(
@@ -3181,18 +3334,37 @@ class Coordinator {
       : cfg_(cfg), ceph_(cfg), rng_(cfg.seed), next_update_id_(make_update_id_seed()) {}
 
   void Run() {
+    if (!cfg_.update_trace_out.empty()) {
+      update_trace_stream_.open(cfg_.update_trace_out);
+      if (!update_trace_stream_) throw std::runtime_error("cannot open update trace output");
+    }
+    if (!cfg_.rpc_trace_out.empty()) {
+      rpc_trace_stream_.open(cfg_.rpc_trace_out);
+      if (!rpc_trace_stream_) throw std::runtime_error("cannot open RPC trace output");
+    }
     ceph_.Connect();
-    ceph_.InitMetaIfNeeded();
+    if (cfg_.mode == "build") {
+      ceph_.InitMetaIfNeeded();
+    } else {
+      ValidateMeta(ceph_.GetMeta());
+    }
     auto t0 = now_sec();
 
     if (cfg_.mode == "build") {
       RunBuild();
     } else if (cfg_.mode == "update") {
       RunUpdate();
+    } else if (cfg_.mode == "query") {
+      RunQuery();
     } else {
       throw std::runtime_error("unsupported mode");
     }
     metrics_.total_seconds = now_sec() - t0;
+    if (!cfg_.rpc_trace_out.empty()) {
+      rpc_trace_stream_ << metrics_.rpc_trace_records;
+      rpc_trace_stream_.flush();
+      if (!rpc_trace_stream_) throw std::runtime_error("RPC trace output failed");
+    }
     WriteMetrics();
     if (metrics_.failed_updates > 0) {
       throw std::runtime_error(
@@ -3217,6 +3389,8 @@ class Coordinator {
     std::mt19937_64 rng;
     std::vector<AdjacencyBlob> pending_patches;
     std::vector<double> update_latencies_ms;
+    std::string trace_records;
+    uint64_t current_new_id = UINT64_MAX;
   };
 
   struct ReservedInsert {
@@ -3228,6 +3402,149 @@ class Coordinator {
     uint32_t level = 0;
     std::vector<Neighbor> selected;
   };
+
+  void AppendUpdateTrace(UpdateContext& ctx, const UpdateTraceSnapshot& before,
+      uint32_t worker, uint64_t sequence, uint64_t vector_index, uint64_t label,
+      uint32_t level, bool success, double started, double latency_ms,
+      const std::string& error = "") {
+    if (cfg_.update_trace_out.empty()) return;
+    const auto after = TakeTraceSnapshot(ctx.metrics);
+    std::array<double, 14> seconds{};
+    for (size_t i = 0; i < seconds.size(); ++i)
+      seconds[i] = after.stages[i] - before.stages[i];
+    const double search = std::max(0.0, seconds[2] - seconds[3]);
+    const double patch = std::max(0.0, seconds[6] - seconds[7]) + seconds[8];
+    const double accounted_ms = 1000.0 * (seconds[0] + seconds[1] + search +
+        seconds[4] + seconds[5] + patch + seconds[9] + seconds[10] +
+        seconds[12] + seconds[13]);
+    std::ostringstream out;
+    out << std::setprecision(12) << "{\"update_sequence\":" << sequence
+        << ",\"update_vector_index\":" << vector_index
+        << ",\"target_label\":" << label << ",\"new_id\":";
+    if (ctx.current_new_id == UINT64_MAX) out << "null";
+    else out << ctx.current_new_id;
+    out << ",\"inserted_level\":" << level << ",\"worker\":" << worker
+        << ",\"success\":" << (success ? "true" : "false")
+        << ",\"started_process_seconds\":" << started
+        << ",\"latency_ms\":" << latency_ms
+        << ",\"search_exclusive_ms\":" << search * 1000.0
+        << ",\"patch_exclusive_ms\":" << patch * 1000.0
+        << ",\"other_ms\":" << latency_ms - accounted_ms
+        << ",\"unique_distance_objects\":" << ctx.metrics.current_distance_objects.size()
+        << ",\"unique_data_objects\":" << ctx.metrics.current_data_objects.size()
+        << ",\"stages_seconds\":{";
+    for (size_t i = 0; i < seconds.size(); ++i) {
+      if (i) out << ',';
+      out << '\"' << kTraceStages[i].first << "\":" << seconds[i];
+    }
+    out << "},\"counts\":{";
+    for (size_t i = 0; i < kTraceCounts.size(); ++i) {
+      if (i) out << ',';
+      out << '\"' << kTraceCounts[i].first << "\":" << after.counts[i] - before.counts[i];
+    }
+    out << "},\"error\":" << JsonQuoted(error) << "}\n";
+    ctx.trace_records += out.str();
+    if (ctx.trace_records.size() >= 65536) FlushUpdateTrace(ctx);
+  }
+
+  void FlushUpdateTrace(UpdateContext& ctx) {
+    if (ctx.trace_records.empty()) return;
+    std::lock_guard<std::mutex> lock(update_trace_mutex_);
+    update_trace_stream_ << ctx.trace_records;
+    if (!update_trace_stream_) throw std::runtime_error("update trace output failed");
+    ctx.trace_records.clear();
+  }
+
+  void ValidateMeta(const GlobalMeta& meta) const {
+    if (!meta.version || meta.enterpoint == UINT64_MAX || !meta.cur_element_count) {
+      throw ProtocolError("query/update requires an existing nonempty imported index");
+    }
+    if (meta.M != cfg_.M || meta.dim != cfg_.dim ||
+        meta.vector_kind != cfg_.vector_kind || meta.metric != cfg_.metric) {
+      throw ProtocolError("index M/dimension/vector kind/metric do not match runtime configuration");
+    }
+    // meta.ef records construction width; cfg_.ef is update/query width.
+  }
+
+  void RunQuery() {
+    metrics_.mode = "query";
+    const auto meta_before = ceph_.GetMeta();
+    ValidateMeta(meta_before);
+    const double load_t0 = now_sec();
+    const auto queries = LoadVectors(cfg_.input, cfg_.input_format, 0,
+        cfg_.num_vectors, cfg_.dim, cfg_.vector_kind);
+    metrics_.load_seconds = now_sec() - load_t0;
+    std::ofstream results(cfg_.query_results_out);
+    if (!results) throw std::runtime_error("cannot open query results output");
+    results << std::setprecision(10);
+    UpdateContext ctx(ceph_, nullptr, cfg_.seed);
+    const double query_t0 = now_sec();
+    for (size_t q = 0; q < queries.size(); ++q) {
+      const double started = now_sec();
+      begin_update_observation(&ctx.metrics);
+      ctx.metrics.current_sequence = q;
+      uint64_t entry = meta_before.enterpoint;
+      float entry_dist = 0.0f;
+      for (int level = static_cast<int>(meta_before.max_level); level > 0; --level) {
+        entry = GreedySearch(ctx, queries[q], entry, level, &entry_dist);
+      }
+      const auto found = SearchLayer(ctx, queries[q], entry, 0, cfg_.ef);
+      std::vector<uint64_t> ids;
+      for (const auto& candidate : found) ids.push_back(candidate.id);
+      const auto refs = ceph_.ReadVectorRefs(ids, &ctx.metrics);
+      std::vector<uint64_t> labels;
+      for (const auto& [id, ref] : refs) {
+        if (ref.flags == ghnsw::kVectorFlagActive) labels.push_back(ref.external_label);
+      }
+      const auto current_labels = ceph_.LookupLabels(labels, &ctx.metrics);
+      std::vector<ghnsw::ActiveQueryCandidate> candidates;
+      for (const auto& candidate : found) {
+        const auto ref = refs.find(candidate.id);
+        if (ref == refs.end()) continue;
+        const auto active_id = current_labels.find(ref->second.external_label);
+        candidates.push_back({candidate.id, ref->second.external_label,
+            active_id == current_labels.end() ? UINT64_MAX : active_id->second,
+            candidate.dist, ref->second.flags == ghnsw::kVectorFlagActive});
+      }
+      const auto selected = ghnsw::SelectActiveQueryResults(std::move(candidates), cfg_.recall_k);
+      const double latency_ms = (now_sec() - started) * 1000.0;
+      results << "{\"query_index\":" << q << ",\"labels\":[";
+      for (size_t i = 0; i < selected.size(); ++i) {
+        if (i) results << ',';
+        results << selected[i].external_label;
+      }
+      results << "],\"distances\":[";
+      for (size_t i = 0; i < selected.size(); ++i) {
+        if (i) results << ',';
+        results << selected[i].distance;
+      }
+      results << "],\"latency_ms\":" << latency_ms << "}\n";
+      finish_update_observation(&ctx.metrics);
+      metrics_.vectors_processed++;
+      update_latencies_ms_.push_back(latency_ms);
+      if ((q + 1) % 25 == 0) WriteProgress(q + 1);
+    }
+    results.flush();
+    if (!results) throw std::runtime_error("query results output failed");
+    const auto meta_after = ceph_.GetMeta();
+    if (meta_before.version != meta_after.version ||
+        meta_before.next_global_id != meta_after.next_global_id ||
+        meta_before.enterpoint != meta_after.enterpoint) {
+      throw ProtocolError("index changed during read-only snapshot query evaluation");
+    }
+    merge_update_metrics(&metrics_, ctx.metrics);
+    metrics_.graph_seconds = now_sec() - query_t0;
+    if (metrics_.graph_seconds > 0) metrics_.throughput_updates_per_sec =
+        static_cast<double>(queries.size()) / metrics_.graph_seconds;
+    if (!update_latencies_ms_.empty()) {
+      double sum = 0.0;
+      for (double latency : update_latencies_ms_) sum += latency;
+      metrics_.avg_update_latency_ms = sum / update_latencies_ms_.size();
+      metrics_.p50_update_latency_ms = percentile_ms(update_latencies_ms_, 0.50);
+      metrics_.p95_update_latency_ms = percentile_ms(update_latencies_ms_, 0.95);
+      metrics_.p99_update_latency_ms = percentile_ms(update_latencies_ms_, 0.99);
+    }
+  }
 
   void RunBuild() {
     metrics_.mode = "build";
@@ -3336,30 +3653,35 @@ class Coordinator {
             break;
           }
 
-	          try {
-	            const uint64_t vec_idx = i % vectors.size();
-	            const uint64_t label = cfg_.target_start + (i % label_span);
-	            begin_update_observation(&ctx.metrics);
-	            const double update_t0 = now_sec();
-	            {
-	              ScopedStripedLocks label_lock(label_locks_, {label});
-	              const double lookup_t0 = now_sec();
-	              auto labels = ctx.ceph.LookupLabels({label}, &ctx.metrics);
-	              ctx.metrics.lookup_old_seconds += now_sec() - lookup_t0;
-	              auto it = labels.find(label);
+	          const uint64_t vec_idx = i % vectors.size();
+          const uint64_t label = cfg_.target_start + (i % label_span);
+          uint32_t inserted_level = 0;
+          ctx.current_new_id = UINT64_MAX;
+          ctx.metrics.current_sequence = i;
+          const auto before = TakeTraceSnapshot(ctx.metrics);
+          begin_update_observation(&ctx.metrics);
+          const double update_t0 = now_sec();
+          try {
+            {
+              const double lock_t0 = now_sec();
+              ScopedStripedLocks label_lock(label_locks_, {label});
+              ctx.metrics.label_lock_wait_seconds += now_sec() - lock_t0;
+              const double lookup_t0 = now_sec();
+              auto labels = ctx.ceph.LookupLabels({label}, &ctx.metrics);
+              ctx.metrics.lookup_old_seconds += now_sec() - lookup_t0;
+              auto it = labels.find(label);
               const uint64_t update_id = NextUpdateId();
               std::vector<uint64_t> recall_candidates;
-              uint32_t inserted_level = 0;
               const uint64_t new_id = InsertOneParallel(
-                  ctx,
-                  vectors[vec_idx],
-                  label,
-                  update_id,
+                  ctx, vectors[vec_idx], label, update_id,
                   ground_truth_.empty() ? nullptr : &recall_candidates,
                   &inserted_level);
-              if (!ctx.ceph.CasLabel(
-                      label, it == labels.end(), it == labels.end() ? 0 : it->second,
-                      new_id, &ctx.metrics, update_id)) {
+              const double cas_t0 = now_sec();
+              const bool cas_success = ctx.ceph.CasLabel(
+                  label, it == labels.end(), it == labels.end() ? 0 : it->second,
+                  new_id, &ctx.metrics, update_id);
+              ctx.metrics.label_cas_seconds += now_sec() - cas_t0;
+              if (!cas_success) {
                 ctx.metrics.label_cas_conflicts++;
                 ctx.ceph.MarkStale(new_id, &ctx.metrics, update_id);
                 ctx.metrics.stale_marks++;
@@ -3370,43 +3692,42 @@ class Coordinator {
                 ctx.metrics.stale_marks++;
               }
               if (!ground_truth_.empty()) {
-                RecordRecall(
-                    &ctx.metrics,
-                    vec_idx,
-                    i,
-                    label,
-                    new_id,
-                    inserted_level,
-                    recall_candidates,
-                    ground_truth_.at(vec_idx));
+                RecordRecall(&ctx.metrics, vec_idx, i, label, new_id, inserted_level,
+                    recall_candidates, ground_truth_.at(vec_idx));
               }
             }
             finish_update_observation(&ctx.metrics);
-            ctx.update_latencies_ms.push_back((now_sec() - update_t0) * 1000.0);
+            const double latency_ms = (now_sec() - update_t0) * 1000.0;
+            ctx.update_latencies_ms.push_back(latency_ms);
             ctx.metrics.vectors_processed++;
-
+            AppendUpdateTrace(ctx, before, tid, i, vec_idx, label,
+                inserted_level, true, update_t0, latency_ms);
             const uint64_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
             if (done % 100 == 0) {
               std::lock_guard<std::mutex> lock(progress_mu);
+              std::cerr << "parallel update inserted " << done;
               if (cfg_.time_limit_seconds > 0) {
-                std::cerr << "parallel update inserted " << done << " in "
-                          << (now_sec() - g0) << "s / " << cfg_.time_limit_seconds
-                          << "s, workers=" << cfg_.update_parallelism << std::endl;
+                std::cerr << " in " << (now_sec() - g0) << "s / " << cfg_.time_limit_seconds << "s";
               } else {
-                std::cerr << "parallel update inserted " << done << "/"
-                          << cfg_.num_updates << ", workers=" << cfg_.update_parallelism
-                          << std::endl;
+                std::cerr << "/" << cfg_.num_updates;
               }
+              std::cerr << ", workers=" << cfg_.update_parallelism << std::endl;
               WriteProgress(done);
             }
           } catch (const std::exception& error) {
             record_update_failure(&ctx.metrics, error);
             finish_update_observation(&ctx.metrics);
+            AppendUpdateTrace(ctx, before, tid, i, vec_idx, label, inserted_level,
+                false, update_t0, (now_sec() - update_t0) * 1000.0, error.what());
+            if (cfg_.fail_fast) stop.store(true, std::memory_order_relaxed);
           } catch (...) {
             ctx.metrics.failed_updates++;
             ctx.metrics.failed_update_other++;
             ctx.metrics.failure_operations["unknown"]++;
             finish_update_observation(&ctx.metrics);
+            AppendUpdateTrace(ctx, before, tid, i, vec_idx, label, inserted_level,
+                false, update_t0, (now_sec() - update_t0) * 1000.0, "unknown error");
+            if (cfg_.fail_fast) stop.store(true, std::memory_order_relaxed);
           }
         }
       } catch (...) {
@@ -3421,6 +3742,7 @@ class Coordinator {
 
       std::lock_guard<std::mutex> lock(merge_mu);
       merge_update_metrics(&metrics_, ctx.metrics);
+      if (update_trace_stream_.is_open()) FlushUpdateTrace(ctx);
       update_latencies_ms_.insert(
           update_latencies_ms_.end(),
           ctx.update_latencies_ms.begin(),
@@ -3432,6 +3754,10 @@ class Coordinator {
     }
     for (auto& thread : threads) {
       thread.join();
+    }
+    if (update_trace_stream_.is_open()) {
+      update_trace_stream_.flush();
+      if (!update_trace_stream_) throw std::runtime_error("update trace output failed");
     }
     if (distance_executor) {
       distance_executor->Shutdown();
@@ -3823,6 +4149,7 @@ class Coordinator {
     ReservedInsert reserved = ReserveInsertId(ctx, update_id);
     GlobalMeta meta = reserved.search_meta;
     const uint64_t global_id = reserved.global_id;
+    ctx.current_new_id = global_id;
     const uint32_t level = SampleLevel(ctx.rng, cfg_.M);
     if (inserted_level != nullptr) {
       *inserted_level = level;
@@ -4296,6 +4623,31 @@ class Coordinator {
     std::ofstream out(cfg_.metrics_out);
     out << "{\n";
     out << "  \"mode\": \"" << metrics_.mode << "\",\n";
+    out << "  \"M\": " << cfg_.M << ",\n";
+    out << "  \"ef_update_or_query\": " << cfg_.ef << ",\n";
+    out << "  \"seed\": " << cfg_.seed << ",\n";
+    out << "  \"rpc_trace\": {\"enabled\":"
+        << (cfg_.rpc_trace_out.empty() ? "false" : "true")
+        << ",\"sample_every_update\":" << cfg_.rpc_trace_sample_every
+        << ",\"row_limit\":" << cfg_.rpc_trace_max_rows
+        << ",\"rows\":" << metrics_.rpc_trace_rows
+        << ",\"dropped_rows\":" << metrics_.rpc_trace_dropped
+        << ",\"coverage\":\"CLS RPCs and raw OMAP RPCs; payload/stat RPCs have aggregate histogram only\"},\n";
+    const bool complete_breakdown_valid = cfg_.mode == "update" && metrics_.failed_updates == 0;
+    double complete_update_seconds = 0.0;
+    for (double latency : update_latencies_ms_) complete_update_seconds += latency / 1000.0;
+    const double complete_accounted_seconds = metrics_.lookup_old_seconds +
+        metrics_.store_vector_seconds + metrics_.full_graph_search_exclusive_seconds +
+        metrics_.remote_distance_seconds + metrics_.set_new_adjacency_seconds +
+        metrics_.adjacency_patch_exclusive_seconds + metrics_.global_meta_update_seconds +
+        metrics_.mark_stale_seconds + metrics_.label_cas_seconds + metrics_.label_lock_wait_seconds;
+    out << "  \"complete_stage_breakdown_valid\": " << (complete_breakdown_valid ? "true" : "false") << ",\n";
+    out << "  \"complete_update_seconds\": " << complete_update_seconds << ",\n";
+    out << "  \"complete_stage_accounted_seconds\": " << complete_accounted_seconds << ",\n";
+    out << "  \"complete_update_residual_seconds\": " << complete_update_seconds - complete_accounted_seconds << ",\n";
+    out << "  \"label_cas_seconds\": " << metrics_.label_cas_seconds << ",\n";
+    out << "  \"label_lock_wait_seconds\": " << metrics_.label_lock_wait_seconds << ",\n";
+
     out << "  \"distance_mode\": \"" << cfg_.distance_mode << "\",\n";
     out << "  \"storage_access_mode\": \""
         << (cfg_.distance_mode == "compute" ? "raw_rados" : "cls") << "\",\n";
@@ -4423,7 +4775,15 @@ class Coordinator {
                   ? values.roundtrip_seconds * 1000.0 /
                         static_cast<double>(values.calls)
                   : 0.0)
-          << "}";
+          << ", \"max_roundtrip_ms\": " << values.max_roundtrip_seconds * 1000.0
+          << ", \"rpc_us_histogram_upper_bounds\": {";
+      bool first_bucket = true;
+      for (const auto& [bucket, count] : values.rpc_us_histogram) {
+        if (!first_bucket) out << ',';
+        out << '\"' << bucket << "\":" << count;
+        first_bucket = false;
+      }
+      out << "}}";
       first_operation = false;
     }
     if (!first_operation) {
@@ -4444,7 +4804,15 @@ class Coordinator {
                   ? values.roundtrip_seconds * 1000.0 /
                         static_cast<double>(values.calls)
                   : 0.0)
-          << "}";
+          << ", \"max_roundtrip_ms\": " << values.max_roundtrip_seconds * 1000.0
+          << ", \"rpc_us_histogram_upper_bounds\": {";
+      bool first_bucket = true;
+      for (const auto& [bucket, count] : values.rpc_us_histogram) {
+        if (!first_bucket) out << ',';
+        out << '\"' << bucket << "\":" << count;
+        first_bucket = false;
+      }
+      out << "}}";
       first_raw_operation = false;
     }
     if (!first_raw_operation) {
@@ -4988,6 +5356,9 @@ class Coordinator {
 
   Config cfg_;
   CephFacade ceph_;
+  std::ofstream update_trace_stream_;
+  std::ofstream rpc_trace_stream_;
+  std::mutex update_trace_mutex_;
 	  Metrics metrics_;
 	  std::mt19937_64 rng_;
 	  std::atomic<uint64_t> next_update_id_;
@@ -5060,6 +5431,20 @@ Config ParseArgs(int argc, const char** argv) {
       cfg.metrics_out = next("--metrics-out");
     } else if (arg == "--progress-out") {
       cfg.progress_out = next("--progress-out");
+    } else if (arg == "--query-results-out") {
+      cfg.query_results_out = next("--query-results-out");
+    } else if (arg == "--update-trace-out") {
+      cfg.update_trace_out = next("--update-trace-out");
+    } else if (arg == "--rpc-trace-out") {
+      cfg.rpc_trace_out = next("--rpc-trace-out");
+    } else if (arg == "--rpc-trace-sample-every") {
+      cfg.rpc_trace_sample_every = std::stoull(next("--rpc-trace-sample-every"));
+    } else if (arg == "--rpc-trace-max-rows") {
+      cfg.rpc_trace_max_rows = std::stoull(next("--rpc-trace-max-rows"));
+    } else if (arg == "--fail-fast") {
+      cfg.fail_fast = true;
+    } else if (arg == "--seed") {
+      cfg.seed = static_cast<uint32_t>(std::stoul(next("--seed")));
     } else if (arg == "--ground-truth") {
       cfg.ground_truth = next("--ground-truth");
     } else if (arg == "--recall-k") {
@@ -5164,7 +5549,31 @@ Config ParseArgs(int argc, const char** argv) {
     } else if (arg == "--osd-op-retry-limit") {
       cfg.osd_op_retry_limit =
           static_cast<uint32_t>(std::stoul(next("--osd-op-retry-limit")));
+    } else {
+      throw std::runtime_error("unknown argument: " + arg);
     }
+  }
+  if (cfg.mode != "build" && cfg.mode != "update" && cfg.mode != "query") {
+    throw std::runtime_error("--mode must be build, update or query");
+  }
+  if (cfg.input.empty() || !cfg.num_vectors || !cfg.dim || !cfg.owners ||
+      !cfg.points_per_object || cfg.M < 2 || cfg.ef < cfg.recall_k ||
+      !cfg.rpc_trace_sample_every || !cfg.rpc_trace_max_rows) {
+    throw std::runtime_error("invalid/absent input, dimensions, M, ef or trace limits");
+  }
+  if (cfg.mode == "update" && (cfg.update_input.empty() || !cfg.num_updates)) {
+    throw std::runtime_error("update requires --update-input and positive --num-updates");
+  }
+  if (!cfg.query_results_out.empty() && cfg.mode != "query") {
+    throw std::runtime_error("--query-results-out requires --mode query");
+  }
+  if (!cfg.update_trace_out.empty() && cfg.mode != "update") {
+    throw std::runtime_error("--update-trace-out requires --mode update");
+  }
+  if (cfg.mode == "query" && (cfg.query_results_out.empty() || cfg.frontier_window != 1 ||
+      cfg.frontier_adaptive || cfg.distance_microbatch || cfg.distance_split_probe ||
+      cfg.time_limit_seconds)) {
+    throw std::runtime_error("query requires --query-results-out, frontier=1, no probe/executor/time window");
   }
   if (cfg.frontier_adaptive && cfg.frontier_window < 2) {
     throw std::runtime_error(
@@ -5188,6 +5597,17 @@ Config ParseArgs(int argc, const char** argv) {
 
 int main(int argc, const char** argv) {
   try {
+    for (int i = 1; i < argc; ++i) {
+      if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+        std::cout << "nsvu-update-coordinator --mode build|update|query --input PATH "
+            "--num-vectors N --dim D --M M --ef EF --distance-mode compute|osd\n"
+            "query: --input QUERY_FILE --query-results-out JSONL --recall-k K\n"
+            "update: --update-input PATH --num-updates N [--update-trace-out JSONL] "
+            "[--rpc-trace-out JSONL --rpc-trace-sample-every 64 --rpc-trace-max-rows 100000] "
+            "[--fail-fast]\n";
+        return 0;
+      }
+    }
     Config cfg = ParseArgs(argc, argv);
     Coordinator coordinator(cfg);
     coordinator.Run();
