@@ -588,6 +588,26 @@ SSH 不能访问，其他 OSD 的文件 hash 尚未重新核验。脚本如实�
 恢复控制器的 `status.json` 记录当前阶段及子运行状态；各子目录继续保存原有详细
 日志、质量/导入结果和事件监测状态。控制器在后台衔接两个阶段，用户无需维持对话。
 
+### 13.1 SIFT 完成与导入启动故障修复
+
+`results/high-recall-continuation-20261118T041552Z/offline-sift/` 已完成四数据集
+引用链核验和 SIFT100M 本地筛选。SIFT 采用 `M=16`、`efConstruction=200`，
+纯构图约 4877.92 s；搜索宽度 128 时 calibration Recall@10=93.41%，独立
+validation 的 1000 条查询 Recall@10=92.98%。这是本地静态质量，仍不代表远端
+查询或更新后 active Recall 已获认证。
+
+后续 `remaining-imports` 于 2026-11-18 05:49:40 UTC 在生成运行 manifest 时停止：
+加载事件监测模块产生的 `bin/__pycache__` 目录被当作文件计算哈希，触发
+`IsADirectoryError`。此前只完成启动只读检查，未执行池重置或 Deep 导入，不能把
+本次故障记作新的存储慢事件。修复后 manifest 仅哈希实际文件，保留所有复制工具
+的内容身份；回归测试通过真实 Python import 生成 bytecode 目录复现并验证此路径。
+
+此次重试直接在新目录运行 `run-high-recall-preparation.py --confirm-reset
+--resume-from <上述 offline-sift 目录>`，继续传入原有慢事件证据及五 OSD CLS
+核验记录。核验后复用四个合格图和 GIST 完整 12 轮结果，不再构图；Deep 仍从
+空池执行原设置与候选设置的一对完整导入、checker。原失败目录与日志保留，
+新增事件停止保护、资源预算及正式实验资格要求保持有效。
+
 ## 参考依据
 
 - [实验手册](experiment-runbook.md)

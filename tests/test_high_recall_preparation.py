@@ -322,6 +322,31 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(suite.import_case.call_count, 2)
             self.assertEqual(partial.read_bytes(), original)
 
+    def test_online_execute_records_files_after_guard_import_creates_bytecode_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            suite = self.resume_suite(Path(temp) / "new")
+            suite.args.datasets = ["sift100m"]
+            helper = suite.bin / "baseline_cluster_guard.py"
+            helper.write_text("GUARD_LOADED = True\n")
+            expected = {p.name: MOD.sha(p) for p in suite.bin.iterdir()}
+
+            def initial_gate(initial=False):
+                if initial:
+                    spec = importlib.util.spec_from_file_location("fixture_guard", helper)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    self.assertTrue(module.GUARD_LOADED)
+
+            suite.cluster_gate = mock.Mock(side_effect=initial_gate)
+            suite.run = mock.Mock()
+            suite.prepare = mock.Mock(return_value=(Path("unused"), {}))
+            suite.qualify = mock.Mock(return_value={})
+            suite.import_trials = mock.Mock()
+            suite.execute()
+            self.assertTrue((suite.bin / "__pycache__").is_dir())
+            self.assertEqual(MOD.read_json(suite.root / "manifest.json")["binaries"], expected)
+            self.assertEqual(MOD.read_json(suite.root / "status.json")["state"], "first_batch_complete")
+
     def test_offline_execute_never_queries_or_cleans_cluster(self):
         with tempfile.TemporaryDirectory() as temp:
             suite = self.resume_suite(Path(temp) / "new", offline=True)

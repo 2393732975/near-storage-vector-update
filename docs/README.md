@@ -7,7 +7,7 @@
 
 - [源码阅读指南](source-reading-guide.md)：从 ID 与对象布局、基础图导入、在线更新调用链到 CLS、只读执行器、检查器和实验门禁，附源码定位、流程图、阅读顺序与验证练习。
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
-- [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：已批准；首批完成前三数据集本地质量筛选和 GIST 导入测试后因慢操作保护停止，2026-11-18 增加结果复用、SIFT 离线补测和按新增事件停止的恢复流程。正式 24-case 尚未启动。
+- [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：已批准；四数据集本地质量筛选及 GIST 导入测试完成。2026-11-18 修复恢复流程中的 bytecode 目录哈希错误，从已完成的 SIFT 结果继续 Deep 导入资格，并按新增事件停止。正式 24-case 尚未启动。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
 - [项目问题评估与后续验证报告](reports/project-issues-assessment-2026-11-12.md)：九类现存问题的事实证据、原因与影响、能力边界，以及处理顺序和建议验收方法。
 - [阶段 0 正确性与观测基线](correctness-observability-baseline.md)：更新协议、离线检查器和正式验收流程。

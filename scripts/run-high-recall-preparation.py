@@ -692,7 +692,9 @@ class Suite:
     def execute(self):
         if not self.offline_only:
             self.cluster_gate(initial=True)
-        versions = {p.name: sha(p) for p in self.bin.iterdir()}
+        # Importing the retained-warning guard creates a __pycache__ directory.
+        # Record copied files; generated directories are not binary inputs.
+        versions = {p.name: sha(p) for p in self.bin.iterdir() if p.is_file()}
         write_json(self.root / "manifest.json", dict(
             started_utc=utc(), source_commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=str(self.repo), text=True).strip(),
