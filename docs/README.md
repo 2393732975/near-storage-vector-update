@@ -9,6 +9,7 @@
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
 - [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：已批准；四数据集本地质量筛选及 GIST 导入测试完成，Deep 导入资格尚未完成。恢复任务因新增 osd.1 慢告警停止，正式 24-case 尚未启动。
 - [高召回准备任务停止诊断与 SSD 维修排查](reports/baseline-preparation-stop-diagnosis-2026-11-19.md)：恢复任务因 osd.1 新慢告警停止；对应 SSD 在排除数据库预设后仍报健康失败，授权短自检也失败。已备份单副本实验池，设备尚未修复，需厂商诊断或换盘；Deep 实际导入尚未开始。
+- [故障 osd.1 数据迁移与停用记录](reports/osd1-data-evacuation-report-2026-11-19.md)：已完成 8 池备份及前后 SHA-256 校验，39 PG clean；故障 OSD 已 down/out 并禁用自启，其余四个 OSD 正常。原五 OSD 实验布局已改变，继续暂停。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
 - [项目问题评估与后续验证报告](reports/project-issues-assessment-2026-11-12.md)：九类现存问题的事实证据、原因与影响、能力边界，以及处理顺序和建议验收方法。
 - [阶段 0 正确性与观测基线](correctness-observability-baseline.md)：更新协议、离线检查器和正式验收流程。

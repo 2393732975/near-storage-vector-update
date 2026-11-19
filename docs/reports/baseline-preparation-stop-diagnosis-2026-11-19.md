@@ -135,7 +135,7 @@ SMART 是诊断当时读取的状态，没有故障发生瞬间的 SMART 快照�
 
 ## 6. 已完成的数据保护与待执行维修
 
-停用检查 `ceph osd ok-to-stop 1` 返回 `ok_to_stop=false`：单副本
+迁移前的停用检查 `ceph osd ok-to-stop 1` 返回 `ok_to_stop=false`：单副本
 `nsvu_owner_1` 的 PG `1673.0` 会离线；osd.1 另外承载 17 个 RBD PG，停止时
 这些 PG 会降级。`safe-to-destroy` 结果也没有将 osd.1 列为可销毁。
 
@@ -154,3 +154,8 @@ owner/OSD 实验映射、检查布局和小规模存储资格，才能继续正�
 具体操作与原始结果可由 `repair-assessment.json`、`manifest.json`、
 `smart-without-presets.out`、`smart-after-short-*.out` 及 `owner1-backup.json`
 复核。
+
+用户后续明确授权迁移并停用；2026-11-19 03:47:21 UTC 已完成数据迁移、
+前后内容校验及 osd.1 持久停用，停盘阻塞已解除。设备本体仍待维修或更换。
+当前四 OSD 状态及完整验收见
+[数据迁移与停用记录](osd1-data-evacuation-report-2026-11-19.md)。
