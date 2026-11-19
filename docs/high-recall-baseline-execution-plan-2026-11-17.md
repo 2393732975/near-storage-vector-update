@@ -623,6 +623,12 @@ validation 的 1000 条查询 Recall@10=92.98%。这是本地静态质量，仍�
 存储资格，之后恢复；不以放宽告警规则继续实验。完整时间线、口径和证据见
 [停止诊断记录](reports/baseline-preparation-stop-diagnosis-2026-11-19.md)。
 
+用户随后授权修复排查；03:11–03:13 UTC 的非破坏性短自检返回
+`Completed: unknown failure`，关闭型号数据库预设后设备仍返回总体健康失败。
+现在按 SSD 内部设备/固件故障处理，尚无经适配核验的官方软件修复方法。
+`nsvu_owner_1` 的空初始化池已导出备份；当前 `ok-to-stop=false`，不得直接
+拔盘或销毁 OSD。需先完成数据保护与受控维护，再由供应商诊断或现场更换 SSD。
+
 ## 参考依据
 
 - [实验手册](experiment-runbook.md)

@@ -76,7 +76,8 @@ n118 的 `/dev/sdd`，型号 `SAMSUNG MZ7LH480HAHQ-00005`，序列号
 这是设备报告的实际健康失败，应优先排查或更换异常 SSD。属性 202 是厂商属性；
 现有证据不能把 raw=16 擅自解释为坏块、供电保护故障或某种确定的固件问题。
 本次重分配扇区、不可纠正错误及 CRC 计数均为 0，也不能用这些为 0 的计数抵消
-总体健康失败。没有执行 SMART 自检任务、写入测试、设备重置或维修操作。
+总体健康失败。首次只读取证未执行 SMART 自检任务、写入测试、设备重置或维修操作；
+后续按用户修复请求完成的短自检见第 5 节。
 
 SMART 是诊断当时读取的状态，没有故障发生瞬间的 SMART 快照。因此可以确认
 “对应设备当前异常”，尚不能证明它独自造成了 11 月 18 日的全部长延迟。
@@ -103,3 +104,53 @@ SMART 是诊断当时读取的状态，没有故障发生瞬间的 SMART 快照�
 `smart-sdc-control-json.out` 及设备映射文件支持上述结论。原始结果不提交 Git。
 远端读取使用已有 Cephadm 管理身份和已有主机密钥校验；临时身份文件已删除，
 未改变认证、Ceph 阈值、健康检查、OSD 服务或池数据。
+
+## 5. 软件侧排查与授权短自检
+
+用户随后要求判断软硬件故障并修复。2026-11-19 03:11–03:13 UTC 对原序列号
+复核后，执行了以下操作，证据目录为
+`results/ssd-repair-qualification-20261119T031143Z/`：
+
+1. `smartctl -H -P ignore -j /dev/sdd` 关闭型号数据库预设，仍返回
+   `smart_status.passed=false`，没有协议读取失败或回退判断警告。这排除了仅因
+   数据库属性名称解释而产生健康失败的说法。
+2. 执行一次后台、非 captive 的 `smartctl -t short -j /dev/sdd`。该诊断不覆盖
+   用户数据；[smartctl 官方手册](https://github.com/smartmontools/smartmontools/blob/main/src/smartctl.8.in)
+   允许在正常系统运行时进行这种测试，但它可能影响运行期间的性能。
+3. 自检最终返回 `Completed: unknown failure`，记录 `passed=false`；设备状态
+   同时显示 `completed with error (unknown test element)`，剩余 90% 是失败时
+   未完成比例，不代表测试仍在运行。不能把日志中的 LBA=0 解读为已定位坏扇区 0。
+4. 自检后总体健康仍失败，属性 202 仍为 value=1、threshold=10、raw=16。
+   设备没有修复；本次自检也不能证明是某个确定的电容、NAND 或控制器部件损坏。
+
+现在可确定问题在 SSD 设备内部，应按设备故障处理；现有证据尚不能将物理硬件
+损坏与盘内固件状态异常完全分开。尚未找到与本盘型号 `MZ7LH480HAHQ-00005`、
+固件 `HXT7904Q` 及此故障表现明确匹配、可核验适配的官方无损软件修复方案。
+
+[Samsung DC Toolkit 2.1 官方指南](https://download.semiconductor.samsung.com/resources/user-manual/Samsung_DCToolkit_V2.1_User_Guide.pdf)
+第 8 页列出 PM/SM883 诊断支持，第 17 页将 SMART 列为支持、Firmware Update
+列为 N/A。因此不能认为“下载任意新版工具就能修复”，也不能将同系列或其他 OEM
+镜像直接刷入此盘。[Dell HE59 发布页](https://www.dell.com/support/home/en-us/drivers/driversdetails?driverid=93P7P)
+列的是 `...0D3` 型号，不是本盘的 `...-00005`，不能作为适配升级依据。
+
+## 6. 已完成的数据保护与待执行维修
+
+停用检查 `ceph osd ok-to-stop 1` 返回 `ok_to_stop=false`：单副本
+`nsvu_owner_1` 的 PG `1673.0` 会离线；osd.1 另外承载 17 个 RBD PG，停止时
+这些 PG 会降级。`safe-to-destroy` 结果也没有将 osd.1 列为可销毁。
+
+已经将 `nsvu_owner_1` 导出到本地维修目录。当前该池只有一个空初始化对象，
+stored=0；导出文件 475 bytes，SHA-256 为
+`136a3083b12fc59fd5b4014898a847006416484bd114e3302a080739105d85ef`。
+这只是该实验池的备份，不是 RBD 数据全量备份，也没有验证在替代池上的恢复。
+没有更改池布局、OSD 成员关系或 RBD 数据，没有停止或重启服务。
+
+后续需要原供应商提供适配的固件/故障诊断结论，或安排现场更换对应 SSD。
+在拔盘、刷固件或销毁 OSD 之前，先处理单副本 PG 的迁移/恢复安排，并等待
+相关 RBD 数据恢复到满足维护条件，再复核停止和销毁检查。换盘后还需恢复
+owner/OSD 实验映射、检查布局和小规模存储资格，才能继续正式准备任务。
+
+本次完成了软件侧复核、短自检和限定实验池备份，**没有声称修复 SSD**。
+具体操作与原始结果可由 `repair-assessment.json`、`manifest.json`、
+`smart-without-presets.out`、`smart-after-short-*.out` 及 `owner1-backup.json`
+复核。
