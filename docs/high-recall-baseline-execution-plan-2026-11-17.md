@@ -608,6 +608,21 @@ validation 的 1000 条查询 Recall@10=92.98%。这是本地静态质量，仍�
 空池执行原设置与候选设置的一对完整导入、checker。原失败目录与日志保留，
 新增事件停止保护、资源预算及正式实验资格要求保持有效。
 
+### 13.2 2026-11-19 停止原因核验
+
+修复后的恢复目录 `results/high-recall-preparation-resume-20261118T075859Z/`
+于 11 月 18 日 08:05:15 UTC 再次停止。这次完成了六个实验池重置，随后检查
+发现慢告警扩展至 osd.1；实际 Deep importer 尚未启动。远端日志确认重置期间
+发生大量 OMAP 删除和 RocksDB flush/compaction，四组 KV 提交约 6.25–10.65 s，
+超过运行时 5 s 阈值。
+
+只读设备诊断进一步确认 n118 的 osd.1 对应 `/dev/sdd` 当前 SMART 总体健康
+失败，属性 202 `Exception_Mode_Status` 越过阈值。同机同型号 `/dev/sdc`
+对照健康通过。具体厂商故障含义及其对本次延迟的贡献程度尚未完全定位，不能
+将这次结果解释为 CLS/HNSW 性能问题。保持任务停止，先处理异常 SSD，再验证
+存储资格，之后恢复；不以放宽告警规则继续实验。完整时间线、口径和证据见
+[停止诊断记录](reports/baseline-preparation-stop-diagnosis-2026-11-19.md)。
+
 ## 参考依据
 
 - [实验手册](experiment-runbook.md)
