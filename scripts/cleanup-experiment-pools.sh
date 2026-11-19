@@ -21,6 +21,8 @@ Environment:
   CEPH_KEYRING       Optional local keyring path.
   EXPECTED_CEPH_FSID Abort unless the connected cluster has this FSID.
   OWNERS             Owner pool count (default: 5).
+  EXPECTED_ACTIVE_OSDS   Optional explicit comma/space-separated up/in OSD IDs.
+  EXPECTED_EXCLUDED_OSDS Existing IDs that must remain down/out (requires active IDs).
 
 Exit status 3 means pool cleanup succeeded but overall Ceph health is not OK.
 EOF
@@ -78,8 +80,8 @@ if [[ "${CEPH_USE_SUDO:-false}" == true ]]; then
 fi
 keyring=${CEPH_KEYRING:-}
 owners=${OWNERS:-5}
-[[ "$owners" =~ ^[1-9][0-9]*$ ]] || {
-  echo "OWNERS must be a positive integer, got: $owners" >&2
+[[ "$owners" =~ ^[1-5]$ ]] || {
+  echo "OWNERS must be in [1, 5] for the authorized experiment pools, got: $owners" >&2
   exit 2
 }
 
@@ -133,17 +135,45 @@ if [[ "$confirm_cleanup" != true ]]; then
   exit 0
 fi
 
-osd_stat=$(ceph_run osd stat)
-if [[ ! "$osd_stat" =~ ([0-9]+)[[:space:]]osds:[[:space:]]([0-9]+)[[:space:]]up.*,[[:space:]]([0-9]+)[[:space:]]in ]]; then
-  echo "Unable to parse OSD state; refusing cleanup: $osd_stat" >&2
-  exit 1
-fi
-total_osds=${BASH_REMATCH[1]}
-up_osds=${BASH_REMATCH[2]}
-in_osds=${BASH_REMATCH[3]}
-if (( total_osds != up_osds || total_osds != in_osds )); then
-  echo "Refusing cleanup while OSDs are not all up/in: $osd_stat" >&2
-  exit 1
+if [[ -n "${EXPECTED_ACTIVE_OSDS:-}" || -n "${EXPECTED_EXCLUDED_OSDS:-}" ]]; then
+  [[ -n "${EXPECTED_CEPH_FSID:-}" && -n "${EXPECTED_ACTIVE_OSDS:-}" ]] || {
+    echo "Explicit OSD layout requires EXPECTED_CEPH_FSID and EXPECTED_ACTIVE_OSDS" >&2
+    exit 1
+  }
+  osd_dump=$(ceph_run osd dump --format json)
+  python3 -c '
+import json, sys
+def ids(value):
+    parts = value.replace(",", " ").split()
+    if any(not x.isdecimal() for x in parts):
+        raise SystemExit("Invalid expected OSD IDs")
+    result = [int(x) for x in parts]
+    if len(result) != len(set(result)):
+        raise SystemExit("Duplicate expected OSD IDs")
+    return set(result)
+active, excluded = ids(sys.argv[1]), ids(sys.argv[2])
+doc = json.load(sys.stdin)
+rows = doc.get("osds", [])
+if (not active or active & excluded or doc.get("fsid") != sys.argv[3] or
+        {x.get("osd") for x in rows} != active | excluded or
+        len(rows) != len(active | excluded) or
+        any(not x.get("up") or not x.get("in") for x in rows if x["osd"] in active) or
+        any(x.get("up") or x.get("in") for x in rows if x["osd"] in excluded)):
+    raise SystemExit("Refusing cleanup: OSD identities/states differ from explicit layout")
+' "$EXPECTED_ACTIVE_OSDS" "${EXPECTED_EXCLUDED_OSDS:-}" "$EXPECTED_CEPH_FSID" <<< "$osd_dump"
+else
+  osd_stat=$(ceph_run osd stat)
+  if [[ ! "$osd_stat" =~ ([0-9]+)[[:space:]]osds:[[:space:]]([0-9]+)[[:space:]]up.*,[[:space:]]([0-9]+)[[:space:]]in ]]; then
+    echo "Unable to parse OSD state; refusing cleanup: $osd_stat" >&2
+    exit 1
+  fi
+  total_osds=${BASH_REMATCH[1]}
+  up_osds=${BASH_REMATCH[2]}
+  in_osds=${BASH_REMATCH[3]}
+  if (( total_osds != up_osds || total_osds != in_osds )); then
+    echo "Refusing cleanup while OSDs are not all up/in: $osd_stat" >&2
+    exit 1
+  fi
 fi
 
 pg_stat=$(ceph_run pg stat)

@@ -61,6 +61,10 @@ class PreparationTests(unittest.TestCase):
         suite.resume_root, suite.offline_only = prior, offline
         suite.reused_splits, suite.reused_graphs, suite.reused_cases = {}, {}, {}
         suite.reference_roots, suite.reference_bytes, suite.resume_evidence = [], 0, {}
+        suite.owner_osds, suite.excluded_osds, suite.owners = list(range(5)), [], 5
+        suite.local_resume_only, suite.layout_changed = False, False
+        suite.cohort_id, suite.device_proof = "test-five-osd", None
+        suite.env = dict(OWNERS="5")
         suite.bin = root / "bin"
         suite.bin.mkdir()
         for name in ("nsvu-base-importer", "nsvu-index-checker", "libcls_hnsw_global.so",
@@ -163,13 +167,16 @@ class PreparationTests(unittest.TestCase):
         suite.args = mock.Mock(keyring=Path("/not/read"))
         suite.root = Path(directory)
         suite.allowed_health = {"MGR_MODULE_ERROR", "POOL_NO_REDUNDANCY", "LARGE_OMAP_OBJECTS"}
+        suite.owner_osds, suite.excluded_osds, suite.owners = list(range(5)), [], 5
+        suite.cohort_id, suite.device_proof = "test-five-osd", None
         document = status if status is not None else dict(
             osdmap=dict(num_osds=5, num_up_osds=5, num_in_osds=5),
             pgmap=dict(num_pgs=39, pgs_by_state=[dict(state_name="active+clean", count=39)]),
             health=dict(checks={}))
         capacities = nodes if nodes is not None else [dict(id=i, utilization=5) for i in range(5)]
-        suite.ceph_json = lambda *cmd: copy.deepcopy(document if cmd == ("status",)
-                                                    else dict(nodes=capacities))
+        suite.ceph_json = lambda *cmd: copy.deepcopy(document if cmd == ("status",) else
+            dict(osds=[dict(osd=i, up=1, **{"in": 1}) for i in range(5)])
+            if cmd == ("osd", "dump") else dict(nodes=capacities))
         return suite, document
 
     def test_reset_confirmation_is_required_before_any_setup(self):
@@ -225,6 +232,110 @@ class PreparationTests(unittest.TestCase):
             self.assertFalse((suite.root / "graphs/gist1m/m16-efc200/base.hnsw").exists())
             self.assertGreater(suite.reference_bytes, 0)
             self.assertTrue(MOD.read_json(suite.root / "resume-manifest.json")["local_quality_only"])
+
+    def test_four_osd_local_resume_discards_old_remote_trials_and_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prior = self.fake_prior(root / "old")
+            suite = self.resume_suite(root / "new", prior)
+            suite.owner_osds, suite.excluded_osds, suite.owners = [0, 2, 3, 4], [1], 4
+            suite.local_resume_only = True
+            (suite.bin / "index-content-digest.py").write_bytes(b"new owner-count support")
+            suite.load_resume()
+            self.assertEqual(set(suite.reused_graphs), {"gist1m"})
+            self.assertEqual(suite.reused_cases, {})
+            self.assertFalse((suite.root / "import-trials/gist1m/selected-settings.json").exists())
+            evidence = MOD.read_json(suite.root / "resume-manifest.json")
+            self.assertTrue(evidence["layout_changed"])
+            self.assertFalse(evidence["remote_trials_reused"])
+            self.assertEqual(suite.gist_configurations(), [(1, 2048), (2, 2048), (4, 2048), (4, 8192)])
+            _, manifest = suite.prepare("gist1m")
+            command = suite.importer_args(manifest, 16, 200)
+            self.assertEqual(command[command.index("--owners") + 1], 4)
+
+    def test_layout_change_requires_local_only_even_when_owner_count_is_unchanged(self):
+        for mapping in ([0, 2, 3, 4], [0, 2, 3, 4, 5]):
+            with self.subTest(mapping=mapping), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                prior = self.fake_prior(root / "old")
+                suite = self.resume_suite(root / "new", prior)
+                suite.owner_osds, suite.excluded_osds, suite.owners = mapping, [1], len(mapping)
+                with self.assertRaisesRegex(RuntimeError, "resume-local-only"):
+                    suite.load_resume()
+
+    def test_local_only_resume_still_rejects_changed_graph_quality_tool(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            suite = self.resume_suite(root / "new", self.fake_prior(root / "old"))
+            suite.local_resume_only = True
+            (suite.bin / "baseline-quality.py").write_bytes(b"different quality semantics")
+            with self.assertRaisesRegex(RuntimeError, "computational binary/tool changed"):
+                suite.load_resume()
+
+    def test_four_osd_gate_rejects_rejoining_failed_osd_and_wrong_active_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            suite, doc = self.gate(temp)
+            suite.owner_osds, suite.excluded_osds, suite.owners = [0, 2, 3, 4], [1], 4
+            doc["osdmap"].update(num_up_osds=4, num_in_osds=4)
+            osdmap = dict(osds=[dict(osd=i, up=int(i != 1), **{"in": int(i != 1)}) for i in range(5)])
+            original = suite.ceph_json
+            suite.ceph_json = lambda *cmd: copy.deepcopy(osdmap) if cmd == ("osd", "dump") else original(*cmd)
+            with mock.patch.object(MOD.subprocess, "check_output", return_value=MOD.FSID):
+                suite.cluster_gate(initial=True)
+            osdmap["osds"][1].update(up=1, **{"in": 1})
+            osdmap["osds"][2].update(up=0, **{"in": 0})
+            with mock.patch.object(MOD.subprocess, "check_output", return_value=MOD.FSID), \
+                    self.assertRaisesRegex(RuntimeError, "identities/states"):
+                suite.cluster_gate()
+
+    def test_four_owner_import_passes_owner_count_to_all_storage_tools(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            suite = self.resume_suite(root / "new", self.fake_prior(root / "old"))
+            suite.owner_osds, suite.excluded_osds, suite.owners = [0, 2, 3, 4], [1], 4
+            suite.local_resume_only = True
+            suite.load_resume()
+            suite.reset = mock.Mock()
+            suite.cluster_gate = mock.Mock()
+            def record(label, command):
+                if label.endswith("-checker"):
+                    target = Path(command[command.index("--output") + 1])
+                    MOD.write_json(target, dict(status="pass", errors=0, warnings=0))
+            suite.run = mock.Mock(side_effect=record)
+            suite.import_case("gist1m", suite.reused_splits["gist1m"], suite.reused_graphs["gist1m"],
+                              4, 8192, 1, True)
+            self.assertEqual(suite.run.call_count, 3)
+            for call in suite.run.call_args_list:
+                command = call.args[1]
+                self.assertEqual(command[command.index("--owners") + 1], 4)
+
+    def test_clean_pgs_must_match_declared_physical_owner_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            suite, _ = self.gate(temp)
+            suite.owner_osds, suite.excluded_osds, suite.owners = [0, 2, 3, 4], [1], 4
+            names = ["nsvu_meta"] + ["nsvu_owner_%d" % i for i in range(4)]
+            definitions = [dict(pool_name=name, pool_id=100 + i, pg_num=1, size=1, min_size=1)
+                           for i, name in enumerate(names)]
+            targets = [0, 0, 2, 3, 4]
+            rows = [dict(pgid="%d.0" % (100 + i), state="active+clean", up=[target], acting=[target])
+                    for i, target in enumerate(targets)]
+            suite.ceph_json = lambda *cmd: copy.deepcopy(definitions if cmd == ("osd", "pool", "ls", "detail")
+                                                        else dict(pg_stats=rows))
+            suite.verify_pool_placement()
+            rows[2].update(up=[1], acting=[1])
+            with self.assertRaisesRegex(RuntimeError, "placement.*nsvu_owner_1"):
+                suite.verify_pool_placement()
+
+    def test_deep_only_local_resume_requires_new_gist_settings_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            suite = self.resume_suite(Path(temp) / "new")
+            suite.local_resume_only = True
+            suite.args.datasets = ["deep100m"]
+            suite.cluster_gate = mock.Mock()
+            suite.cleanup_pools = mock.Mock()
+            with self.assertRaisesRegex(RuntimeError, "Deep-only resume requires"):
+                suite.execute()
+            suite.cleanup_pools.assert_not_called()
 
     def test_offline_completed_resume_can_be_resumed_again(self):
         with tempfile.TemporaryDirectory() as temp:

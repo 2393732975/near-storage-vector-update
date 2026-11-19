@@ -641,6 +641,71 @@ runner 或将四 OSD 下的数据并入原对照。换盘并恢复布局后重�
 方案。完整授权范围、时间线、校验与工件见
 [迁移与停用记录](reports/osd1-data-evacuation-report-2026-11-19.md)。
 
+## 14. 2026-11-19 四 OSD 恢复批次
+
+用户在故障盘迁移停用后明确要求继续未完成任务。本轮采用新的四 OSD 实验组：
+四个逻辑 owner 依次映射物理 OSD `0,2,3,4`，meta 放在 osd.0；osd.1 必须持续
+down/out，服务保持 disabled。该组不与旧五 OSD 组的远端性能数字合并。
+
+### 14.1 可复用与必须重测的内容
+
+原四份 HNSW cache、数据切分、GT 和本地质量筛选结果可以复用：cache identity
+不依赖 owner 数，重新导入时才按 `--owners 4` 分片；每份 cache/sidecar、原始
+数据、split/GT 和本地质量证据仍须通过完整哈希与格式核验，不重新构图。
+
+恢复显式使用 `--resume-local-only`。它不复制任何旧导入结果或 selected-settings，
+即使旧 GIST 12 轮曾完整通过；仅在所有远端证据均弃用时允许存储摘要脚本的
+哈希变化，构图/质量工具和 importer/checker/CLS 二进制身份继续严格匹配。
+同 owner 数但物理 OSD ID 不同，也算布局变化，不能隐式复用旧远端结果。
+
+GIST 在本轮冻结图上重新执行 `(workers, OMAP batch)`：`(1,2048)`、`(2,2048)`、
+`(4,2048)`、`(4,8192)`，交替三轮，共 12 次。每轮完整 checker 和五个当前实验
+池的逻辑内容摘要均须通过；本轮重新选出的设置用于 Deep100M 的原设置/候选
+设置规模验证。SIFT 与 Text2Image 的合格本地图也保留引用，仍未冒充远端资格。
+
+### 14.2 实现与现场资格
+
+初始化脚本支持 `OWNERS=4 OWNER_OSDS=0,2,3,4`，在任何删建池前核验目标均为
+up/in。旧五盘默认映射因此也会在尝试使用 down/out 的 osd.1 时拒绝，不能误将
+故障盘重新加入。importer、checker、digest 和 smoke 的 query/update 均显式传
+owner 数；每次 reset 后另外核对 meta/owner PG 的 up、acting 与声明映射一致。
+
+runner 和 cleanup 声明 active `0,2,3,4`、excluded `1`，检查精确 ID 集合和状态；
+没有简单地跳过旧的“全部 up/in”门禁。cleanup 保留默认严格行为，显式布局需要
+FSID 保护；启动时先对原六个实验池 dry-run/确认清理，以去除旧 owner4，结束
+时同样按六池白名单清理。仅本轮五个实验池参与导入与摘要，`.mgr`、`rbd` 不改。
+
+新只读资格记录为 `results/four-osd-qualification-20261119T035644Z/`：四块活动
+SSD 的 SMART 均通过，序列号匹配，无失败属性；四份实际部署 CLS 的 SHA-256
+均与本地一致。排除设备的运行要求这些新证据，启动时再次匹配活动 OSD 的
+实际主机、设备和序列号。SMART 通过不代替负载资格或后续健康监测。
+
+先在 500 点合成图上验证四 owner 路由、w1/w4 导入内容一致、两路查询只读性、
+严格 raw-RADOS/CLS 计数、20 次串行更新、active-GT Recall 和 checker。通过后
+启动上述首批准备/导入资格任务，继续使用 36 小时、700 GiB 工件、250 GiB
+本地剩余空间及 750 GiB 子进程 RSS 预算。新增慢告警、其他健康变化、活动 OSD
+失效、排除 OSD 重新上线、PG 异常或资源超限均停止并保留现场。
+
+上述真实 smoke 已在 `results/four-osd-smoke-20261119T041100Z/` 通过：w1/w4
+导入摘要一致，Compute/OSD 初始与更新后 Recall@10 均为 1.0，各 20 次更新
+零失败，串行轨迹身份及 active-GT 一致；只读查询前后摘要不变，checker 均零
+error/warning。Compute 更新的 CLS 调用为 0、raw 调用为 20201；OSD 更新
+CLS 调用为 11553。这里只认证合成小图功能，不作为全规模质量或性能数据。
+
+本轮入口示例（其余路径以实际 launch manifest 为准）：
+
+```bash
+python3 scripts/run-high-recall-preparation.py --confirm-reset \
+  --owner-osds 0,2,3,4 --excluded-osds 1 --cohort-id four-osd-20261119 \
+  --resume-from results/high-recall-continuation-20261118T041552Z/offline-sift \
+  --resume-local-only --run-root results/high-recall-four-osd-YYYYMMDDTHHMMSSZ \
+  --deployed-cls-evidence results/four-osd-qualification-20261119T035644Z/deployed-cls-verification.json \
+  --device-qualification results/four-osd-qualification-20261119T035644Z/device-qualification.json
+```
+
+这仍是准备/资格批次，正式 24-case 尚需完成本组的远端/动态质量、同步观测及
+pilot 预算验收。不能将旧五盘的收益百分比或本地静态 Recall 直接作为本组结论。
+
 ## 参考依据
 
 - [实验手册](experiment-runbook.md)

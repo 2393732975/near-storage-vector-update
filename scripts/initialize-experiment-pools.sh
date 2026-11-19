@@ -16,6 +16,53 @@ owners=${OWNERS:-5}
 prefix=${OWNER_POOL_PREFIX:-nsvu_owner_}
 meta_pool=${META_POOL:-nsvu_meta}
 
+# OWNER_OSDS may use commas or whitespace, e.g. OWNERS=4 OWNER_OSDS=0,2,3,4.
+# Owner IDs are logical shard IDs; OSD IDs need not be contiguous. Validate the
+# entire destructive scope and placement before deleting even the first pool.
+if [[ ! "$owners" =~ ^[1-5]$ ]]; then
+  echo "OWNERS must be an integer in [1, 5] for the approved experiment pools." >&2
+  exit 2
+fi
+if [[ "$prefix" != nsvu_owner_ || "$meta_pool" != nsvu_meta ]]; then
+  echo "Refusing reset outside nsvu_meta and nsvu_owner_0 through nsvu_owner_4." >&2
+  exit 2
+fi
+owner_osds=()
+if [[ "${OWNER_OSDS+x}" == x ]]; then
+  if [[ -z "${OWNER_OSDS//[[:space:]]/}" ||
+        "$OWNER_OSDS" =~ (^|,)[[:space:]]*(,|$) ]]; then
+    echo "OWNER_OSDS must contain nonempty OSD IDs separated by commas or spaces." >&2
+    exit 2
+  fi
+  mapping_text=${OWNER_OSDS//,/ }
+  mapping_text=${mapping_text//$'\n'/ }
+  mapping_text=${mapping_text//$'\r'/ }
+  read -r -a owner_osds <<< "$mapping_text"
+else
+  for (( owner = 0; owner < owners; owner++ )); do
+    owner_osds+=("$owner")
+  done
+fi
+if (( ${#owner_osds[@]} != owners )); then
+  echo "OWNER_OSDS count must match OWNERS=$owners." >&2
+  exit 2
+fi
+declare -A seen_osds=()
+for (( owner = 0; owner < owners; owner++ )); do
+  osd=${owner_osds[$owner]}
+  if [[ ! "$osd" =~ ^[0-9]+$ || ${#osd} -gt 10 ]]; then
+    echo "OWNER_OSDS entries must be nonnegative OSD IDs." >&2
+    exit 2
+  fi
+  osd=$((10#$osd))
+  if (( osd > 2147483647 )) || [[ -n "${seen_osds[$osd]+present}" ]]; then
+    echo "OWNER_OSDS entries must be unique valid OSD IDs." >&2
+    exit 2
+  fi
+  seen_osds[$osd]=1
+  owner_osds[$owner]=$osd
+done
+
 ceph_args=()
 rados_args=()
 if [[ -n "$keyring" ]]; then
@@ -30,6 +77,21 @@ if [[ -n "${EXPECTED_CEPH_FSID:-}" ]]; then
     exit 1
   fi
 fi
+
+osd_state=$("$ceph_cmd" "${ceph_args[@]}" osd dump --format json)
+printf '%s\n' "$osd_state" | python3 -c '
+import json, sys
+document = json.load(sys.stdin)
+rows = document.get("osds", [])
+states = {row["osd"]: row for row in rows}
+if len(states) != len(rows):
+    raise SystemExit("Refusing reset: duplicate OSD state records")
+targets = [int(value) for value in sys.argv[1:]]
+for target in targets:
+    row = states.get(target)
+    if row is None or row.get("up") != 1 or row.get("in") != 1:
+        raise SystemExit("Refusing reset: target osd.%d must be present and up/in" % target)
+' "${owner_osds[@]}"
 
 ensure_pool_placement() {
   local pool=$1 target_osd=$2 pool_id pgid acting
@@ -62,7 +124,11 @@ ensure_single_pg_pool() {
   fi
 }
 
-for pool in "$meta_pool" $(seq 0 $((owners - 1)) | sed "s#^#${prefix}#"); do
+pools=("$meta_pool")
+for (( owner = 0; owner < owners; owner++ )); do
+  pools+=("${prefix}${owner}")
+done
+for pool in "${pools[@]}"; do
   if "$ceph_cmd" "${ceph_args[@]}" osd pool ls | grep -Fxq "$pool"; then
     "$ceph_cmd" "${ceph_args[@]}" osd pool rm "$pool" "$pool" --yes-i-really-really-mean-it
   fi
@@ -77,9 +143,9 @@ for pool in "$meta_pool" $(seq 0 $((owners - 1)) | sed "s#^#${prefix}#"); do
   ensure_single_pg_pool "$pool"
 done
 
-ensure_pool_placement "$meta_pool" 0
+ensure_pool_placement "$meta_pool" "${owner_osds[0]}"
 "$rados_cmd" "${rados_args[@]}" -p "$meta_pool" put hnsw.global.meta /dev/null
 for owner in $(seq 0 $((owners - 1))); do
-  ensure_pool_placement "${prefix}${owner}" "$owner"
+  ensure_pool_placement "${prefix}${owner}" "${owner_osds[$owner]}"
   "$rados_cmd" "${rados_args[@]}" -p "${prefix}${owner}" put hnsw.owner.meta /dev/null
 done

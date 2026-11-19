@@ -26,6 +26,19 @@ FSID = "c83da116-1e8b-11f1-933d-cd48aa44d216"
 DATASETS = ("gist1m", "text2image10m", "deep100m", "sift100m")
 
 
+def osd_ids(value):
+    try:
+        parts = str(value).replace(",", " ").split()
+        if any(not part.isdecimal() for part in parts):
+            raise ValueError()
+        values = [int(part) for part in parts]
+        if len(values) != len(set(values)):
+            raise ValueError()
+        return values
+    except ValueError:
+        raise argparse.ArgumentTypeError("OSD IDs must be unique nonnegative integers")
+
+
 def utc():
     return datetime.now(timezone.utc).isoformat()
 
@@ -123,8 +136,18 @@ class Suite:
         self.resume_evidence = {}
         self.slow_guard = None
         self.cls_proof = None
+        self.device_proof = None
+        self.owner_osds = list(args.owner_osds)
+        self.excluded_osds = list(args.excluded_osds)
+        self.owners = len(self.owner_osds)
+        self.local_resume_only = args.resume_local_only
+        self.layout_changed = False
+        self.cohort_id = args.cohort_id or "osds-" + "-".join(map(str, self.owner_osds))
         self.env = dict(os.environ, CEPH_KEYRING=str(args.keyring),
-                        EXPECTED_CEPH_FSID=FSID, OWNERS="5", META_POOL="nsvu_meta",
+                        EXPECTED_CEPH_FSID=FSID, OWNERS=str(self.owners), META_POOL="nsvu_meta",
+                        OWNER_OSDS=",".join(map(str, self.owner_osds)),
+                        EXPECTED_ACTIVE_OSDS=",".join(map(str, self.owner_osds)),
+                        EXPECTED_EXCLUDED_OSDS=",".join(map(str, self.excluded_osds)),
                         OWNER_POOL_PREFIX="nsvu_owner_", CEPH_CMD="/usr/bin/ceph",
                         RADOS_CMD="/usr/bin/rados", CEPH_USE_SUDO="false")
         self.lock = (self.repo / "results/.high-recall-experiment.lock").open("w")
@@ -149,13 +172,41 @@ class Suite:
             digest = sha(self.bin / "libcls_hnsw_global.so")
             rows = proof.get("osds", [])
             if (proof.get("status") != "pass" or proof.get("fsid") != FSID or
-                    len(rows) != 5 or {x.get("osd") for x in rows} != set(range(5)) or
+                    len(rows) != self.owners or {x.get("osd") for x in rows} != set(self.owner_osds) or
                     proof.get("expected_sha256") != digest or
                     any(x.get("sha256") != digest or not x.get("matches_expected") for x in rows)):
                 raise RuntimeError("deployed CLS proof is incomplete or binary differs")
             self.cls_proof = proof
             shutil.copy2(args.deployed_cls_evidence, self.root / "deployed-cls-verification.json")
+        if getattr(args, "device_qualification", None):
+            proof = read_json(args.device_qualification)
+            rows = proof.get("devices", [])
+            if (proof.get("status") != "pass" or proof.get("fsid") != FSID or
+                    proof.get("read_only") is not True or proof.get("configuration_changed") is not False or
+                    proof.get("active_osds") != self.owner_osds or
+                    set(proof.get("excluded_osds", [])) != set(self.excluded_osds) or
+                    len(rows) != self.owners or {x.get("osd") for x in rows} != set(self.owner_osds) or
+                    any(x.get("smart_passed") is not True or x.get("smart_exit_code") != 0 or
+                        x.get("serial_matches") is not True or x.get("failed_attributes") or
+                        not x.get("serial") or x.get("serial") != x.get("observed_serial") for x in rows)):
+                raise RuntimeError("device qualification is incomplete or does not match this layout")
+            checked = datetime.fromisoformat(proof["checked_utc"])
+            age = (datetime.now(timezone.utc) - checked).total_seconds()
+            if not 0 <= age <= 24 * 3600:
+                raise RuntimeError("device qualification must be from the last 24 hours")
+            self.device_proof = proof
+            shutil.copy2(args.device_qualification, self.root / "device-qualification.json")
+        if self.excluded_osds and not self.offline_only and (not self.device_proof or not self.cls_proof):
+            raise RuntimeError("an excluded-device layout requires current active-device and CLS evidence")
         self.status("starting")
+
+    def storage_layout(self):
+        return dict(owners=self.owners, owner_osds=self.owner_osds,
+                    excluded_osds=self.excluded_osds)
+
+    def gist_configurations(self):
+        return list(dict.fromkeys([(1, 2048), (min(2, self.owners), 2048),
+                                   (self.owners, 2048), (self.owners, 8192)]))
 
     def status(self, state, **extra):
         doc = dict(state=state, updated_utc=utc(), pid=os.getpid(),
@@ -163,6 +214,7 @@ class Suite:
                    stage="offline_graph_qualification_only" if self.offline_only else
                          "preparation_and_qualification_only",
                    resume_from=str(self.resume_root) if self.resume_root else None,
+                   cohort_id=self.cohort_id, storage_layout=self.storage_layout(),
                    referenced_artifact_bytes=self.reference_bytes,
                    steps=self.steps, **extra)
         write_json(self.root / "status.json", doc)
@@ -252,8 +304,18 @@ class Suite:
             raise RuntimeError("FSID mismatch")
         doc = self.ceph_json("status")
         osds = doc.get("osdmap", {}).get("osdmap", doc.get("osdmap", {}))
-        if any(osds.get(key) != 5 for key in ("num_osds", "num_up_osds", "num_in_osds")):
-            raise RuntimeError("OSDs must be 5/5 up/in")
+        expected = set(self.owner_osds) | set(self.excluded_osds)
+        if (osds.get("num_osds") != len(expected) or
+                any(osds.get(key) != self.owners for key in ("num_up_osds", "num_in_osds"))):
+            raise RuntimeError("OSD counts differ from the declared active/excluded layout")
+        osdmap = self.ceph_json("osd", "dump")
+        rows = osdmap.get("osds", [])
+        if (len(rows) != len(expected) or {row.get("osd") for row in rows} != expected or
+                any(not row.get("up") or not row.get("in") for row in rows
+                    if row["osd"] in self.owner_osds) or
+                any(row.get("up") or row.get("in") for row in rows
+                    if row["osd"] in self.excluded_osds)):
+            raise RuntimeError("OSD identities/states differ from the declared active/excluded layout")
         pg = doc["pgmap"]
         states = pg.get("pgs_by_state", [])
         if (not states or pg.get("num_pgs", 0) <= 0 or
@@ -295,14 +357,36 @@ class Suite:
         elif checks - self.allowed_health:
             raise RuntimeError("new health checks: " + str(checks - self.allowed_health))
         utilization = self.ceph_json("osd", "df")
-        if {x.get("id") for x in utilization.get("nodes", [])} != set(range(5)):
+        if {x.get("id") for x in utilization.get("nodes", [])} != expected:
             raise RuntimeError("incomplete OSD capacity report")
-        if any(float(x.get("utilization", 0)) >= 80 for x in utilization.get("nodes", [])):
+        if any(float(x.get("utilization", 0)) >= 80 for x in utilization.get("nodes", [])
+               if x["id"] in self.owner_osds):
             raise RuntimeError("OSD capacity threshold reached")
         write_json(self.root / "cluster-latest.json", doc)
         if initial:
+            if self.device_proof:
+                metadata = {x["id"]: x for x in self.ceph_json("osd", "metadata")}
+                for device in self.device_proof["devices"]:
+                    actual = metadata.get(device["osd"], {})
+                    if (actual.get("hostname") != device["host"] or
+                            device["serial"] not in actual.get("device_ids", "") or
+                            Path(device["device"]).name not in actual.get("devices", "").split(",")):
+                        raise RuntimeError("qualified device identity differs from live OSD metadata")
             write_json(self.root / "cluster-initial.json", doc)
             write_json(self.root / "daemon-versions.json", self.ceph_json("versions"))
+
+    def cleanup_pools(self, label):
+        # Include the legacy fifth owner in the fixed authorized whitelist.
+        self.cluster_gate()
+        previous = self.env["OWNERS"]
+        self.env["OWNERS"] = "5"
+        try:
+            self.run(label + "-dry-run", ["bash", self.bin / "cleanup-experiment-pools.sh"], 900)
+            self.run(label, ["bash", self.bin / "cleanup-experiment-pools.sh", "--confirm-cleanup"],
+                     900, allowed=(0, 3))
+        finally:
+            self.env["OWNERS"] = previous
+        self.cluster_gate()
 
     def reset(self, label):
         self.cluster_gate()
@@ -311,11 +395,29 @@ class Suite:
         while True:
             try:
                 self.cluster_gate()
+                self.verify_pool_placement()
                 return
             except RuntimeError as error:
-                if "PGs" not in str(error) or time.monotonic() >= deadline:
+                if ("PGs" not in str(error) and "placement" not in str(error)) or time.monotonic() >= deadline:
                     raise
                 time.sleep(5)
+
+    def verify_pool_placement(self):
+        definitions = {x["pool_name"]: x for x in self.ceph_json("osd", "pool", "ls", "detail")}
+        pg_rows = {x["pgid"]: x for x in self.ceph_json("pg", "dump", "pgs")["pg_stats"]}
+        wanted = {"nsvu_meta": self.owner_osds[0]}
+        wanted.update({"nsvu_owner_%d" % owner: osd for owner, osd in enumerate(self.owner_osds)})
+        for name, target in wanted.items():
+            pool = definitions.get(name, {})
+            pg = pg_rows.get(str(pool.get("pool_id")) + ".0", {})
+            if (pool.get("pg_num") != 1 or pool.get("size") != 1 or pool.get("min_size") != 1 or
+                    pg.get("state") != "active+clean" or pg.get("up") != [target] or
+                    pg.get("acting") != [target]):
+                raise RuntimeError("experiment pool placement is not ready: " + name)
+        write_json(self.root / "pool-placement-latest.json", dict(
+            checked_utc=utc(), storage_layout=self.storage_layout(),
+            pools=[dict(pool=name, physical_osd=target, pool_id=definitions[name]["pool_id"])
+                   for name, target in wanted.items()]))
 
     def reuse_note(self, label, sources):
         record = dict(label=label, state="reused", verified_utc=utc(),
@@ -433,7 +535,7 @@ class Suite:
         cfg = manifest["config"]
         expected = dict(M=selected["M"], ef_construction=selected["ef_construction"],
                         num_vectors=cfg["count"], vectors_imported=cfg["count"], dim=cfg["dim"],
-                        points_per_object=cfg["points_per_object"], owners=5,
+                        points_per_object=cfg["points_per_object"], owners=self.owners,
                         import_workers=row["workers"], omap_batch=row["omap_batch"])
         if (row.get("metrics") != metrics or any(metrics.get(k) != v for k, v in expected.items()) or
                 not isinstance(metrics.get("total_seconds"), (int, float)) or
@@ -461,6 +563,11 @@ class Suite:
         if self.resume_root == self.root:
             raise RuntimeError("resume must use a distinct new RUN_ROOT")
         prior = read_json(self.resume_root / "manifest.json")
+        prior_layout = prior.get("storage_layout", dict(owners=5, owner_osds=list(range(5)),
+                                                       excluded_osds=[]))
+        self.layout_changed = prior_layout != self.storage_layout()
+        if self.layout_changed and not self.local_resume_only:
+            raise RuntimeError("storage layout changed; --resume-local-only is required to discard remote trials")
         state = read_json(self.resume_root / "status.json")
         if state.get("state") in ("starting", "running"):
             raise RuntimeError("resume source is still marked active")
@@ -472,8 +579,11 @@ class Suite:
         for root in self.reference_roots:
             if read_json(root / "manifest.json").get("expected_fsid") != FSID:
                 raise RuntimeError("resume lineage cluster identity mismatch")
-        for name in ("nsvu-base-importer", "nsvu-index-checker", "libcls_hnsw_global.so",
-                     "baseline-quality.py", "index-content-digest.py"):
+        tools = ["nsvu-base-importer", "nsvu-index-checker", "libcls_hnsw_global.so",
+                 "baseline-quality.py"]
+        if not self.local_resume_only:
+            tools.append("index-content-digest.py")
+        for name in tools:
             if prior.get("binaries", {}).get(name) != sha(self.bin / name):
                 raise RuntimeError("resume computational binary/tool changed: " + name)
         files = {}
@@ -500,7 +610,7 @@ class Suite:
                 files[str(source_selected)] = sha(source_selected)
                 self.reused_graphs[dataset] = selected
             source_summary = self.resume_root / "import-trials" / dataset / "summary.json"
-            if source_summary.exists() and dataset in self.reused_graphs:
+            if source_summary.exists() and dataset in self.reused_graphs and not self.local_resume_only:
                 seen, digests, rows = set(), set(), []
                 for row in read_json(source_summary):
                     key = (row["repetition"], row["workers"], row["omap_batch"])
@@ -515,7 +625,7 @@ class Suite:
                 if len(digests) > 1:
                     raise RuntimeError("resume GIST import contents disagree")
                 self.reused_cases[dataset] = {(x["repetition"], x["workers"], x["omap_batch"]): x for x in rows}
-                expected = {(rep, w, b) for rep in (1, 2, 3) for w, b in ((1, 2048), (2, 2048), (5, 2048), (5, 8192))}
+                expected = {(rep, w, b) for rep in (1, 2, 3) for w, b in self.gist_configurations()}
                 if dataset == "gist1m" and set(self.reused_cases[dataset]) == expected:
                     target = self.root / "import-trials" / dataset
                     write_json(target / "summary.json", rows)
@@ -534,7 +644,13 @@ class Suite:
         self.resume_evidence = dict(source_run=str(self.resume_root), verified_utc=utc(),
                                     ancestor_roots=[str(x) for x in self.reference_roots],
                                     referenced_artifact_bytes=self.reference_bytes, source_files_sha256=files,
-                                    local_quality_only=True, failed_imports_reused=False)
+                                    local_quality_only=True, failed_imports_reused=False,
+                                    resume_local_only=self.local_resume_only,
+                                    source_layout=prior_layout, target_layout=self.storage_layout(),
+                                    layout_changed=self.layout_changed,
+                                    remote_trials_reused=any(self.reused_cases.values()),
+                                    digest_tool_identity_policy=("not reused: graph-only resume discards all remote evidence"
+                                        if self.local_resume_only else "identical tool required"))
         write_json(self.root / "resume-manifest.json", self.resume_evidence)
         self.resource_gate()
         self.reuse_note("resume-evidence-verified", [self.resume_root])
@@ -559,7 +675,8 @@ class Suite:
         return [self.bin / "nsvu-base-importer", "--input", base["path"], "--input-format", base["format"],
                 "--num-vectors", cfg["count"], "--dim", cfg["dim"], "--vector-kind", cfg["kind"],
                 "--metric", cfg["metric"], "--threads", cfg["threads"], "--M", m, "--ef", efc,
-                "--points-per-object", cfg["points_per_object"], "--dataset-sha256", base["sha256"]]
+                "--owners", self.owners, "--points-per-object", cfg["points_per_object"],
+                "--dataset-sha256", base["sha256"]]
 
     def qualify(self, dataset, manifest):
         if dataset in self.reused_graphs:
@@ -626,7 +743,7 @@ class Suite:
             "--metrics-out", folder / "import.json", "--progress-out", folder / "progress.json"])
         cfg = manifest["config"]
         self.run(label + "-checker", [self.bin / "nsvu-index-checker", "--keyring", self.args.keyring,
-                 "--owners", 5, "--points-per-object", cfg["points_per_object"], "--batch-size", 8192,
+                 "--owners", self.owners, "--points-per-object", cfg["points_per_object"], "--batch-size", 8192,
                  "--reference-input", manifest["base"]["path"], "--reference-input-format", manifest["base"]["format"],
                  "--reference-count", cfg["count"], "--semantic-samples", 256,
                  "--semantic-min-edge-win-rate", .60, "--output", folder / "checker.json"])
@@ -636,6 +753,7 @@ class Suite:
         if digest:
             self.run(label + "-digest", ["/usr/bin/python3", self.bin / "index-content-digest.py",
                      "--keyring", self.args.keyring, "--expected-fsid", FSID,
+                     "--owners", self.owners,
                      "--output", folder / "content-digest.json"])
         self.cluster_gate()
         return folder
@@ -645,7 +763,7 @@ class Suite:
         # Same frozen graph in every case. Three alternating rounds of GIST;
         # one large-data pair validates scaling without a full Cartesian scan.
         if dataset == "gist1m":
-            configurations, repetitions = [(1, 2048), (2, 2048), (5, 2048), (5, 8192)], 3
+            configurations, repetitions = self.gist_configurations(), 3
             identities = {(r, w, b) for r in (1, 2, 3) for w, b in configurations}
             if set(self.reused_cases.get(dataset, {})) == identities:
                 self.reuse_note(dataset + "-reuse-complete-import-trials",
@@ -699,19 +817,23 @@ class Suite:
             started_utc=utc(), source_commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=str(self.repo), text=True).strip(),
             expected_fsid=FSID, datasets=list(self.args.datasets), binaries=versions,
+            cohort_id=self.cohort_id, storage_layout=self.storage_layout(),
             scope="offline quality qualification and import speed trials, not formal baseline",
             frontier_window=1, executor_enabled=False, max_hours=self.args.max_hours,
             offline_only=self.offline_only,
             cluster_validation="not_requested_offline_only" if self.offline_only else "passed_startup_gate",
             resume_from=str(self.resume_root) if self.resume_root else None,
             retained_slow_warning_guard=bool(getattr(self, "slow_guard", None)),
-            deployed_cls_verification="all five deployed files verified" if getattr(self, "cls_proof", None)
+            deployed_cls_verification="all active deployed files verified" if getattr(self, "cls_proof", None)
                                       else "remote deployed files not certified by this run",
+            device_qualification=self.device_proof,
             deployed_cls_evidence=self.cls_proof if getattr(self, "cls_proof", None) else None))
         self.load_resume()
         if (not self.offline_only and "deep100m" in self.args.datasets and "gist1m" not in self.args.datasets and
                 not (self.root / "import-trials/gist1m/selected-settings.json").exists()):
             raise RuntimeError("Deep-only resume requires complete verified GIST import trials")
+        if not self.offline_only and self.local_resume_only:
+            self.cleanup_pools("cleanup-prior-layout")
         for dataset in self.args.datasets:
             _, manifest = self.prepare(dataset)
             selected = self.qualify(dataset, manifest)
@@ -724,13 +846,9 @@ class Suite:
             return
         # Pool cleanup is restricted to the same six experiment pools. Code 3
         # means cleanup succeeded and the pre-existing health warning remains.
-        self.cluster_gate()
-        self.run("cleanup-dry-run", ["bash", self.bin / "cleanup-experiment-pools.sh"], 900)
-        self.run("cleanup", ["bash", self.bin / "cleanup-experiment-pools.sh", "--confirm-cleanup"],
-                 900, allowed=(0, 3))
-        self.cluster_gate()
+        self.cleanup_pools("cleanup")
         self.status("first_batch_complete", next_step=(
-            "Review import speed/quality results, verify remote deployed CLS hashes, "
+            "Review this cohort's import speed/quality results, verify remote deployed CLS hashes, "
             "then certify remote dynamic recall and start formal paired runs. "
             "Local HNSW recall alone is not the high-recall baseline result."))
 
@@ -741,10 +859,18 @@ def main():
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--resume-from", type=Path,
                         help="Verify/reuse completed evidence from a prior run into a fresh RUN_ROOT")
+    parser.add_argument("--resume-local-only", action="store_true",
+                        help="Reuse only verified local graphs/splits; discard every prior import timing/result")
+    parser.add_argument("--owner-osds", type=osd_ids, default=list(range(5)),
+                        help="Physical OSD IDs in owner order; default 0,1,2,3,4")
+    parser.add_argument("--excluded-osds", type=osd_ids, default=[],
+                        help="Existing OSD IDs that must remain down/out")
+    parser.add_argument("--cohort-id", help="Label stored with this experiment's physical layout")
     parser.add_argument("--offline-only", action="store_true",
                         help="Only split/graph quality work; never query/change/clean Ceph")
     parser.add_argument("--retained-slow-evidence", type=Path)
     parser.add_argument("--deployed-cls-evidence", type=Path)
+    parser.add_argument("--device-qualification", type=Path)
     parser.add_argument("--dataset-root", type=Path, default=Path("/home/hhf/datasets"))
     parser.add_argument("--keyring", type=Path, default=Path("/home/hhf/study/ceph.client.admin.keyring"))
     parser.add_argument("--python", default="/tmp/nsvu-osd-plot-venv/bin/python")
@@ -755,6 +881,10 @@ def main():
     args = parser.parse_args()
     if not args.confirm_reset and not args.offline_only:
         parser.error("--confirm-reset is required for authorized experiment-pool resets")
+    if not 1 <= len(args.owner_osds) <= 5 or set(args.owner_osds) & set(args.excluded_osds):
+        parser.error("need 1..5 active owner OSDs disjoint from excluded OSDs")
+    if args.resume_local_only and not args.resume_from:
+        parser.error("--resume-local-only requires --resume-from")
     if any(x <= 0 for x in (args.max_hours, args.min_free_gib, args.max_artifact_gib)):
         parser.error("resource limits must be positive")
     if len(set(args.datasets)) != len(args.datasets):

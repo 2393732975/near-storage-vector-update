@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only logical digest of the six NSVU experiment pools (not an export)."""
+"""Read-only logical digest of the selected NSVU experiment pools (not an export)."""
 
 import argparse
 import hashlib
@@ -7,7 +7,17 @@ import json
 import struct
 from pathlib import Path
 
-POOLS = ["nsvu_meta"] + ["nsvu_owner_%d" % i for i in range(5)]
+DEFAULT_OWNERS = 5
+
+
+def positive_integer(value):
+    try:
+        result = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
 
 
 def framed(digest, value):
@@ -55,6 +65,8 @@ def main():
     parser.add_argument("--keyring", required=True)
     parser.add_argument("--expected-fsid", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--owners", type=positive_integer, default=DEFAULT_OWNERS,
+                        help="Number of logical owner pools (default: 5)")
     args = parser.parse_args()
     import rados
     records = []
@@ -62,7 +74,8 @@ def main():
                      conf={"keyring": args.keyring}) as cluster:
         if cluster.get_fsid() != args.expected_fsid:
             raise RuntimeError("FSID mismatch before read-only digest")
-        for pool in POOLS:
+        pools = ["nsvu_meta"] + ["nsvu_owner_%d" % i for i in range(args.owners)]
+        for pool in pools:
             with cluster.open_ioctx(pool) as ioctx:
                 names = sorted(obj.key for obj in ioctx.list_objects())
                 for oid in names:
@@ -73,7 +86,7 @@ def main():
                                     "omap_sha256": omap, "omap_entries": count})
     aggregate = hashlib.sha256(json.dumps(records, sort_keys=True,
                                          separators=(",", ":")).encode()).hexdigest()
-    document = {"schema_version": 1, "fsid": args.expected_fsid,
+    document = {"schema_version": 1, "fsid": args.expected_fsid, "owners": args.owners,
                 "logical_sha256": aggregate, "objects": records}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

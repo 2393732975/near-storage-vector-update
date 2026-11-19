@@ -7,7 +7,7 @@
 
 - [源码阅读指南](source-reading-guide.md)：从 ID 与对象布局、基础图导入、在线更新调用链到 CLS、只读执行器、检查器和实验门禁，附源码定位、流程图、阅读顺序与验证练习。
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
-- [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：已批准；四数据集本地质量筛选及 GIST 导入测试完成，Deep 导入资格尚未完成。恢复任务因新增 osd.1 慢告警停止，正式 24-case 尚未启动。
+- [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：用户授权在故障盘停用后继续，已制定四 owner→OSD 0/2/3/4 的新组恢复流程。复用本地图，重测 GIST 导入配置并继续 Deep 资格；旧五盘远端结果不复用，正式 24-case 尚未启动。
 - [高召回准备任务停止诊断与 SSD 维修排查](reports/baseline-preparation-stop-diagnosis-2026-11-19.md)：恢复任务因 osd.1 新慢告警停止；对应 SSD 在排除数据库预设后仍报健康失败，授权短自检也失败。已备份单副本实验池，设备尚未修复，需厂商诊断或换盘；Deep 实际导入尚未开始。
 - [故障 osd.1 数据迁移与停用记录](reports/osd1-data-evacuation-report-2026-11-19.md)：已完成 8 池备份及前后 SHA-256 校验，39 PG clean；故障 OSD 已 down/out 并禁用自启，其余四个 OSD 正常。原五 OSD 实验布局已改变，继续暂停。
 - [优化实施方案](optimization-implementation-plan.md)：阶段依赖、目标架构、验收门槛和消融设计。
