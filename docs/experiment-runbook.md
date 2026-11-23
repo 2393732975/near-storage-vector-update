@@ -596,6 +596,31 @@ resume_log=results/high-recall-formal-auto-resume.log
 
 仅当正式 runner 因已识别的 BlueStore 慢操作中断 case，且期间 OSD 日志连续、设备和布局复核通过、I/O 进入静默窗口时，脚本才继续。设备错误、OSD 重启和日志缺失会阻止恢复。`--max-attempts` 默认为 3，`--wait-seconds` 默认为 600，用于仍有正常 I/O 时的等待。最新批次状态与汇总路径可从 `results/high-recall-formal.latest-launch.json` 查到。
 
+### 用 RADOS 快照恢复实验索引
+
+`index-pool-snapshot.py` 用于单独验证快照恢复。选定一份冻结图，导入完成后、第一次更新前保存快照。创建和恢复期间要排空实验池的写入。脚本持有高召回实验使用的共享锁，并核对 FSID、池 ID、PG 和实际 OSD 落点。
+
+```bash
+snapshot_args=(
+  --checkpoint "$run_root/index-snapshot.json"
+  --keyring "$CEPH_KEYRING"
+  --expected-fsid "$EXPECTED_CEPH_FSID"
+)
+/usr/bin/python3 scripts/index-pool-snapshot.py capture "${snapshot_args[@]}" \
+  --placement "$run_root/pool-placement-latest.json"
+```
+
+`--placement` 指向当前 runner 记录的池映射文件。若使用正式 runner 的外层目录，映射文件位于 `pilot/pool-placement-latest.json`。索引更新和终态验收完成后，可先预览变动对象，再恢复。
+
+```bash
+/usr/bin/python3 scripts/index-pool-snapshot.py plan "${snapshot_args[@]}"
+/usr/bin/python3 scripts/index-pool-snapshot.py restore "${snapshot_args[@]}"
+```
+
+恢复会按对象版本和大小找出变动项，包括只有 OMAP 变动的对象。快照后新增的对象会被移除，快照后删除的对象会被恢复。脚本核对恢复后的对象清单，并将回滚对象的正文和 OMAP 摘要与快照逐一比较。`restore` 输出回滚对象数与耗时。中断时检查点保持 `restoring`，使用原检查点再次执行 `restore`。试验结束后，可用 `drop` 删除该检查点对应的快照。快照依附于原实验池，重建池会丢失快照。
+
+正式 runner 目前按每个 case 重建池和导入。接入快照前，应在单独实验中比较恢复耗时和全量导入耗时，并检查更新、Recall 与索引一致性。Quincy 在对象首次改写时可能为快照复制完整 OMAP，同一快照的首次使用与回滚后的再次使用可能有不同的写入成本。 [Ceph Quincy 池快照](https://docs.ceph.com/en/quincy/rados/operations/pools/#making-a-snapshot-of-a-pool) · [BlueStore 克隆实现](https://github.com/ceph/ceph/blob/v17.2.8/src/os/bluestore/BlueStore.cc#L16792-L16859)
+
 ## 10. 实验后清理
 
 先预览白名单，再带 FSID 保护执行删除：
