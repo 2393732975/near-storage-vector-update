@@ -6,6 +6,7 @@
 ## 当前文档
 
 - [源码阅读指南](source-reading-guide.md)：从 ID 与对象布局、基础图导入、在线更新调用链到 CLS、只读执行器、检查器和实验门禁，附源码定位、流程图、阅读顺序与验证练习。
+- [Compute 与 OSD/CLS Baseline 实现对照报告](reports/compute-osd-baseline-architecture-2026-11-23.md) 逐模块说明两路的共用流程、HNSW 搜索、对象读写和验收，并对照 Deep100M 正式重测的首轮结果。
 - [HNSW 元数据管理与 Ceph CRUSH 对象放置报告](reports/metadata-management-and-crush-placement-2026-11-23.md) 解释向量与 OMAP 的同对象布局、label 与全局元数据、覆盖更新顺序，并给出 Deep100M 的实际 PG 和 OSD 映射。
 - [实验复现与数据准备手册](experiment-runbook.md)：数据获取、参数、运行命令、结果汇总和安全清理。
 - [高召回 Compute / OSD baseline 重测执行计划](high-recall-baseline-execution-plan-2026-11-17.md)：用户授权在故障盘停用后继续，已制定四 owner→OSD 0/2/3/4 的新组恢复流程。复用本地图，重测 GIST 导入配置并继续 Deep 资格；旧五盘远端结果不复用，正式 24-case 尚未启动。
