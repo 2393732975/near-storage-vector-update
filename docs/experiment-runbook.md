@@ -578,6 +578,24 @@ python3 scripts/summarize-stage-costs.py "$run_root" \
 `stage_profile` 和失败分类。并发运行时不要直接相加 JSON 的旧 `*_pct`；具体统计
 口径见[阶段耗时与数据移动打点](stage-profiling.md)。
 
+### 高召回正式重测自动续跑
+
+从仓库根目录用正式实验的 Python 环境运行。脚本从 `results/high-recall-formal.latest-launch.json` 读取最近一次停止的正式批次及其冻结 runner。
+
+```bash
+/tmp/nsvu-osd-plot-venv/bin/python scripts/auto-resume-high-recall-formal.py
+```
+
+默认只读检查 Ceph。输出 `ready` 时会列出下一条 case 和已完成数量。带 `--confirm-reset` 才会续跑。续跑会按原四 OSD 布局重建 `nsvu_meta` 和 `nsvu_owner_0` 至 `nsvu_owner_3`，保留已完成的 case，从对应冻结图重新导入中断的 case。以下命令可在 `tmux` 中执行，`--launcher-log` 将重定向的日志路径登记到最新运行清单。
+
+```bash
+resume_log=results/high-recall-formal-auto-resume.log
+/tmp/nsvu-osd-plot-venv/bin/python scripts/auto-resume-high-recall-formal.py \
+  --confirm-reset --launcher-log "$resume_log" >>"$resume_log" 2>&1
+```
+
+仅当正式 runner 因已识别的 BlueStore 慢操作中断 case，且期间 OSD 日志连续、设备和布局复核通过、I/O 进入静默窗口时，脚本才继续。设备错误、OSD 重启和日志缺失会阻止恢复。`--max-attempts` 默认为 3，`--wait-seconds` 默认为 600，用于仍有正常 I/O 时的等待。最新批次状态与汇总路径可从 `results/high-recall-formal.latest-launch.json` 查到。
+
 ## 10. 实验后清理
 
 先预览白名单，再带 FSID 保护执行删除：
