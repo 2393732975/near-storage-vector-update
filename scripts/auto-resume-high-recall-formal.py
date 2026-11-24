@@ -3,17 +3,19 @@
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import importlib.util
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 import time
 
 
@@ -71,8 +73,72 @@ def load_formal_runner(template):
     return formal, ceph_guard
 
 
-def recovery_guard(base, active_osds):
+def scan_journal(rows, osd, prior, is_event, *, tail=False):
+    anchor, events, count = None, [], 0
+    for line in rows:
+        row = json.loads(line)
+        cursor, boot, invocation = (row.get(key) for key in (
+            "__CURSOR", "_BOOT_ID", "_SYSTEMD_INVOCATION_ID"))
+        if not cursor or not boot or not invocation or not isinstance(row.get("MESSAGE"), str):
+            raise RuntimeError(f"osd.{osd} journal identity or record changed")
+        if count == 0:
+            if prior and not tail and cursor != prior["cursor"]:
+                raise RuntimeError(f"osd.{osd} journal anchor missing")
+            origin = prior or {"boot": boot, "invocation": invocation}
+        if (boot, invocation) != (origin["boot"], origin["invocation"]):
+            raise RuntimeError(f"osd.{osd} journal daemon identity changed")
+        if (count or prior is None or tail) and is_event(row):
+            events.append(dict(osd=osd, timestamp_us=int(row["__REALTIME_TIMESTAMP"]), message=row["MESSAGE"]))
+        anchor = dict(cursor=cursor, boot=boot, invocation=invocation)
+        count += 1
+    if anchor is None:
+        raise RuntimeError(f"osd.{osd} journal coverage could not be verified")
+    return osd, anchor, events, count - int(bool(prior) and not tail)
+
+
+def recovery_guard(base, active_osds, journal_module):
     class Guard(base):
+        def _read_journals(self, *, first_since=None, tails=False):
+            def read_osd(osd):
+                prior = self.anchors.get(osd)
+                if tails:
+                    selectors = ["-n", "1"]
+                elif prior is not None:
+                    selectors = ["--cursor", prior["cursor"]]
+                else:
+                    selectors = ["--since", first_since]
+                args = ["journalctl", "-u", f"ceph-{journal_module.FSID}@osd.{osd}.service",
+                        "--no-pager", "--quiet", "--all", "-o", "json",
+                        "--output-fields=MESSAGE,_BOOT_ID,_SYSTEMD_INVOCATION_ID", *selectors]
+                host = journal_module.OSD_HOSTS[osd]
+                command = ["sudo", "-n", *args]
+                if host:
+                    command = [
+                        "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                        "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+                        "-o", "GlobalKnownHostsFile=/dev/null",
+                        "-o", f"UserKnownHostsFile={journal_module.SSH_KNOWN_HOSTS}",
+                        "-i", str(self.identity), "root@" + host, shlex.join(args),
+                    ]
+                # Spool the projection to disk so a long stop does not need an
+                # in-memory copy of every journal row before checking its cursor.
+                with TemporaryFile() as rows:
+                    try:
+                        result = subprocess.run(command, stdout=rows, stderr=subprocess.PIPE, timeout=60)
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        raise RuntimeError(f"osd.{osd} journal could not be read") from error
+                    if result.returncode or result.stderr.strip():
+                        raise RuntimeError(f"osd.{osd} journal could not be read, exit={result.returncode}")
+                    rows.seek(0)
+                    return scan_journal(rows, osd, prior, journal_module.is_event, tail=tails)
+
+            with ThreadPoolExecutor(max_workers=len(active_osds)) as workers:
+                samples = list(workers.map(read_osd, sorted(active_osds)))
+            events = [event for _, _, records, _ in samples for event in records]
+            return ({osd: anchor for osd, anchor, _, _ in samples},
+                    sorted(events, key=lambda event: event["timestamp_us"]),
+                    sum(count for _, _, _, count in samples))
+
         def anchor_clean(self):
             # A cleared alert does not replace the previous journal checkpoint.
             self._recover(set())
@@ -297,7 +363,7 @@ def attempt(formal, guard_module, template, previous, root, args):
         verify_device_layout(suite)
         verify_previous_pools(suite, placement)
         with ExitStack() as stack:
-            guard_type = recovery_guard(guard_module.Guard, active)
+            guard_type = recovery_guard(guard_module.Guard, active, guard_module)
             guard = wait_for_quiet(lambda: stack.enter_context(
                 guard_type(root / "evidence", recovery_source=previous / "evidence")),
                 suite, formal.phase, args.wait_seconds)

@@ -120,7 +120,7 @@ class FormalAutoResumeTests(unittest.TestCase):
         }
         (root / "ceph-guard-status.json").write_text(json.dumps(prior), encoding="utf-8")
         (root / "ceph-guard-unexpected-events.json").write_text(json.dumps(recorded_stop), encoding="utf-8")
-        guard = MOD.recovery_guard(FakeGuard, ACTIVE_OSDS)(root)
+        guard = MOD.recovery_guard(FakeGuard, ACTIVE_OSDS, mock.Mock())(root)
         quiet = {osd: {"read_eio": 0} for osd in ACTIVE_OSDS}
         guard._quiet_evidence = mock.Mock(return_value=[quiet, quiet])
         return guard, recorded_stop
@@ -140,6 +140,27 @@ class FormalAutoResumeTests(unittest.TestCase):
         self.assertEqual(guard.checked, 5)
         self.assertEqual(guard._quiet_evidence.call_count, 2)
         guard._record.assert_called_once()
+
+    def test_large_journal_keeps_original_anchor_and_checks_later_events(self):
+        prior = anchors("prior")[2]
+
+        def rows():
+            for sequence in range(30002):
+                yield json.dumps({
+                    "__CURSOR": prior["cursor"] if sequence == 0 else str(sequence),
+                    "_BOOT_ID": prior["boot"], "_SYSTEMD_INVOCATION_ID": prior["invocation"],
+                    "__REALTIME_TIMESTAMP": sequence,
+                    "MESSAGE": "slow" if sequence in (0, 30001) else "ordinary log",
+                }).encode()
+
+        osd, last, events, count = MOD.scan_journal(
+            rows(), 2, prior, lambda row: row["MESSAGE"] == "slow")
+        self.assertEqual((osd, last["cursor"], count), (2, "30001", 30001))
+        self.assertEqual(events, [event("slow", timestamp_us=30001)])
+        journal = rows()
+        next(journal)
+        with self.assertRaisesRegex(RuntimeError, "journal anchor missing"):
+            MOD.scan_journal(journal, 2, prior, lambda row: False)
 
     def test_missing_anchor_or_event_mismatch_prevents_quiet_recovery(self):
         for fault in ("journal continuity", "missing stop record", "extra stop record"):
