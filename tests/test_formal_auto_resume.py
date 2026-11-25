@@ -108,6 +108,41 @@ class FormalAutoResumeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 MOD.stopped_events(root, ACTIVE_OSDS)
 
+    def test_completed_reset_reuses_new_pool_ids_and_limits_submit_events_to_its_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pilot = root / "pilot"
+            evidence = root / "evidence"
+            evidence.mkdir()
+            (pilot / "logs").mkdir(parents=True)
+            (root / "status.json").write_text(json.dumps({"state": "stopped", "error": MOD.RESET_STOP_REASON}))
+            step = {
+                "label": "sift100m-rep1-osd-reset", "state": "completed", "exit_code": 0,
+                "command": ["bash", str(pilot / "bin/initialize-experiment-pools.sh"), "--confirm-reset"],
+                "log": "logs/reset.log", "started_utc": "2026-11-23T04:49:30+00:00",
+                "finished_utc": "2026-11-23T04:49:31+00:00",
+            }
+            (pilot / "status.json").write_text(json.dumps({"steps": [step]}))
+            (pilot / "pool-placement-latest.json").write_text(json.dumps({
+                "pools": [{"pool": "nsvu_meta", "physical_osd": 0, "pool_id": 1892}],
+            }))
+            (pilot / step["log"]).write_text("pool 'nsvu_meta' created\nset pool 1897 size to 1\n")
+            reset = MOD.completed_reset(root)
+            self.assertEqual(reset["placement"]["pools"], [{
+                "pool": "nsvu_meta", "physical_osd": 0, "pool_id": 1897,
+            }])
+
+            row = event(BLUESTORE + "log_latency slow operation observed for submit_transact, latency = 5.3s")
+            event_path = evidence / "ceph-guard-unexpected-events.json"
+            event_path.write_text(json.dumps([row]))
+            self.assertEqual(MOD.stopped_events(root, ACTIVE_OSDS, reset), [row])
+            self.assertFalse(MOD.slow_events([row], ACTIVE_OSDS))
+            for unexpected in (dict(row, timestamp_us=row["timestamp_us"] - 2_000_000),
+                               dict(row, message="Input/output error")):
+                event_path.write_text(json.dumps([unexpected]))
+                with self.assertRaisesRegex(RuntimeError, "outside the recorded submit_transact scope"):
+                    MOD.stopped_events(root, ACTIVE_OSDS, reset)
+
     def fake_recovery_guard(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

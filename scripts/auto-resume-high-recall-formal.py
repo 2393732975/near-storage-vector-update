@@ -23,12 +23,17 @@ REPO = Path(__file__).resolve().parents[1]
 RESULTS = REPO / "results"
 LATEST = RESULTS / "high-recall-formal.latest-launch.json"
 STOP_REASON = "New OSD slow, restart or device events during formal work"
+RESET_STOP_REASON = "New OSD slow, restart, or device event outside the reset KV scope"
 SLOW_EVENT = re.compile(
     r"^[^\n]*?bluestore\(/var/lib/ceph/osd/ceph-(?P<osd>\d+)\) "
     r"(?:_txc_state_proc slow aio_wait, txc = 0x[0-9a-f]+, latency = [0-9.]+s|"
     r"log_latency_fn slow operation observed for _txc_committed_kv, "
     r"latency = [0-9.]+s, txc = 0x[0-9a-f]+|"
     r"log_latency slow operation observed for kv_(?:commit|sync), latency = [0-9.]+s)\s*$"
+)
+RESET_SUBMIT_EVENT = re.compile(
+    r"^[^\n]*?bluestore\(/var/lib/ceph/osd/ceph-(?P<osd>\d+)\) "
+    r"log_latency slow operation observed for submit_transact, latency = [0-9.]+s\s*$"
 )
 
 
@@ -40,7 +45,7 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def slow_events(events, active_osds):
+def slow_events(events, active_osds, pattern=SLOW_EVENT):
     if not isinstance(events, list) or not events:
         return False
     for row in events:
@@ -48,17 +53,54 @@ def slow_events(events, active_osds):
                 row["osd"] not in active_osds or type(row.get("timestamp_us")) is not int or
                 row["timestamp_us"] <= 0 or not isinstance(row.get("message"), str)):
             return False
-        match = SLOW_EVENT.fullmatch(row["message"])
+        match = pattern.fullmatch(row["message"])
         if not match or int(match["osd"]) != row["osd"]:
             return False
     return True
 
 
-def stopped_events(path, active_osds):
+def completed_reset(path):
     status = read(path / "status.json")
-    if status.get("state") != "stopped" or status.get("error") != STOP_REASON:
+    if status.get("error") != RESET_STOP_REASON:
+        return None
+    pilot = path / "pilot"
+    steps = read(pilot / "status.json")["steps"]
+    if not steps:
+        raise RuntimeError("The stopped run lacks a pool reset record")
+    step = steps[-1]
+    expected_command = ["bash", str(pilot / "bin/initialize-experiment-pools.sh"), "--confirm-reset"]
+    if (step["state"] != "completed" or step["exit_code"] != 0 or
+            step["command"] != expected_command or not step["label"].endswith("-reset")):
+        raise RuntimeError("The last step is not a successful experiment pool reset")
+
+    log = (pilot / step["log"]).read_text()
+    created = re.findall(r"^pool '([^']+)' created\nset pool (\d+) size to 1$", log, re.M)
+    pool_ids = {name: int(pool_id) for name, pool_id in created}
+    placement = read(pilot / "pool-placement-latest.json")
+    prior_ids = {pool["pool_id"] for pool in placement["pools"]}
+    if (len(created) != len(placement["pools"]) or
+            set(pool_ids) != {pool["pool"] for pool in placement["pools"]} or
+            len(set(pool_ids.values())) != len(pool_ids) or prior_ids.intersection(pool_ids.values())):
+        raise RuntimeError("The reset log does not identify a fresh set of experiment pools")
+    for pool in placement["pools"]:
+        pool["pool_id"] = pool_ids[pool["pool"]]
+    return dict(label=step["label"], started_utc=step["started_utc"],
+                finished_utc=step["finished_utc"], placement=placement)
+
+
+def stopped_events(path, active_osds, reset=None):
+    status = read(path / "status.json")
+    reason = RESET_STOP_REASON if reset else STOP_REASON
+    if status.get("state") != "stopped" or status.get("error") != reason:
         raise RuntimeError("Previous run did not stop at the formal OSD log guard")
     events = read(path / "evidence/ceph-guard-unexpected-events.json")
+    if reset:
+        start, end = (int(datetime.fromisoformat(reset[key]).timestamp() * 1_000_000)
+                      for key in ("started_utc", "finished_utc"))
+        if (not slow_events(events, active_osds, RESET_SUBMIT_EVENT) or
+                not all(start <= row["timestamp_us"] <= end for row in events)):
+            raise RuntimeError("The reset stop contains events outside the recorded submit_transact scope")
+        return events
     if not slow_events(events, active_osds):
         raise RuntimeError("The stop is not a recognized BlueStore slow operation on an active OSD")
     return events
@@ -96,7 +138,7 @@ def scan_journal(rows, osd, prior, is_event, *, tail=False):
     return osd, anchor, events, count - int(bool(prior) and not tail)
 
 
-def recovery_guard(base, active_osds, journal_module):
+def recovery_guard(base, active_osds, journal_module, reset=None):
     class Guard(base):
         def _read_journals(self, *, first_since=None, tails=False):
             def read_osd(osd):
@@ -147,13 +189,18 @@ def recovery_guard(base, active_osds, journal_module):
             previous = read(self.recovery_source / "ceph-guard-status.json")
             expected = read(self.recovery_source / "ceph-guard-unexpected-events.json")
             self.anchors = {int(osd): anchor for osd, anchor in previous["journal_anchors"].items()}
-            if set(self.anchors) != set(active_osds) or not slow_events(expected, active_osds):
+            pattern = RESET_SUBMIT_EVENT if reset else SLOW_EVENT
+            if set(self.anchors) != set(active_osds) or not slow_events(expected, active_osds, pattern):
                 raise RuntimeError("Prior checkpoint lacks complete OSD journal evidence")
             admitted = set(previous["retained_slow_osds"]) | {row["osd"] for row in expected}
             if health - admitted:
                 raise RuntimeError("BlueStore warnings expanded beyond verified OSDs")
 
             anchors, events, checked = self._read_journals()
+            reset_kv = []
+            if reset:
+                reset_kv, events = journal_module.reset_events(
+                    events, reset["started_utc"], reset["finished_utc"])
             event_key = lambda row: (row["osd"], row["timestamp_us"], row["message"])
             if Counter(map(event_key, events)) != Counter(map(event_key, expected)):
                 raise RuntimeError("OSD journals contain events beyond the recorded stop")
@@ -171,7 +218,7 @@ def recovery_guard(base, active_osds, journal_module):
             self.checked = checked + extra_count
             self.admissions = 1
             self.reset_warning_osds = observed
-            self._record("recovering_from_verified_previous_stop", expected)
+            self._record("recovering_from_verified_previous_stop", reset_kv + expected)
 
         def _quiet_evidence(self):
             # Check read_eio independently so it cannot be treated as a busy OSD.
@@ -245,7 +292,7 @@ def verify_device_layout(suite):
             raise RuntimeError(f"osd.{device['osd']} live device identity changed")
 
 
-def checkpoints(formal, previous):
+def checkpoints(formal, previous, reset=None):
     completed = {}
     interrupted = []
     for dataset in formal.DATASETS:
@@ -274,18 +321,24 @@ def checkpoints(formal, previous):
                     raise RuntimeError(f"Case needs review before resuming: {directory}")
     pending = [(d, rep, mode) for d in formal.DATASETS for rep, modes in formal.REPEAT_ORDER.items()
                for mode in modes if (d, rep, mode) not in completed]
-    if len(interrupted) != 1 or not pending or interrupted[0] != pending[0]:
+    if reset and pending and not interrupted:
+        dataset, rep, mode = pending[0]
+        if reset["label"] == f"{dataset}-rep{rep}-{mode}-reset":
+            return completed, pending, reset["placement"]
+    if reset or len(interrupted) != 1 or not pending or interrupted[0] != pending[0]:
         raise RuntimeError("Stopped case is not the next unfinished formal case")
     return completed, pending, placement
 
 
-def publish_attempt(formal, root, template, previous, source_manifest, completed, launcher_log):
+def publish_attempt(formal, root, template, previous, source_manifest, completed, launcher_log, reset=None):
     for directory in completed.values():
         shutil.copytree(directory, root / "pilot/cases" / directory.relative_to(previous / "pilot/cases"))
     manifest = dict(source_manifest, previous_formal_run=str(previous),
                     reused_completed_cases=sorted(completed),
                     orchestration_commit=subprocess.check_output(
                         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip())
+    if reset:
+        manifest["reused_completed_pool_reset"] = reset
     formal.write(root / "manifest.json", manifest)
     formal.update_summary()
     latest = dict(run_root=str(root / "pilot"), status=str(root / "status.json"),
@@ -297,7 +350,7 @@ def publish_attempt(formal, root, template, previous, source_manifest, completed
     formal.write(LATEST, latest)
 
 
-def run_cases(formal, suite, guard, pending, placement, reset_wait):
+def run_cases(formal, suite, guard, pending, placement, reset_wait, reuse_reset=False):
     def gate():
         base_gate()
         formal.validate_health(suite.ceph_json("health", "detail"), permit_retained=True)
@@ -305,24 +358,32 @@ def run_cases(formal, suite, guard, pending, placement, reset_wait):
 
     base_gate = suite.cluster_gate
     suite.cluster_gate = gate
-    for dataset, rep, mode in pending:
+    for index, (dataset, rep, mode) in enumerate(pending):
         label = f"{dataset}-rep{rep}-{mode}"
         manifest = formal.prior.PRIOR / "splits" / dataset / "split-manifest.json"
         if read(manifest)["dataset"] != dataset:
             raise RuntimeError(f"Frozen split belongs to a different dataset: {dataset}")
         graph = formal.graph_for(suite, dataset, rep)
         formal.runner.require_hash(Path(graph["cache"]), graph["cache_sha256"])
-        formal.phase("recreating_experiment_pools", dataset=dataset, rep=rep, route=mode)
+        use_existing = reuse_reset and index == 0
+        stage = "verifying_completed_empty_pools" if use_existing else "recreating_experiment_pools"
+        formal.phase(stage, dataset=dataset, rep=rep, route=mode)
         suite.resource_gate()
         verify_previous_pools(suite, placement)
         gate()
-        started = formal.runner.utc()
-        suite.run(label + "-reset", ["bash", suite.bin / "initialize-experiment-pools.sh",
-                                    "--confirm-reset"], 600)
-        ended = formal.runner.utc()
-        wait_for_quiet(lambda: guard.admit_reset(started, ended), suite, formal.phase, reset_wait)
-        formal.wait_for_clean_placement(suite, base_gate)
-        placement = read(suite.root / "pool-placement-latest.json")
+        if not use_existing:
+            started = formal.runner.utc()
+            suite.run(label + "-reset", ["bash", suite.bin / "initialize-experiment-pools.sh",
+                                        "--confirm-reset"], 600)
+            ended = formal.runner.utc()
+            try:
+                wait_for_quiet(lambda: guard.admit_reset(started, ended), suite, formal.phase, reset_wait)
+            except RuntimeError as error:
+                if str(error) == RESET_STOP_REASON:
+                    raise RetryableRecovery(str(error)) from error
+                raise
+            formal.wait_for_clean_placement(suite, base_gate)
+            placement = read(suite.root / "pool-placement-latest.json")
         formal.verify_empty_pools(suite, {p["pool"]: p["pool_id"] for p in placement["pools"]})
         gate()
         try:
@@ -348,8 +409,9 @@ def attempt(formal, guard_module, template, previous, root, args):
     active = source_manifest["storage_layout"]["owner_osds"]
     if set(active) != set(guard_module.OSD_HOSTS) or source_manifest["expected_fsid"] != formal.runner.FSID:
         raise RuntimeError("Frozen cohort does not match the formal OSD guard")
-    stopped_events(previous, active)
-    completed, pending, placement = checkpoints(formal, previous)
+    reset = completed_reset(previous)
+    stopped_events(previous, active, reset)
+    completed, pending, placement = checkpoints(formal, previous, reset)
     if read(template / "graphs.json") != read(previous / "graphs.json"):
         raise RuntimeError("Frozen graph catalogue differs from the stopped run")
     for name in ("graphs.json", "graph-build-status.json"):
@@ -363,19 +425,22 @@ def attempt(formal, guard_module, template, previous, root, args):
         verify_device_layout(suite)
         verify_previous_pools(suite, placement)
         with ExitStack() as stack:
-            guard_type = recovery_guard(guard_module.Guard, active, guard_module)
+            guard_type = recovery_guard(guard_module.Guard, active, guard_module, reset)
             guard = wait_for_quiet(lambda: stack.enter_context(
                 guard_type(root / "evidence", recovery_source=previous / "evidence")),
                 suite, formal.phase, args.wait_seconds)
             suite.cluster_gate()
             guard.check()
             verify_previous_pools(suite, placement)
+            if reset:
+                pool_ids = {p["pool"]: p["pool_id"] for p in placement["pools"]}
+                reset["placement"] = formal.verify_empty_pools(suite, pool_ids)
             if not args.confirm_reset:
                 print(json.dumps(dict(state="ready", next_case=pending[0],
                                       completed_cases=len(completed), pending_cases=len(pending))), flush=True)
                 return
-            publish_attempt(formal, root, template, previous, source_manifest, completed, args.launcher_log)
-            run_cases(formal, suite, guard, pending, placement, args.wait_seconds)
+            publish_attempt(formal, root, template, previous, source_manifest, completed, args.launcher_log, reset)
+            run_cases(formal, suite, guard, pending, placement, args.wait_seconds, reuse_reset=reset is not None)
             suite.status("completed")
             formal.phase("completed", summary=str(root / "formal-summary.json"))
     except Exception as error:
@@ -424,7 +489,7 @@ def main():
             attempt(formal, guard_module, template, previous, root, args)
             return 0
         except RetryableRecovery:
-            stopped_events(root, guard_module.OSD_HOSTS)
+            stopped_events(root, guard_module.OSD_HOSTS, completed_reset(root))
             previous = root
     raise RuntimeError("Automatic recovery attempt limit reached")
 
